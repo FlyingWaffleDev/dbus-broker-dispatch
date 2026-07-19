@@ -30,18 +30,26 @@ typedef struct {
 static void service_free(Service *s) { if (!s) return; g_free(s->name); g_free(s->path); g_free(s->exec); g_free(s->user); g_free(s); }
 static void die_error(const gchar *what, GError *e) { g_printerr("%s: %s\n", what, e ? e->message : "unknown error"); g_clear_error(&e); }
 
-static GVariant *empty_array(const GVariantType *type) { GVariantBuilder b; g_variant_builder_init(&b, type); return g_variant_builder_end(&b); }
-static GVariant *policy_batch(gboolean connect) {
- GVariant *own = empty_array(G_VARIANT_TYPE("a(btbs)"));
- GVariant *send = empty_array(G_VARIANT_TYPE("a(btssssuutt)"));
- GVariant *recv = empty_array(G_VARIANT_TYPE("a(btssssuutt)"));
- return g_variant_new("(bt@a(btbs)@a(btssssuutt)@a(btssssuutt))", connect, (guint64)1, own, send, recv);
+static GVariant *policy_batch(gboolean connect, gboolean permit_messages, guint64 priority) {
+ GVariantBuilder own, send, recv;
+ g_variant_builder_init(&own, G_VARIANT_TYPE("a(btbs)"));
+ g_variant_builder_init(&send, G_VARIANT_TYPE("a(btssssuutt)"));
+ g_variant_builder_init(&recv, G_VARIANT_TYPE("a(btssssuutt)"));
+ if (permit_messages) {
+  g_variant_builder_add(&own, "(btbs)", TRUE, priority, TRUE, "");
+  g_variant_builder_add(&send, "(btssssuutt)", TRUE, priority, "", "", "", "", 0, 0, (guint64)0, G_MAXUINT64);
+  g_variant_builder_add(&recv, "(btssssuutt)", TRUE, priority, "", "", "", "", 0, 0, (guint64)0, G_MAXUINT64);
+ }
+ return g_variant_new("(bt@a(btbs)@a(btssssuutt)@a(btssssuutt))", connect, priority,
+                      g_variant_builder_end(&own), g_variant_builder_end(&send), g_variant_builder_end(&recv));
 }
 /* dbus-broker's policy wire format; rules are expanded by the broker, not XML. */
 static GVariant *make_policy(Launcher *l) {
- GVariantBuilder uids, gids, selinux; GVariant *batch = policy_batch(TRUE);
+ GVariantBuilder uids, gids, selinux; GVariant *default_batch = policy_batch(TRUE, FALSE, 1);
+ GVariant *controller_batch = policy_batch(TRUE, TRUE, 2);
  g_variant_builder_init(&uids, G_VARIANT_TYPE(UID_POLICY_TYPE));
- g_variant_builder_add(&uids, "(u@" BATCH_TYPE ")", G_MAXUINT32, batch);
+ g_variant_builder_add(&uids, "(u@" BATCH_TYPE ")", G_MAXUINT32, default_batch);
+ g_variant_builder_add(&uids, "(u@" BATCH_TYPE ")", (guint)getuid(), controller_batch);
  g_variant_builder_init(&gids, G_VARIANT_TYPE(GID_POLICY_TYPE));
  g_variant_builder_init(&selinux, G_VARIANT_TYPE("a(ss)"));
  return g_variant_new("(@" UID_POLICY_TYPE "@" GID_POLICY_TYPE "@a(ss)bs)",
