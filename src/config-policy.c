@@ -185,6 +185,12 @@ static gboolean parse_uint64(const gchar *text, guint64 default_value, guint64 *
         return g_ascii_string_to_unsigned(text, 10, 0, G_MAXUINT64, value, NULL);
 }
 
+/* The broker controller protocol represents an unconstrained match as an
+ * empty string. D-Bus XML spells the same match as "*". */
+static gchar *copy_match(const gchar *value) {
+        return g_strdup(value && !g_str_equal(value, "*") ? value : "");
+}
+
 static GPtrArray *rules_for_id(GHashTable *rules, guint id) {
         GPtrArray *array = g_hash_table_lookup(rules, &id);
 
@@ -255,18 +261,18 @@ static void parse_rule(ParserState *state, const gchar *element, const gchar **a
                 rule->name = g_strdup(own_prefix ? own_prefix : (g_str_equal(own, "*") ? "" : own));
         } else if (send_destination || attribute(attributes, "send_interface") || attribute(attributes, "send_member") || send_type) {
                 rule->type = POLICY_RULE_SEND;
-                rule->name = g_strdup(send_destination ? send_destination : "");
-                rule->path = g_strdup(attribute(attributes, "send_path"));
-                rule->interface = g_strdup(attribute(attributes, "send_interface"));
-                rule->member = g_strdup(attribute(attributes, "send_member"));
+                rule->name = copy_match(send_destination);
+                rule->path = copy_match(attribute(attributes, "send_path"));
+                rule->interface = copy_match(attribute(attributes, "send_interface"));
+                rule->member = copy_match(attribute(attributes, "send_member"));
                 rule->message_type = parse_message_type(send_type);
                 rule->broadcast = parse_tristate(attribute(attributes, "send_broadcast"));
         } else {
                 rule->type = POLICY_RULE_RECV;
-                rule->name = g_strdup(recv_sender ? recv_sender : "");
-                rule->path = g_strdup(attribute(attributes, "receive_path"));
-                rule->interface = g_strdup(attribute(attributes, "receive_interface"));
-                rule->member = g_strdup(attribute(attributes, "receive_member"));
+                rule->name = copy_match(recv_sender);
+                rule->path = copy_match(attribute(attributes, "receive_path"));
+                rule->interface = copy_match(attribute(attributes, "receive_interface"));
+                rule->member = copy_match(attribute(attributes, "receive_member"));
                 rule->message_type = parse_message_type(recv_type);
         }
 
@@ -464,9 +470,11 @@ gboolean launcher_config_load(LauncherConfig *config, const gchar *path, GError 
         return load_file(config, path, FALSE, error);
 }
 
-static GVariant *batch_from_rules(GPtrArray *base, GPtrArray *specific) {
+static GVariant *batch_from_rules(GPtrArray *base, GPtrArray *specific, gboolean default_connect) {
         GVariantBuilder own, send, recv;
-        gboolean connect = FALSE;
+        gboolean connect = default_connect;
+        /* Priority zero is the broker's implicit deny and is never selected.
+         * Match the compatibility launcher's POLICY_PRIORITY_DEFAULT. */
         guint64 connect_priority = 1;
         GPtrArray *arrays[] = { base, specific, NULL };
 
@@ -494,15 +502,29 @@ static GVariant *batch_from_rules(GPtrArray *base, GPtrArray *specific) {
                              g_variant_builder_end(&own), g_variant_builder_end(&send), g_variant_builder_end(&recv));
 }
 
-static void add_uid_batches(GVariantBuilder *builder, LauncherConfig *config) {
+static void add_uid_batches(GVariantBuilder *builder, LauncherConfig *config, gboolean user_scope) {
         GHashTableIter iter;
         gpointer key;
         gpointer value;
+        guint self = getuid();
+        gboolean have_self = FALSE;
 
-        g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", G_MAXUINT32, batch_from_rules(config->default_rules, NULL));
+        g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", G_MAXUINT32,
+                              batch_from_rules(config->default_rules, NULL, FALSE));
         g_hash_table_iter_init(&iter, config->user_rules);
-        while (g_hash_table_iter_next(&iter, &key, &value))
-                g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", *(guint *)key, batch_from_rules(config->default_rules, value));
+        while (g_hash_table_iter_next(&iter, &key, &value)) {
+                gboolean is_self = *(guint *)key == self;
+                g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", *(guint *)key,
+                                      batch_from_rules(config->default_rules, value, user_scope && is_self));
+                have_self |= is_self;
+        }
+
+        /* dbus-daemon implicitly permits the UID that owns a session bus to
+         * connect. dbus-broker denies by default, so model that fallback as a
+         * UID-specific entry; do not grant other local users access. */
+        if (user_scope && !have_self)
+                g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", self,
+                                      batch_from_rules(config->default_rules, NULL, TRUE));
 }
 
 static void add_gid_batches(GVariantBuilder *builder, LauncherConfig *config) {
@@ -513,8 +535,9 @@ static void add_gid_batches(GVariantBuilder *builder, LauncherConfig *config) {
         g_hash_table_iter_init(&iter, config->group_rules);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
                 guint gid = *(guint *)key;
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", TRUE, gid, gid, batch_from_rules(value, NULL));
-        }
+                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", TRUE, gid, gid,
+                                      batch_from_rules(value, NULL, FALSE));
+}
 }
 
 static void add_console_batches(GVariantBuilder *builder, LauncherConfig *config, guint max_uid, const GArray *console_uids) {
@@ -527,14 +550,14 @@ static void add_console_batches(GVariantBuilder *builder, LauncherConfig *config
                 if (uid > max_uid || uid < next)
                         continue;
                 if (uid > next)
-                        g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, uid - 1, batch_from_rules(config->no_console_rules, NULL));
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, uid, uid, batch_from_rules(config->at_console_rules, NULL));
+                        g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, uid - 1, batch_from_rules(config->no_console_rules, NULL, FALSE));
+                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, uid, uid, batch_from_rules(config->at_console_rules, NULL, FALSE));
                 next = uid + 1;
         }
         if (next <= max_uid)
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, max_uid, batch_from_rules(config->no_console_rules, NULL));
+                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, max_uid, batch_from_rules(config->no_console_rules, NULL, FALSE));
         if (max_uid < G_MAXUINT)
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, max_uid + 1, G_MAXUINT, batch_from_rules(config->at_console_rules, NULL));
+                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, max_uid + 1, G_MAXUINT, batch_from_rules(config->at_console_rules, NULL, FALSE));
 }
 
 GVariant *launcher_config_export_policy(LauncherConfig *config, gboolean user_scope, guint system_uid_max, const GArray *console_uids) {
@@ -543,7 +566,10 @@ GVariant *launcher_config_export_policy(LauncherConfig *config, gboolean user_sc
         g_variant_builder_init(&uids, G_VARIANT_TYPE(UID_POLICY_TYPE));
         g_variant_builder_init(&gids, G_VARIANT_TYPE(GID_POLICY_TYPE));
         g_variant_builder_init(&selinux, G_VARIANT_TYPE("a(ss)"));
-        add_uid_batches(&uids, config);
+        /* dbus-daemon session.conf has no explicit connection grant: session
+         * buses permit their owning user's local clients by default. System
+         * buses remain deny-by-default unless their policy grants access. */
+        add_uid_batches(&uids, config, user_scope);
         add_gid_batches(&gids, config);
         if (!user_scope)
                 add_console_batches(&gids, config, system_uid_max, console_uids);
