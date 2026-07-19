@@ -20,5 +20,8 @@ deps = [glib, gio, gio_unix, expat]
 if get_option('elogind')
   deps += elogind
 endif
-executable('dbus-broker-openrc-launch', 'src/launcher.c', dependencies: deps, install: true)
+executable('dbus-broker-openrc-launch', ['src/launcher.c', 'src/config-policy.c'], dependencies: deps, install: true)
 executable('dbus-broker-openrc-run-session', 'src/run-session.c', dependencies: [glib], install: true)
+
+test_config_policy = executable('test-config-policy', ['src/test-config-policy.c', 'src/config-policy.c'], dependencies: deps)
+test('config-policy', test_config_policy)
