@@ -156,15 +156,16 @@ static gchar *read_machine_id(GError **error) {
  return id;
 }
 static gboolean start_broker(Launcher *l, GError **error) {
- int pair[2]; GSocket *s; GSocketConnection *sc; gchar *arg, *machine_arg, *guid, *machine_id; gchar *argv[4];
+ int pair[2]; GSocket *s; GSocketConnection *sc; gchar *arg, *machine_arg, *machine_id; gchar *argv[4];
  if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,pair)<0){g_set_error(error,G_IO_ERROR,g_io_error_from_errno(errno),"socketpair: %s",g_strerror(errno));return FALSE;}
  machine_id = read_machine_id(error); if (!machine_id) { close(pair[0]); close(pair[1]); return FALSE; }
  arg=g_strdup("--controller=3"); machine_arg=g_strdup_printf("--machine-id=%s", machine_id); argv[0]=l->broker; argv[1]=arg; argv[2]=machine_arg; argv[3]=NULL;
  g_message("Starting dbus-broker with machine ID %.8s...", machine_id);
  if(!g_spawn_async(NULL,argv,NULL,G_SPAWN_DO_NOT_REAP_CHILD,child_setup,GINT_TO_POINTER(pair[1]),&l->broker_pid,error)){close(pair[0]);close(pair[1]);g_free(arg);g_free(machine_arg);g_free(machine_id);return FALSE;} close(pair[1]);g_free(arg);g_free(machine_arg);g_free(machine_id);
  s=g_socket_new_from_fd(pair[0],error); if(!s)return FALSE; sc=G_SOCKET_CONNECTION(g_socket_connection_factory_create_connection(s)); g_object_unref(s);
- guid = g_dbus_generate_guid();
- l->controller=g_dbus_connection_new_sync(G_IO_STREAM(sc),guid,G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_SERVER,NULL,NULL,error); g_free(guid); g_object_unref(sc); return l->controller!=NULL;
+ /* dbus-broker is the server on its controller socket (see controller_init()).
+  * The controller must therefore initiate D-Bus SASL authentication as client. */
+ l->controller=g_dbus_connection_new_sync(G_IO_STREAM(sc),NULL,G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_CLIENT,NULL,NULL,error); g_object_unref(sc); return l->controller!=NULL;
 }
 static gboolean add_listener(Launcher *l, GError **error) {
  GUnixFDList *fds=g_unix_fd_list_new(); gint idx=g_unix_fd_list_append(fds,g_socket_get_fd(l->listener),error); GVariant *reply;
