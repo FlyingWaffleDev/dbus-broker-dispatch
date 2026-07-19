@@ -1,0 +1,4 @@
+option('elogind', type: 'boolean', value: false,
+       description: 'Enable elogind-backed active-local-session detection')
+option('system-console-users', type: 'array', value: [],
+       description: 'Additional users always considered at-console')
