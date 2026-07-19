@@ -234,7 +234,8 @@ static void parse_rule(ParserState *state, const gchar *element, const gchar **a
         const gchar *send_type = attribute(attributes, "send_type");
         const gchar *recv_type = attribute(attributes, "receive_type");
         PolicyRule *rule = g_new0(PolicyRule, 1);
-        guint id = 0;
+        guint id = state->context == POLICY_CONTEXT_USER ? state->uid :
+                   state->context == POLICY_CONTEXT_GROUP ? state->gid : 0;
         gboolean connection_target = FALSE;
         gboolean group_target = FALSE;
 

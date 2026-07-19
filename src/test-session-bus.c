@@ -8,9 +8,9 @@
 
 static void test_session_bus(gconstpointer data) {
         const gchar *launcher = data;
-        gchar *runtime = NULL, *data_home = NULL, *service_dir = NULL, *service_file = NULL;
+        gchar *runtime = NULL, *data_home = NULL, *service_dir = NULL, *service_file = NULL, *config_file = NULL;
         gchar *marker = NULL, *command_file = NULL, *quoted_marker = NULL, *command = NULL, *service_contents = NULL;
-        gchar *address = NULL, *contents = NULL, **environment = NULL;
+        gchar *config_contents = NULL, *address = NULL, *contents = NULL, **environment = NULL;
         GPid pid = 0;
         GDBusConnection *connection = NULL;
         GVariant *reply = NULL;
@@ -38,11 +38,25 @@ static void test_session_bus(gconstpointer data) {
         g_assert_true(g_file_set_contents(service_file, service_contents, -1, &error));
         g_assert_no_error(error);
         g_free(service_contents);
+        config_file = g_build_filename(runtime, "session.conf", NULL);
+        config_contents = g_strdup_printf("<busconfig>"
+                                          "<listen>unix:path=%s/bus</listen>"
+                                          "<servicedir>%s</servicedir>"
+                                          "<policy context='default'>"
+                                          "<allow user='*'/><deny own='*'/>"
+                                          "<allow send_destination='org.freedesktop.DBus'/>"
+                                          "<allow receive_type='method_call'/><allow receive_type='method_return'/>"
+                                          "<allow receive_type='error'/><allow receive_type='signal'/>"
+                                          "</policy>"
+                                          "<policy user='%s'><allow own='org.example.PolicyTest'/></policy>"
+                                          "</busconfig>", runtime, service_dir, g_get_user_name());
+        g_assert_true(g_file_set_contents(config_file, config_contents, -1, &error));
+        g_assert_no_error(error);
         environment = g_get_environ();
         environment = g_environ_setenv(environment, "XDG_RUNTIME_DIR", runtime, TRUE);
         environment = g_environ_setenv(environment, "XDG_DATA_HOME", data_home, TRUE);
         g_assert_true(g_spawn_async(NULL,
-                                    (gchar *[]){ (gchar *)launcher, "--scope=user", "--foreground", NULL },
+                                    (gchar *[]){ (gchar *)launcher, "--scope=user", "--foreground", "--config-file", config_file, NULL },
                                     environment, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &error));
         g_assert_no_error(error);
         g_strfreev(environment);
@@ -62,6 +76,16 @@ static void test_session_bus(gconstpointer data) {
         reply = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus", "/",
                                              "org.freedesktop.DBus", "ListNames", NULL,
                                              G_VARIANT_TYPE("(as)"), G_DBUS_CALL_FLAGS_NONE,
+                                             -1, NULL, &error);
+        g_assert_no_error(error);
+        g_assert_nonnull(reply);
+        g_variant_unref(reply);
+        reply = NULL;
+
+        reply = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                             "org.freedesktop.DBus", "RequestName",
+                                             g_variant_new("(su)", "org.example.PolicyTest", 0),
+                                             G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE,
                                              -1, NULL, &error);
         g_assert_no_error(error);
         g_assert_nonnull(reply);
@@ -95,6 +119,7 @@ static void test_session_bus(gconstpointer data) {
         g_spawn_close_pid(pid);
         g_free(address);
         g_free(contents);
+        g_assert_cmpint(g_remove(config_file), ==, 0);
         g_assert_cmpint(g_remove(marker), ==, 0);
         g_assert_cmpint(g_remove(command_file), ==, 0);
         g_assert_cmpint(g_remove(service_file), ==, 0);
@@ -105,6 +130,8 @@ static void test_session_bus(gconstpointer data) {
         g_assert_cmpint(g_rmdir(data_home), ==, 0);
         g_assert_cmpint(g_rmdir(runtime), ==, 0);
         g_free(command);
+        g_free(config_contents);
+        g_free(config_file);
         g_free(quoted_marker);
         g_free(marker);
         g_free(command_file);
