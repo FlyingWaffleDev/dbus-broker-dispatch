@@ -7,6 +7,7 @@
 #include <glib-unix.h>
 #include <expat.h>
 #include <getopt.h>
+#include <grp.h>
 #include <pwd.h>
 #include <signal.h>
 #include <sys/prctl.h>
@@ -110,8 +111,24 @@ static gboolean register_service(Launcher *l, Service *s, GError **error) {
  return call(l, "/org/bus1/DBus/Broker", "org.bus1.DBus.Broker", "AddName", g_variant_new("(osu)", s->path, s->name, uid), error);
 }
 static void reset_service(Launcher *l, Service *s, const gchar *why) { GError *e = NULL; call(l, s->path, "org.bus1.DBus.Name", "Reset", g_variant_new("(ts)", s->serial, why), &e); g_clear_error(&e); s->starting = FALSE; }
-typedef struct { Launcher *launcher; Service *service; } Activation;
-static void child_done(GPid pid, gint status, gpointer data) { Activation *a = data; if (!WIFEXITED(status) || WEXITSTATUS(status)) reset_service(a->launcher, a->service, "org.bus1.DBus.Name.Error.UnitFailure"); else a->service->starting = FALSE; g_spawn_close_pid(pid); g_free(a); }
+typedef struct {
+ Launcher *launcher;
+ Service *service;
+ gchar *user;
+ uid_t uid;
+ gid_t gid;
+} Activation;
+static void activation_free(Activation *a) { if (!a) return; g_free(a->user); g_free(a); }
+static void activation_child_setup(gpointer data) {
+ Activation *a = data;
+
+ if (!a->user || (geteuid() == a->uid && getegid() == a->gid)) return;
+ /* User= is meaningful for system service activation.  Do the privilege
+  * transition in the child so the launcher itself remains the controller. */
+ if (geteuid() != 0 || initgroups(a->user, a->gid) < 0 || setgid(a->gid) < 0 || setuid(a->uid) < 0)
+  _exit(127);
+}
+static void child_done(GPid pid, gint status, gpointer data) { Activation *a = data; if (!WIFEXITED(status) || WEXITSTATUS(status)) reset_service(a->launcher, a->service, "org.bus1.DBus.Name.Error.UnitFailure"); else a->service->starting = FALSE; g_spawn_close_pid(pid); activation_free(a); }
 static gchar **activation_environment(Launcher *l) {
  gchar **env = g_get_environ(); GHashTableIter iter; gpointer key, value;
  g_hash_table_iter_init(&iter, l->environment);
@@ -119,14 +136,20 @@ static gchar **activation_environment(Launcher *l) {
  return env;
 }
 static void activate(Launcher *l, Service *s, guint64 serial) {
- GError *e = NULL; gchar **argv = NULL; gchar **env;
+ GError *e = NULL; gchar **argv = NULL; gchar **env; struct passwd *pw = NULL; Activation *activation;
  if (s->starting) return;
  s->starting = TRUE;
  s->serial = serial;
  if (!g_shell_parse_argv(s->exec, NULL, &argv, &e)) { die_error("Invalid service Exec", e); reset_service(l, s, "org.bus1.DBus.Name.Error.InvalidUnit"); return; }
+ if (s->user && *s->user) {
+  pw = getpwnam(s->user);
+  if (!pw) { g_set_error(&e, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "Unknown service user %s", s->user); die_error("Service activation failed", e); reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure"); g_strfreev(argv); return; }
+ }
  env = activation_environment(l); env = g_environ_setenv(env, "DBUS_STARTER_ADDRESS", l->address, TRUE); env = g_environ_setenv(env, "DBUS_STARTER_BUS_TYPE", l->user ? "session" : "system", TRUE);
+ activation = g_new0(Activation, 1); activation->launcher = l; activation->service = s;
+ if (pw) { activation->user = g_strdup(pw->pw_name); activation->uid = pw->pw_uid; activation->gid = pw->pw_gid; }
  GPid pid;
- if (!g_spawn_async(NULL, argv, env, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &e)) { die_error("Service activation failed", e); reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure"); } else { Activation *a = g_new(Activation, 1); *a=(Activation){l,s}; g_child_watch_add(pid, child_done, a); }
+ if (!g_spawn_async(NULL, argv, env, G_SPAWN_DO_NOT_REAP_CHILD, activation_child_setup, activation, &pid, &e)) { die_error("Service activation failed", e); reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure"); activation_free(activation); } else g_child_watch_add(pid, child_done, activation);
  g_strfreev(argv); g_strfreev(env);
 }
 

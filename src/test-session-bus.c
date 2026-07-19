@@ -31,7 +31,10 @@ static void test_session_bus(gconstpointer data) {
         g_assert_true(g_file_set_contents(command_file, command, -1, &error));
         g_assert_no_error(error);
         g_assert_cmpint(chmod(command_file, 0700), ==, 0);
-        service_contents = g_strdup_printf("[D-BUS Service]\nName=org.example.SessionTest\nExec=%s\n", command_file);
+        /* Exercise the D-Bus service-file User= path.  The test runner's own
+         * account keeps this portable for unprivileged test runs. */
+        service_contents = g_strdup_printf("[D-BUS Service]\nName=org.example.SessionTest\nExec=%s\nUser=%s\n",
+                                           command_file, g_get_user_name());
         g_assert_true(g_file_set_contents(service_file, service_contents, -1, &error));
         g_assert_no_error(error);
         g_free(service_contents);
