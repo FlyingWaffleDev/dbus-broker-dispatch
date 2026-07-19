@@ -112,13 +112,19 @@ static gboolean register_service(Launcher *l, Service *s, GError **error) {
 static void reset_service(Launcher *l, Service *s, const gchar *why) { GError *e = NULL; call(l, s->path, "org.bus1.DBus.Name", "Reset", g_variant_new("(ts)", s->serial, why), &e); g_clear_error(&e); s->starting = FALSE; }
 typedef struct { Launcher *launcher; Service *service; } Activation;
 static void child_done(GPid pid, gint status, gpointer data) { Activation *a = data; if (!WIFEXITED(status) || WEXITSTATUS(status)) reset_service(a->launcher, a->service, "org.bus1.DBus.Name.Error.UnitFailure"); else a->service->starting = FALSE; g_spawn_close_pid(pid); g_free(a); }
+static gchar **activation_environment(Launcher *l) {
+ gchar **env = g_get_environ(); GHashTableIter iter; gpointer key, value;
+ g_hash_table_iter_init(&iter, l->environment);
+ while (g_hash_table_iter_next(&iter, &key, &value)) env = g_environ_setenv(env, key, value, TRUE);
+ return env;
+}
 static void activate(Launcher *l, Service *s, guint64 serial) {
  GError *e = NULL; gchar **argv = NULL; gchar **env;
  if (s->starting) return;
  s->starting = TRUE;
  s->serial = serial;
  if (!g_shell_parse_argv(s->exec, NULL, &argv, &e)) { die_error("Invalid service Exec", e); reset_service(l, s, "org.bus1.DBus.Name.Error.InvalidUnit"); return; }
- env = g_get_environ(); env = g_environ_setenv(env, "DBUS_STARTER_ADDRESS", l->address, TRUE); env = g_environ_setenv(env, "DBUS_STARTER_BUS_TYPE", l->user ? "session" : "system", TRUE);
+ env = activation_environment(l); env = g_environ_setenv(env, "DBUS_STARTER_ADDRESS", l->address, TRUE); env = g_environ_setenv(env, "DBUS_STARTER_BUS_TYPE", l->user ? "session" : "system", TRUE);
  GPid pid;
  if (!g_spawn_async(NULL, argv, env, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &e)) { die_error("Service activation failed", e); reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure"); } else { Activation *a = g_new(Activation, 1); *a=(Activation){l,s}; g_child_watch_add(pid, child_done, a); }
  g_strfreev(argv); g_strfreev(env);
@@ -127,7 +133,15 @@ static void activate(Launcher *l, Service *s, guint64 serial) {
 static void on_signal(GDBusConnection *c, const gchar *sender, const gchar *path, const gchar *iface, const gchar *signal, GVariant *params, gpointer data) {
  Launcher *l = data; (void)c; (void)sender;
  if (g_str_equal(iface, "org.bus1.DBus.Name") && g_str_equal(signal, "Activate")) { Service *s = g_hash_table_lookup(l->services, path); if (s) { guint64 serial; g_variant_get(params, "(t)", &serial); activate(l, s, serial); } }
- else if (g_str_equal(iface, "org.bus1.DBus.Broker") && g_str_equal(signal, "SetActivationEnvironment")) { GVariant *dict; g_variant_get(params, "(@a{ss})", &dict); g_variant_unref(dict); }
+ else if (g_str_equal(iface, "org.bus1.DBus.Broker") && g_str_equal(signal, "SetActivationEnvironment")) {
+  GVariant *dict; GVariantIter iter; gchar *key, *value;
+  g_variant_get(params, "(@a{ss})", &dict); g_variant_iter_init(&iter, dict);
+  while (g_variant_iter_next(&iter, "{ss}", &key, &value)) {
+   if (*key && !strchr(key, '=')) g_hash_table_replace(l->environment, key, value);
+   else { g_warning("Ignoring invalid D-Bus activation environment variable"); g_free(key); g_free(value); }
+  }
+  g_variant_unref(dict);
+ }
 }
 
 static GHashTable *new_service_table(void) {

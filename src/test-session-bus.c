@@ -8,7 +8,9 @@
 
 static void test_session_bus(gconstpointer data) {
         const gchar *launcher = data;
-        gchar *runtime = NULL, *address = NULL, **environment = NULL;
+        gchar *runtime = NULL, *data_home = NULL, *service_dir = NULL, *service_file = NULL;
+        gchar *marker = NULL, *command_file = NULL, *quoted_marker = NULL, *command = NULL, *service_contents = NULL;
+        gchar *address = NULL, *contents = NULL, **environment = NULL;
         GPid pid = 0;
         GDBusConnection *connection = NULL;
         GVariant *reply = NULL;
@@ -18,8 +20,24 @@ static void test_session_bus(gconstpointer data) {
         runtime = g_dir_make_tmp("openrc-broker-session-test-XXXXXX", &error);
         g_assert_no_error(error);
         g_assert_cmpint(chmod(runtime, 0700), ==, 0);
+        data_home = g_build_filename(runtime, "data", NULL);
+        service_dir = g_build_filename(data_home, "dbus-1", "services", NULL);
+        service_file = g_build_filename(service_dir, "org.example.SessionTest.service", NULL);
+        marker = g_build_filename(runtime, "activation-display", NULL);
+        command_file = g_build_filename(runtime, "activation-command", NULL);
+        g_assert_cmpint(g_mkdir_with_parents(service_dir, 0700), ==, 0);
+        quoted_marker = g_shell_quote(marker);
+        command = g_strdup_printf("#!/bin/sh\nprintf %%s \"$DISPLAY\" > %s\n", quoted_marker);
+        g_assert_true(g_file_set_contents(command_file, command, -1, &error));
+        g_assert_no_error(error);
+        g_assert_cmpint(chmod(command_file, 0700), ==, 0);
+        service_contents = g_strdup_printf("[D-BUS Service]\nName=org.example.SessionTest\nExec=%s\n", command_file);
+        g_assert_true(g_file_set_contents(service_file, service_contents, -1, &error));
+        g_assert_no_error(error);
+        g_free(service_contents);
         environment = g_get_environ();
         environment = g_environ_setenv(environment, "XDG_RUNTIME_DIR", runtime, TRUE);
+        environment = g_environ_setenv(environment, "XDG_DATA_HOME", data_home, TRUE);
         g_assert_true(g_spawn_async(NULL,
                                     (gchar *[]){ (gchar *)launcher, "--scope=user", "--foreground", NULL },
                                     environment, G_SPAWN_DO_NOT_REAP_CHILD, NULL, NULL, &pid, &error));
@@ -44,14 +62,52 @@ static void test_session_bus(gconstpointer data) {
                                              -1, NULL, &error);
         g_assert_no_error(error);
         g_assert_nonnull(reply);
-
         g_variant_unref(reply);
+        reply = NULL;
+
+        {
+                GVariantBuilder builder;
+                g_variant_builder_init(&builder, G_VARIANT_TYPE("a{ss}"));
+                g_variant_builder_add(&builder, "{ss}", "DISPLAY", ":test-display");
+                reply = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                                                     "org.freedesktop.DBus", "UpdateActivationEnvironment",
+                                                     g_variant_new("(@a{ss})", g_variant_builder_end(&builder)),
+                                                     NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
+                g_assert_no_error(error);
+                g_assert_nonnull(reply);
+                g_variant_unref(reply);
+        }
+        g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                               "StartServiceByName", g_variant_new("(su)", "org.example.SessionTest", 0),
+                               NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+        for (guint attempt = 0; attempt < 100 && !g_file_test(marker, G_FILE_TEST_EXISTS); ++attempt)
+                g_usleep(10 * 1000);
+        g_assert_true(g_file_get_contents(marker, &contents, NULL, &error));
+        g_assert_no_error(error);
+        g_assert_cmpstr(contents, ==, ":test-display");
+
         g_object_unref(connection);
         kill(pid, SIGTERM);
         g_assert_cmpint(waitpid(pid, &status, 0), ==, pid);
         g_spawn_close_pid(pid);
         g_free(address);
+        g_free(contents);
+        g_assert_cmpint(g_remove(marker), ==, 0);
+        g_assert_cmpint(g_remove(command_file), ==, 0);
+        g_assert_cmpint(g_remove(service_file), ==, 0);
+        g_assert_cmpint(g_rmdir(service_dir), ==, 0);
+        g_free(service_dir);
+        service_dir = g_build_filename(data_home, "dbus-1", NULL);
+        g_assert_cmpint(g_rmdir(service_dir), ==, 0);
+        g_assert_cmpint(g_rmdir(data_home), ==, 0);
         g_assert_cmpint(g_rmdir(runtime), ==, 0);
+        g_free(command);
+        g_free(quoted_marker);
+        g_free(marker);
+        g_free(command_file);
+        g_free(service_file);
+        g_free(service_dir);
+        g_free(data_home);
         g_free(runtime);
 }
 
