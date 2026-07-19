@@ -147,11 +147,21 @@ static gboolean bind_listener(Launcher *l, GError **error) {
  a=g_unix_socket_address_new(l->socket_path); if(!g_socket_bind(l->listener,a,FALSE,error) || !g_socket_listen(l->listener,error)) {g_object_unref(a);return FALSE;} g_object_unref(a); return TRUE;
 }
 static void child_setup(gpointer data) { int fd=GPOINTER_TO_INT(data); if(dup2(fd,3)<0)_exit(127); }
+static gchar *read_machine_id(GError **error) {
+ gchar *id = NULL; gsize len = 0;
+ if (!g_file_get_contents("/etc/machine-id", &id, &len, error)) return NULL;
+ g_strstrip(id);
+ if (strlen(id) != 32) { g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "/etc/machine-id must contain a 32-character machine ID"); g_free(id); return NULL; }
+ for (gchar *p = id; *p; ++p) if (!g_ascii_isxdigit(*p)) { g_set_error(error, G_IO_ERROR, G_IO_ERROR_INVALID_DATA, "/etc/machine-id is not hexadecimal"); g_free(id); return NULL; }
+ return id;
+}
 static gboolean start_broker(Launcher *l, GError **error) {
- int pair[2]; GSocket *s; GSocketConnection *sc; gchar *arg, *guid; gchar *argv[3];
+ int pair[2]; GSocket *s; GSocketConnection *sc; gchar *arg, *machine_arg, *guid, *machine_id; gchar *argv[4];
  if(socketpair(AF_UNIX,SOCK_STREAM|SOCK_CLOEXEC,0,pair)<0){g_set_error(error,G_IO_ERROR,g_io_error_from_errno(errno),"socketpair: %s",g_strerror(errno));return FALSE;}
- arg=g_strdup("--controller=3"); argv[0]=l->broker; argv[1]=arg; argv[2]=NULL;
- if(!g_spawn_async(NULL,argv,NULL,G_SPAWN_DO_NOT_REAP_CHILD,child_setup,GINT_TO_POINTER(pair[1]),&l->broker_pid,error)){close(pair[0]);close(pair[1]);g_free(arg);return FALSE;} close(pair[1]);g_free(arg);
+ machine_id = read_machine_id(error); if (!machine_id) { close(pair[0]); close(pair[1]); return FALSE; }
+ arg=g_strdup("--controller=3"); machine_arg=g_strdup_printf("--machine-id=%s", machine_id); argv[0]=l->broker; argv[1]=arg; argv[2]=machine_arg; argv[3]=NULL;
+ g_message("Starting dbus-broker with machine ID %.8s...", machine_id);
+ if(!g_spawn_async(NULL,argv,NULL,G_SPAWN_DO_NOT_REAP_CHILD,child_setup,GINT_TO_POINTER(pair[1]),&l->broker_pid,error)){close(pair[0]);close(pair[1]);g_free(arg);g_free(machine_arg);g_free(machine_id);return FALSE;} close(pair[1]);g_free(arg);g_free(machine_arg);g_free(machine_id);
  s=g_socket_new_from_fd(pair[0],error); if(!s)return FALSE; sc=G_SOCKET_CONNECTION(g_socket_connection_factory_create_connection(s)); g_object_unref(s);
  guid = g_dbus_generate_guid();
  l->controller=g_dbus_connection_new_sync(G_IO_STREAM(sc),guid,G_DBUS_CONNECTION_FLAGS_AUTHENTICATION_SERVER,NULL,NULL,error); g_free(guid); g_object_unref(sc); return l->controller!=NULL;

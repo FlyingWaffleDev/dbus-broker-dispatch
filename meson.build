@@ -1,4 +1,4 @@
-project('openrc-broker-launcher', 'c', version: '0.1.0',
+project('dbus-broker-openrc-launcher', 'c', version: '0.1.0',
         default_options: ['c_std=c11', 'warning_level=2'])
 
 glib = dependency('glib-2.0', version: '>= 2.56')
@@ -22,5 +22,3 @@ if get_option('elogind')
 endif
 executable('dbus-broker-openrc-launch', 'src/launcher.c', dependencies: deps, install: true)
 executable('dbus-broker-openrc-run-session', 'src/run-session.c', dependencies: [glib], install: true)
-install_data('openrc/dbus', install_dir: get_option('libdir') / 'openrc' / 'init.d')
-install_data('README.md', install_dir: get_option('datadir') / 'doc' / 'openrc-broker-launcher')
