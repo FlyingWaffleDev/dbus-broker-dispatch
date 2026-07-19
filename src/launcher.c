@@ -8,6 +8,7 @@
 #include <getopt.h>
 #include <pwd.h>
 #include <signal.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -154,7 +155,10 @@ static gboolean bind_listener(Launcher *l, GError **error) {
  f=g_file_new_for_path(l->socket_path); g_file_delete(f,NULL,NULL); g_object_unref(f);
  a=g_unix_socket_address_new(l->socket_path); if(!g_socket_bind(l->listener,a,FALSE,error) || !g_socket_listen(l->listener,error)) {g_object_unref(a);return FALSE;} g_object_unref(a); return TRUE;
 }
-static void child_setup(gpointer data) { int fd=GPOINTER_TO_INT(data); if(dup2(fd,3)<0)_exit(127); }
+static void child_setup(gpointer data) {
+ int fd = GPOINTER_TO_INT(data);
+ if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || dup2(fd, 3) < 0) _exit(127);
+}
 static gchar *read_machine_id(GError **error) {
  gchar *id = NULL; gsize len = 0;
  if (!g_file_get_contents("/etc/machine-id", &id, &len, error)) return NULL;
