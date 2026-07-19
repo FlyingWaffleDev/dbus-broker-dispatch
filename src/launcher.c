@@ -170,7 +170,7 @@ static gboolean start_broker(Launcher *l, GError **error) {
 static gboolean add_listener(Launcher *l, GError **error) {
  GUnixFDList *fds=g_unix_fd_list_new(); gint idx=g_unix_fd_list_append(fds,g_socket_get_fd(l->listener),error); GVariant *reply;
  if(idx<0){g_object_unref(fds);return FALSE;}
- reply=g_dbus_connection_call_with_unix_fd_list_sync(l->controller,NULL,"/org/bus1/DBus/Broker","org.bus1.DBus.Broker","AddListener",g_variant_new("(ohv)","/org/bus1/DBus/Listener/0",idx,g_variant_new_variant(make_policy(l))),NULL,G_DBUS_CALL_FLAGS_NONE,-1,fds,NULL,NULL,error); g_object_unref(fds); if(!reply)return FALSE;g_variant_unref(reply);return TRUE;
+ reply=g_dbus_connection_call_with_unix_fd_list_sync(l->controller,NULL,"/org/bus1/DBus/Broker","org.bus1.DBus.Broker","AddListener",g_variant_new("(ohv)","/org/bus1/DBus/Listener/0",idx,make_policy(l)),NULL,G_DBUS_CALL_FLAGS_NONE,-1,fds,NULL,NULL,error); g_object_unref(fds); if(!reply)return FALSE;g_variant_unref(reply);return TRUE;
 }
 static void usage(const gchar *p) { g_print("Usage: %s --scope=system|user [--config-file=PATH] [--address=ADDRESS] [--broker=PATH] [--system-uid-max=N] [--audit] [--foreground]\n",p); }
 int main(int argc, char **argv) {
