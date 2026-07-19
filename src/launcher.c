@@ -10,6 +10,7 @@
 #include <signal.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -153,7 +154,9 @@ static gboolean bind_listener(Launcher *l, GError **error) {
  GSocketAddress *a; GFile *f;
  l->listener=g_socket_new(G_SOCKET_FAMILY_UNIX,G_SOCKET_TYPE_STREAM,G_SOCKET_PROTOCOL_DEFAULT,error); if(!l->listener)return FALSE;
  f=g_file_new_for_path(l->socket_path); g_file_delete(f,NULL,NULL); g_object_unref(f);
- a=g_unix_socket_address_new(l->socket_path); if(!g_socket_bind(l->listener,a,FALSE,error) || !g_socket_listen(l->listener,error)) {g_object_unref(a);return FALSE;} g_object_unref(a); return TRUE;
+ a=g_unix_socket_address_new(l->socket_path); if(!g_socket_bind(l->listener,a,FALSE,error) || !g_socket_listen(l->listener,error)) {g_object_unref(a);return FALSE;} g_object_unref(a);
+ if (!l->user && chmod(l->socket_path, 0666) < 0) { g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno), "chmod %s: %s", l->socket_path, g_strerror(errno)); return FALSE; }
+ return TRUE;
 }
 static void child_setup(gpointer data) {
  int fd = GPOINTER_TO_INT(data);
