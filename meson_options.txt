@@ -2,3 +2,7 @@ option('elogind', type: 'boolean', value: false,
        description: 'Enable elogind-backed active-local-session detection')
 option('system-console-users', type: 'array', value: [],
        description: 'Additional users always considered at-console')
+option('pam', type: 'feature', value: 'auto',
+       description: 'Build the PAM session module')
+option('pam-module-dir', type: 'string', value: '',
+       description: 'PAM module installation directory (defaults to libdir/security)')

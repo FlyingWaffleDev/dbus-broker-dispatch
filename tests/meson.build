@@ -33,3 +33,17 @@ test(
   ],
   timeout: 30,
 )
+
+if pam.found()
+  test_pam_session = executable(
+    'test-pam-session',
+    'test-pam-session.c',
+    dependencies: [glib, gio, pam],
+  )
+  test(
+    'pam-session',
+    test_pam_session,
+    args: [pam_dbus_broker_dispatch.full_path(), dbus_broker_dispatch.full_path()],
+    timeout: 30,
+  )
+endif

@@ -24,6 +24,8 @@ the system or desktop-session bus on a primary machine.
 - Optional live elogind session monitoring for console-sensitive policy.
 - AppArmor feature detection and `enabled`, `disabled`, and `required` modes.
 - A `dbus-run-session`-style wrapper for isolated user buses.
+- An optional PAM session module that starts one shared user bus after the
+  session manager has created a secure `XDG_RUNTIME_DIR`.
 
 `SystemdService=` is ignored when an `Exec=` command is available. A service
 that contains only `SystemdService=` is not registered; this project never
@@ -36,6 +38,11 @@ meson setup build --buildtype=release
 meson compile -C build
 meson test -C build --print-errorlogs
 ```
+
+The PAM module is built automatically when Linux-PAM is available. Require or
+disable it explicitly with `-Dpam=enabled` or `-Dpam=disabled`; override its
+installation directory with `-Dpam-module-dir=/lib64/security` when a
+distribution keeps PAM modules outside the normal prefix.
 
 Enable elogind policy updates with `-Delogind=true`. Configure additional
 users that should always receive `at_console` policy with, for example,
@@ -68,7 +75,36 @@ The dispatcher requires an explicit `--scope`. It accepts `--config-file`,
 `--address`, `--broker`, `--pid-file`, `--system-uid-max`, and `--audit`.
 Omit `--foreground` to self-daemonize. The OpenRC system service uses that
 mode to match Gentoo's reference `dbus` service; the OpenRC user service uses
-foreground mode under `supervise-daemon`.
+self-daemonizing mode as well.
+
+## PAM user-bus startup
+
+`pam_dbus_broker_dispatch.so` is an optional session module for systems that
+have no per-user service manager. Add it after the module that creates
+`XDG_RUNTIME_DIR` (normally `pam_elogind.so`):
+
+```text
+-session optional pam_dbus_broker_dispatch.so
+```
+
+On open-session it validates that the runtime directory is an absolute,
+user-owned `0700` directory, serializes concurrent starts, and launches
+`dbus-broker-dispatch --scope=user` with the target user's credentials. It
+then publishes `DBUS_SESSION_BUS_ADDRESS` through the PAM environment. Multiple
+PAM sessions share the same module-owned bus; the last close-session stops it.
+An already-active bus owned by another integration mechanism is reused but is
+never claimed or stopped.
+
+The module does not create or chown runtime directories. A missing
+`XDG_RUNTIME_DIR` returns `PAM_IGNORE`, so ordering after `pam_elogind` (or an
+equivalent session-runtime provider) is required. The optional PAM control
+flag is recommended during initial deployment so a bus failure cannot prevent
+login. Add the line only to session stacks whose processes should inherit a
+user bus.
+
+Module arguments are limited to `debug`, `dispatcher=/absolute/path`, and
+`config-file=/absolute/path`. The path overrides are intended for development
+and controlled deployments; normal installations need no arguments.
 
 ## Current compatibility boundary
 

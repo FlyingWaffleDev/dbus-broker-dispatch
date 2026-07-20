@@ -8,6 +8,7 @@ expat = dependency('expat')
 conf = configuration_data()
 conf.set_quoted('PROJECT_VERSION', meson.project_version())
 conf.set_quoted('DEFAULT_BROKER', get_option('prefix') / get_option('libexecdir') / 'dbus-broker')
+conf.set_quoted('DEFAULT_DISPATCHER', get_option('prefix') / get_option('bindir') / 'dbus-broker-dispatch')
 conf.set_quoted('SYSTEM_CONSOLE_USERS', ','.join(get_option('system-console-users')))
 if get_option('elogind')
   elogind = dependency('libelogind', required: true)
@@ -37,5 +38,22 @@ dbus_broker_run_session = executable(
   include_directories: src_inc,
   install: true,
 )
+
+pam = dependency('pam', required: get_option('pam'))
+if pam.found()
+  pam_module_dir = get_option('pam-module-dir')
+  if pam_module_dir == ''
+    pam_module_dir = get_option('prefix') / get_option('libdir') / 'security'
+  endif
+  pam_dbus_broker_dispatch = shared_module(
+    'pam_dbus_broker_dispatch',
+    'src/pam-dbus-broker-dispatch.c',
+    name_prefix: '',
+    dependencies: [pam],
+    include_directories: src_inc,
+    install: true,
+    install_dir: pam_module_dir,
+  )
+endif
 
 subdir('tests')
