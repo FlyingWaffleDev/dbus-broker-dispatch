@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include <errno.h>
 #include <gio/gio.h>
 #include <glib/gstdio.h>
 #include <signal.h>
@@ -28,7 +29,7 @@ static void test_session_bus(gconstpointer data)
         GError *error = NULL;
         int status;
 
-        runtime = g_dir_make_tmp("openrc-broker-session-test-XXXXXX", &error);
+        runtime = g_dir_make_tmp("broker-dispatch-session-test-XXXXXX", &error);
         g_assert_no_error(error);
         g_assert_cmpint(chmod(runtime, 0700), ==, 0);
         data_home = g_build_filename(runtime, "data", NULL);
@@ -168,10 +169,91 @@ static void test_session_bus(gconstpointer data)
         g_free(runtime);
 }
 
+static void test_daemon_startup(gconstpointer data)
+{
+        const gchar *dispatcher = data;
+        gchar *runtime, *config_file, *pid_file, *socket_path, *config_contents, *pid_contents = NULL;
+        gchar **environment;
+        gchar *end = NULL;
+        GError *error = NULL;
+        struct stat socket_stat;
+        gint64 parsed_pid;
+        int status;
+
+        runtime = g_dir_make_tmp("broker-dispatch-daemon-test-XXXXXX", &error);
+        g_assert_no_error(error);
+        g_assert_cmpint(chmod(runtime, 0700), ==, 0);
+        config_file = g_build_filename(runtime, "session.conf", NULL);
+        pid_file = g_build_filename(runtime, "dispatch.pid", NULL);
+        socket_path = g_build_filename(runtime, "bus", NULL);
+        config_contents = g_strdup_printf("<busconfig>"
+                                          "<listen>unix:path=%s</listen>"
+                                          "<policy context='default'>"
+                                          "<allow user='*'/><allow own='*'/><allow send_destination='*'/>"
+                                          "<allow receive_sender='*'/>"
+                                          "</policy>"
+                                          "</busconfig>",
+                                          socket_path);
+        g_assert_true(g_file_set_contents(config_file, config_contents, -1, &error));
+        g_assert_no_error(error);
+        environment = g_get_environ();
+        environment = g_environ_setenv(environment, "XDG_RUNTIME_DIR", runtime, TRUE);
+        g_assert_true(g_spawn_sync(NULL,
+                                   (gchar *[]){(gchar *)dispatcher, "--scope=user", "--config-file", config_file,
+                                               "--pid-file", pid_file, NULL},
+                                   environment, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL,
+                                   NULL, NULL, &status, &error));
+        g_assert_no_error(error);
+        g_assert_true(WIFEXITED(status));
+        g_assert_cmpint(WEXITSTATUS(status), ==, 0);
+        g_assert_cmpint(lstat(socket_path, &socket_stat), ==, 0);
+        g_assert_true(S_ISSOCK(socket_stat.st_mode));
+        g_assert_true(g_file_get_contents(pid_file, &pid_contents, NULL, &error));
+        g_assert_no_error(error);
+        errno = 0;
+        parsed_pid = g_ascii_strtoll(pid_contents, &end, 10);
+        g_assert_cmpint(errno, ==, 0);
+        g_assert_true(end != pid_contents && (*end == '\n' || *end == '\0'));
+        g_assert_cmpint(parsed_pid, >, 1);
+        g_assert_cmpint(kill((pid_t)parsed_pid, SIGTERM), ==, 0);
+        for (guint attempt = 0; attempt < 500 && (g_file_test(socket_path, G_FILE_TEST_EXISTS) ||
+                                                  g_file_test(pid_file, G_FILE_TEST_EXISTS));
+             ++attempt)
+                g_usleep(10 * 1000);
+        g_assert_false(g_file_test(socket_path, G_FILE_TEST_EXISTS));
+        g_assert_false(g_file_test(pid_file, G_FILE_TEST_EXISTS));
+
+        /* A daemonized start must propagate post-fork initialization errors
+         * to its caller instead of reporting a false successful start. */
+        g_assert_true(g_file_set_contents(socket_path, "occupied", -1, &error));
+        g_assert_no_error(error);
+        g_assert_true(g_spawn_sync(NULL,
+                                   (gchar *[]){(gchar *)dispatcher, "--scope=user", "--config-file", config_file,
+                                               "--pid-file", pid_file, NULL},
+                                   environment, G_SPAWN_STDOUT_TO_DEV_NULL | G_SPAWN_STDERR_TO_DEV_NULL, NULL, NULL,
+                                   NULL, NULL, &status, &error));
+        g_assert_no_error(error);
+        g_assert_true(WIFEXITED(status));
+        g_assert_cmpint(WEXITSTATUS(status), ==, 1);
+        g_assert_false(g_file_test(pid_file, G_FILE_TEST_EXISTS));
+        g_assert_cmpint(g_remove(socket_path), ==, 0);
+
+        g_strfreev(environment);
+        g_free(pid_contents);
+        g_assert_cmpint(g_remove(config_file), ==, 0);
+        g_assert_cmpint(g_rmdir(runtime), ==, 0);
+        g_free(config_contents);
+        g_free(socket_path);
+        g_free(pid_file);
+        g_free(config_file);
+        g_free(runtime);
+}
+
 int main(int argc, char **argv)
 {
         g_test_init(&argc, &argv, NULL);
         g_assert_cmpint(argc, ==, 2);
         g_test_add_data_func("/session-bus/connect-and-list", argv[1], test_session_bus);
+        g_test_add_data_func("/session-bus/daemon-startup", argv[1], test_daemon_startup);
         return g_test_run();
 }

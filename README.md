@@ -1,11 +1,11 @@
-# Non-systemd launcher for dbus-broker
+# dbus-broker-dispatch
 
-`dbus-broker-openrc-launch` is an init-agnostic controller for
+`dbus-broker-dispatch` is an init-agnostic controller for
 [`dbus-broker`](https://github.com/bus1/dbus-broker). It creates the public
 Unix listener, starts an unprivileged broker with a private controller socket,
 loads standard D-Bus XML policy, and provides service activation and reloads.
-The companion Gentoo overlay supplies the OpenRC integration; the controller
-itself does not call or depend on OpenRC.
+The companion Gentoo overlay supplies `dbus-broker-dispatch-openrc`; the
+dispatcher itself does not call or depend on OpenRC.
 
 This is pre-release software. Test it in a disposable system before replacing
 the system or desktop-session bus on a primary machine.
@@ -51,23 +51,24 @@ meson test -C build-asan --print-errorlogs
 
 ## Usage
 
-Run under a supervisor in the foreground:
+Run in the foreground under a supervisor:
 
 ```sh
-dbus-broker-openrc-launch --scope=system --foreground
-dbus-broker-openrc-launch --scope=user --foreground
+dbus-broker-dispatch --scope=system --foreground
+dbus-broker-dispatch --scope=user --foreground
 ```
 
 Run one command in a private session bus:
 
 ```sh
-dbus-broker-openrc-run-session -- command arg...
+dbus-broker-run-session -- command arg...
 ```
 
-The launcher requires an explicit `--scope`. It accepts `--config-file`,
+The dispatcher requires an explicit `--scope`. It accepts `--config-file`,
 `--address`, `--broker`, `--pid-file`, `--system-uid-max`, and `--audit`.
-Daemonization remains available by omitting `--foreground`, but supervised
-foreground mode gives the init system accurate startup and failure reporting.
+Omit `--foreground` to self-daemonize. The OpenRC system service uses that
+mode to match Gentoo's reference `dbus` service; the OpenRC user service uses
+foreground mode under `supervise-daemon`.
 
 ## Current compatibility boundary
 

@@ -1,4 +1,4 @@
-project('dbus-broker-openrc-launcher', 'c', version: '0.1.0',
+project('dbus-broker-dispatch', 'c', version: '0.1.0',
         default_options: ['c_std=c11', 'warning_level=3'])
 
 glib = dependency('glib-2.0', version: '>= 2.56')
@@ -22,16 +22,16 @@ if get_option('elogind')
   deps += elogind
 endif
 src_inc = include_directories('src')
-dbus_broker_openrc_launch = executable(
-  'dbus-broker-openrc-launch',
+dbus_broker_dispatch = executable(
+  'dbus-broker-dispatch',
   ['src/launcher.c', 'src/config-policy.c'],
   dependencies: deps,
   include_directories: src_inc,
   install: true,
 )
 
-dbus_broker_openrc_run_session = executable(
-  'dbus-broker-openrc-run-session',
+dbus_broker_run_session = executable(
+  'dbus-broker-run-session',
   'src/run-session.c',
   dependencies: [glib],
   include_directories: src_inc,

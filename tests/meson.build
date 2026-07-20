@@ -15,7 +15,7 @@ test_session_bus = executable(
 test(
   'session-bus',
   test_session_bus,
-  args: [dbus_broker_openrc_launch.full_path()],
+  args: [dbus_broker_dispatch.full_path()],
   timeout: 30,
 )
 
@@ -28,8 +28,8 @@ test(
   'run-session',
   test_run_session,
   args: [
-    dbus_broker_openrc_run_session.full_path(),
-    dbus_broker_openrc_launch.full_path(),
+    dbus_broker_run_session.full_path(),
+    dbus_broker_dispatch.full_path(),
   ],
   timeout: 30,
 )

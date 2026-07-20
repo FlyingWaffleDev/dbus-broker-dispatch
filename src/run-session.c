@@ -34,7 +34,7 @@ static gboolean wait_for_bus(const gchar *socket_path, GPid bus, gboolean *reape
                 if (result == bus) {
                         *reaped = TRUE;
                         g_set_error(error, G_SPAWN_ERROR, G_SPAWN_ERROR_FAILED,
-                                    "user bus launcher exited before its listener was ready");
+                                    "user bus dispatcher exited before its listener was ready");
                         return FALSE;
                 }
                 if (result < 0 && errno != EINTR) {
@@ -74,7 +74,7 @@ int main(int argc, char **argv)
         gboolean bus_reaped = FALSE;
 
         if (argc < 2) {
-                g_printerr("Usage: %s -- COMMAND [ARGS...]\n", argv[0]);
+                g_printerr("Usage: dbus-broker-run-session -- COMMAND [ARGS...]\n");
                 return 2;
         }
         if (g_strcmp0(argv[1], "--") == 0)
@@ -100,9 +100,9 @@ int main(int argc, char **argv)
                 return 1;
         }
 
-        launcher = g_find_program_in_path("dbus-broker-openrc-launch");
+        launcher = g_find_program_in_path("dbus-broker-dispatch");
         if (!launcher)
-                launcher = g_strdup("dbus-broker-openrc-launch");
+                launcher = g_strdup("dbus-broker-dispatch");
         if (!g_spawn_async(NULL, (gchar *[]){launcher, "--scope=user", "--foreground", NULL}, NULL,
                            G_SPAWN_DO_NOT_REAP_CHILD, launcher_child_setup, NULL, &bus, &error)) {
                 g_printerr("Cannot start user bus: %s\n", error->message);

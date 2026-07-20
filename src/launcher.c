@@ -35,6 +35,7 @@ typedef struct {
 } Service;
 typedef struct {
         gboolean user, audit, daemonize;
+        int startup_fd;
         gchar *config, *address, *broker, *socket_path, *pid_file;
         guint system_uid_max;
         guint64 max_bytes, max_fds, max_matches;
@@ -1094,12 +1095,74 @@ static gboolean write_pid_file(const gchar *path, GError **error)
 
 static gboolean daemonize(Launcher *l, GError **error)
 {
+        char status;
+        pid_t pid;
+        ssize_t result;
+        int null_fd;
+        int startup_pipe[2];
 
-        if (l->daemonize && daemon(0, 0) < 0) {
-                g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno), "daemon: %s", g_strerror(errno));
+        if (!l->daemonize)
+                return write_pid_file(l->pid_file, error);
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, startup_pipe) < 0) {
+                g_set_error(error, G_IO_ERROR, g_io_error_from_errno(errno), "startup socketpair: %s",
+                            g_strerror(errno));
                 return FALSE;
         }
-        return write_pid_file(l->pid_file, error);
+        pid = fork();
+        if (pid < 0) {
+                int saved_errno = errno;
+                close(startup_pipe[0]);
+                close(startup_pipe[1]);
+                g_set_error(error, G_IO_ERROR, g_io_error_from_errno(saved_errno), "fork: %s", g_strerror(saved_errno));
+                return FALSE;
+        }
+        if (pid > 0) {
+                close(startup_pipe[1]);
+                do
+                        result = read(startup_pipe[0], &status, 1);
+                while (result < 0 && errno == EINTR);
+                close(startup_pipe[0]);
+                _exit(result == 1 && status == 'R' ? 0 : 1);
+        }
+        close(startup_pipe[0]);
+        l->startup_fd = startup_pipe[1];
+        if (setsid() < 0 || chdir("/") < 0 || (null_fd = open("/dev/null", O_RDWR | O_CLOEXEC)) < 0 ||
+            dup2(null_fd, STDIN_FILENO) < 0 || dup2(null_fd, STDOUT_FILENO) < 0 || dup2(null_fd, STDERR_FILENO) < 0) {
+                int saved_errno = errno;
+                status = 'F';
+                do
+                        result = send(l->startup_fd, &status, 1, MSG_NOSIGNAL);
+                while (result < 0 && errno == EINTR);
+                close(l->startup_fd);
+                l->startup_fd = -1;
+                g_set_error(error, G_IO_ERROR, g_io_error_from_errno(saved_errno), "daemon setup: %s",
+                            g_strerror(saved_errno));
+                return FALSE;
+        }
+        if (null_fd > STDERR_FILENO)
+                close(null_fd);
+        if (!write_pid_file(l->pid_file, error)) {
+                status = 'F';
+                do
+                        result = send(l->startup_fd, &status, 1, MSG_NOSIGNAL);
+                while (result < 0 && errno == EINTR);
+                close(l->startup_fd);
+                l->startup_fd = -1;
+                return FALSE;
+        }
+        return TRUE;
+}
+
+static void notify_startup(Launcher *l, gboolean ready)
+{
+        char status = ready ? 'R' : 'F';
+
+        if (l->startup_fd < 0)
+                return;
+        while (send(l->startup_fd, &status, 1, MSG_NOSIGNAL) < 0 && errno == EINTR)
+                ;
+        close(l->startup_fd);
+        l->startup_fd = -1;
 }
 static gboolean start_broker(Launcher *l, GError **error)
 {
@@ -1190,7 +1253,7 @@ static gboolean add_listener(Launcher *l, GError **error)
 }
 static void usage(void)
 {
-        g_print("Usage: dbus-broker-openrc-launch --scope=system|user [--config-file=PATH] [--address=ADDRESS] "
+        g_print("Usage: dbus-broker-dispatch --scope=system|user [--config-file=PATH] [--address=ADDRESS] "
                 "[--broker=PATH] [--pid-file=PATH] [--system-uid-max=N] [--audit] [--foreground]\n");
 }
 
@@ -1222,7 +1285,7 @@ static gchar *socket_path_from_address(const gchar *address, GError **error)
 
 int main(int argc, char **argv)
 {
-        Launcher l = {0};
+        Launcher l = {.startup_fd = -1};
         GError *e = NULL;
         GMainLoop *loop;
         gint c;
@@ -1285,7 +1348,7 @@ int main(int argc, char **argv)
                         l.daemonize = FALSE;
                         break;
                 case 'V':
-                        g_print("dbus-broker-openrc-launch %s\n", PROJECT_VERSION);
+                        g_print("dbus-broker-dispatch %s\n", PROJECT_VERSION);
                         return 0;
                 default:
                         usage();
@@ -1365,7 +1428,7 @@ int main(int argc, char **argv)
                         refresh_console_users(&l);
         }
         if (!scan_services(l.service_dirs, l.services, &e) || !daemonize(&l, &e)) {
-                die_error("Cannot start launcher", e);
+                die_error("Cannot start dispatcher", e);
                 return 1;
         }
         loop = g_main_loop_new(NULL, FALSE);
@@ -1375,7 +1438,8 @@ int main(int argc, char **argv)
         int_source = g_unix_signal_add(SIGINT, quit_loop, loop);
         if (!bind_listener(&l, &e) || !start_broker(&l, &e) || !add_listener(&l, &e) ||
             !register_services(&l, l.services, &e)) {
-                die_error("Cannot start launcher", e);
+                notify_startup(&l, FALSE);
+                die_error("Cannot start dispatcher", e);
                 if (l.controller)
                         g_object_unref(l.controller);
                 if (l.listener) {
@@ -1394,6 +1458,7 @@ int main(int argc, char **argv)
                 "<node><interface name='org.bus1.DBus.Controller'><method name='ReloadConfig'/></interface></node>",
                 &e);
         if (!info) {
+                notify_startup(&l, FALSE);
                 die_error("Controller API", e);
                 g_object_unref(l.controller);
                 g_object_unref(l.listener);
@@ -1409,6 +1474,7 @@ int main(int argc, char **argv)
         reg = g_dbus_connection_register_object(l.controller, "/org/bus1/DBus/Controller", info->interfaces[0],
                                                 &controller_vtable, &l, NULL, &e);
         if (!reg) {
+                notify_startup(&l, FALSE);
                 die_error("Controller API", e);
                 g_dbus_node_info_unref(info);
                 g_object_unref(l.controller);
@@ -1426,6 +1492,7 @@ int main(int argc, char **argv)
                                            on_signal, &l, NULL);
         configure_console_monitor(&l);
         l.broker_watch_source = g_child_watch_add(l.broker_pid, broker_exit, &l);
+        notify_startup(&l, TRUE);
         g_main_loop_run(loop);
         g_dbus_connection_unregister_object(l.controller, reg);
         g_source_remove(hup_source);
