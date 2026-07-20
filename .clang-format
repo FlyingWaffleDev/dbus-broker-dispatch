@@ -1,0 +1,12 @@
+BasedOnStyle: LLVM
+IndentWidth: 8
+ContinuationIndentWidth: 8
+ColumnLimit: 120
+AlignAfterOpenBracket: Align
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+BreakBeforeBraces: Linux
+PointerAlignment: Right
+SortIncludes: CaseSensitive
+SpaceBeforeParens: ControlStatements
+UseTab: Never
