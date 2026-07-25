@@ -1,10 +1,34 @@
 test_config_policy = executable(
   'test-config-policy',
-  ['test-config-policy.c', '../src/config-policy.c'],
+  ['test-config-policy.c', '../src/config-policy.c', '../src/policy-export.c', '../src/nss-cache.c'],
   dependencies: deps,
-  include_directories: src_inc,
+  include_directories: [src_inc, root_inc],
 )
 test('config-policy', test_config_policy)
+
+test_nss_cache = executable(
+  'test-nss-cache',
+  ['test-nss-cache.c', '../src/nss-cache.c'],
+  dependencies: [glib, gio],
+  include_directories: src_inc,
+)
+test('nss-cache', test_nss_cache)
+
+test_file_watch = executable(
+  'test-file-watch',
+  ['test-file-watch.c', '../src/file-watch.c'],
+  dependencies: [glib, gio],
+  include_directories: src_inc,
+)
+test('file-watch', test_file_watch, timeout: 10)
+
+test_service = executable(
+  'test-service',
+  ['test-service.c', '../src/service.c', '../src/nss-cache.c'],
+  dependencies: [glib, gio],
+  include_directories: src_inc,
+)
+test('service', test_service)
 
 test_session_bus = executable(
   'test-session-bus',

@@ -20,9 +20,12 @@ static void launcher_child_setup(gpointer data)
 static void test_session_bus(gconstpointer data)
 {
         const gchar *launcher = data;
-        gchar *runtime = NULL, *data_home = NULL, *service_dir = NULL, *service_file = NULL, *config_file = NULL;
-        gchar *marker = NULL, *command_file = NULL, *quoted_marker = NULL, *command = NULL, *service_contents = NULL;
-        gchar *config_contents = NULL, *address = NULL, *contents = NULL, **environment = NULL;
+        gchar *runtime = NULL, *service_dir = NULL, *service_file = NULL, *config_file = NULL;
+        gchar *marker = NULL, *reload_marker = NULL, *command_file = NULL, *reload_command_file = NULL;
+        gchar *quoted_marker = NULL, *quoted_reload_marker = NULL, *command = NULL, *reload_command = NULL;
+        gchar *service_contents = NULL;
+        gchar *config_contents = NULL, *config_replacement = NULL, *replacement_path = NULL;
+        gchar *address = NULL, *contents = NULL, **environment = NULL;
         GPid pid = 0;
         GDBusConnection *connection = NULL;
         GVariant *reply = NULL;
@@ -32,17 +35,23 @@ static void test_session_bus(gconstpointer data)
         runtime = g_dir_make_tmp("broker-dispatch-session-test-XXXXXX", &error);
         g_assert_no_error(error);
         g_assert_cmpint(chmod(runtime, 0700), ==, 0);
-        data_home = g_build_filename(runtime, "data", NULL);
-        service_dir = g_build_filename(data_home, "dbus-1", "services", NULL);
+        service_dir = g_build_filename(runtime, "dbus-1", "services", NULL);
         service_file = g_build_filename(service_dir, "org.example.SessionTest.service", NULL);
         marker = g_build_filename(runtime, "activation-display", NULL);
+        reload_marker = g_build_filename(runtime, "automatic-reload", NULL);
         command_file = g_build_filename(runtime, "activation-command", NULL);
+        reload_command_file = g_build_filename(runtime, "reload-command", NULL);
         g_assert_cmpint(g_mkdir_with_parents(service_dir, 0700), ==, 0);
         quoted_marker = g_shell_quote(marker);
         command = g_strdup_printf("#!/bin/sh\nprintf %%s \"$DISPLAY\" > %s\nsleep 0.2\nexit 1\n", quoted_marker);
         g_assert_true(g_file_set_contents(command_file, command, -1, &error));
         g_assert_no_error(error);
         g_assert_cmpint(chmod(command_file, 0700), ==, 0);
+        quoted_reload_marker = g_shell_quote(reload_marker);
+        reload_command = g_strdup_printf("#!/bin/sh\nprintf reloaded > %s\nexit 1\n", quoted_reload_marker);
+        g_assert_true(g_file_set_contents(reload_command_file, reload_command, -1, &error));
+        g_assert_no_error(error);
+        g_assert_cmpint(chmod(reload_command_file, 0700), ==, 0);
         /* User= is normally absent on session services; the launcher must
          * register activation against its own UID rather than root. */
         service_contents = g_strdup_printf("[D-BUS Service]\nName=org.example.SessionTest\nExec=%s\n", command_file);
@@ -52,7 +61,8 @@ static void test_session_bus(gconstpointer data)
         config_file = g_build_filename(runtime, "session.conf", NULL);
         config_contents = g_strdup_printf("<busconfig>"
                                           "<listen>unix:path=%s/bus</listen>"
-                                          "<servicedir>%s</servicedir>"
+                                          "<type>session</type>"
+                                          "<standard_session_servicedirs/>"
                                           "<policy context='default'>"
                                           "<allow user='*'/><deny own='*'/>"
                                           "<allow send_destination='org.freedesktop.DBus'/>"
@@ -61,12 +71,11 @@ static void test_session_bus(gconstpointer data)
                                           "</policy>"
                                           "<policy user='%s'><allow own='org.example.PolicyTest'/></policy>"
                                           "</busconfig>",
-                                          runtime, service_dir, g_get_user_name());
+                                          runtime, g_get_user_name());
         g_assert_true(g_file_set_contents(config_file, config_contents, -1, &error));
         g_assert_no_error(error);
         environment = g_get_environ();
         environment = g_environ_setenv(environment, "XDG_RUNTIME_DIR", runtime, TRUE);
-        environment = g_environ_setenv(environment, "XDG_DATA_HOME", data_home, TRUE);
         g_assert_true(g_spawn_async(
                 NULL,
                 (gchar *[]){(gchar *)launcher, "--scope=user", "--foreground", "--config-file", config_file, NULL},
@@ -115,30 +124,61 @@ static void test_session_bus(gconstpointer data)
                 g_assert_nonnull(reply);
                 g_variant_unref(reply);
         }
-        g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
-                               "StartServiceByName", g_variant_new("(su)", "org.example.SessionTest", 0), NULL,
+        g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                               "org.freedesktop.DBus", "StartServiceByName",
+                               g_variant_new("(su)", "org.example.SessionTest", 0), NULL,
                                G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+        g_assert_true(g_dbus_connection_flush_sync(connection, NULL, &error));
+        g_assert_no_error(error);
         for (guint attempt = 0; attempt < 500 && !g_file_test(marker, G_FILE_TEST_EXISTS); ++attempt)
                 g_usleep(10 * 1000);
         g_assert_true(g_file_get_contents(marker, &contents, NULL, &error));
         g_assert_no_error(error);
         g_assert_cmpstr(contents, ==, ":test-display");
 
-        /* Reload while the old activation child is still alive. This catches
-         * stale Service references and verifies that a changed definition can
-         * replace the active controller object safely. */
+        /* A service-directory change must trigger a debounced automatic reload.
+         * The replacement also exercises immutable per-generation service
+         * credentials while the previous activation is being reaped. */
         g_free(service_contents);
-        service_contents = g_strdup("[D-BUS Service]\nName=org.example.SessionTest\nExec=/bin/true\n");
+        service_contents = g_strdup_printf("[D-BUS Service]\nName=org.example.SessionTest\nExec=%s\n",
+                                           reload_command_file);
         g_assert_true(g_file_set_contents(service_file, service_contents, -1, &error));
         g_assert_no_error(error);
+        g_usleep(750 * 1000);
+        g_dbus_connection_call(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
+                               "org.freedesktop.DBus", "StartServiceByName",
+                               g_variant_new("(su)", "org.example.SessionTest", 0), NULL,
+                               G_DBUS_CALL_FLAGS_NONE, -1, NULL, NULL, NULL);
+        g_assert_true(g_dbus_connection_flush_sync(connection, NULL, &error));
+        g_assert_no_error(error);
+        for (guint attempt = 0; attempt < 500 && !g_file_test(reload_marker, G_FILE_TEST_EXISTS); ++attempt)
+                g_usleep(10 * 1000);
+        g_assert_true(g_file_test(reload_marker, G_FILE_TEST_EXISTS));
+
+        /* Configuration watches must survive the atomic replacement pattern
+         * used by package managers and editors. */
+        config_replacement = g_strdup_printf("<busconfig>"
+                                             "<listen>unix:path=%s/bus</listen><type>session</type>"
+                                             "<standard_session_servicedirs/>"
+                                             "<policy context='default'><allow user='*'/><deny own='*'/>"
+                                             "<allow send_destination='org.freedesktop.DBus'/>"
+                                             "<allow receive_sender='*'/></policy>"
+                                             "<policy user='%s'><allow own='org.example.PolicyTest'/>"
+                                             "<allow own='org.example.AutomaticPolicy'/></policy></busconfig>",
+                                             runtime, g_get_user_name());
+        replacement_path = g_build_filename(runtime, "session.conf.new", NULL);
+        g_assert_true(g_file_set_contents(replacement_path, config_replacement, -1, &error));
+        g_assert_no_error(error);
+        g_assert_cmpint(g_rename(replacement_path, config_file), ==, 0);
+        g_usleep(750 * 1000);
         reply = g_dbus_connection_call_sync(connection, "org.freedesktop.DBus", "/org/freedesktop/DBus",
-                                            "org.freedesktop.DBus", "ReloadConfig", NULL, NULL, G_DBUS_CALL_FLAGS_NONE,
-                                            -1, NULL, &error);
+                                            "org.freedesktop.DBus", "RequestName",
+                                            g_variant_new("(su)", "org.example.AutomaticPolicy", 0),
+                                            G_VARIANT_TYPE("(u)"), G_DBUS_CALL_FLAGS_NONE, -1, NULL, &error);
         g_assert_no_error(error);
         g_assert_nonnull(reply);
         g_variant_unref(reply);
         reply = NULL;
-        g_usleep(250 * 1000);
 
         g_object_unref(connection);
         kill(pid, SIGTERM);
@@ -148,24 +188,30 @@ static void test_session_bus(gconstpointer data)
         g_free(contents);
         g_assert_cmpint(g_remove(config_file), ==, 0);
         g_assert_cmpint(g_remove(marker), ==, 0);
+        g_assert_cmpint(g_remove(reload_marker), ==, 0);
         g_assert_cmpint(g_remove(command_file), ==, 0);
+        g_assert_cmpint(g_remove(reload_command_file), ==, 0);
         g_assert_cmpint(g_remove(service_file), ==, 0);
         g_assert_cmpint(g_rmdir(service_dir), ==, 0);
         g_free(service_dir);
-        service_dir = g_build_filename(data_home, "dbus-1", NULL);
+        service_dir = g_build_filename(runtime, "dbus-1", NULL);
         g_assert_cmpint(g_rmdir(service_dir), ==, 0);
-        g_assert_cmpint(g_rmdir(data_home), ==, 0);
         g_assert_cmpint(g_rmdir(runtime), ==, 0);
         g_free(command);
+        g_free(reload_command);
         g_free(service_contents);
         g_free(config_contents);
+        g_free(config_replacement);
+        g_free(replacement_path);
         g_free(config_file);
         g_free(quoted_marker);
+        g_free(quoted_reload_marker);
         g_free(marker);
+        g_free(reload_marker);
         g_free(command_file);
+        g_free(reload_command_file);
         g_free(service_file);
         g_free(service_dir);
-        g_free(data_home);
         g_free(runtime);
 }
 

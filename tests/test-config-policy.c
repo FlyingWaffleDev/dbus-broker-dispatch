@@ -185,6 +185,132 @@ static void test_limits_and_apparmor(void)
         g_free(directory);
 }
 
+static void test_transient_services_bus_type_and_optimization(void)
+{
+        LauncherConfig *config;
+        GPtrArray *dirs;
+        GVariant *policy, *bus_type, *selinux, *uids, *entry, *batch, *own_rules;
+        GError *error = NULL;
+        gchar *directory = g_dir_make_tmp("broker-transient-config-XXXXXX", &error);
+        gchar *root;
+        const gchar *old_runtime = g_getenv("XDG_RUNTIME_DIR");
+        gchar *saved_runtime = g_strdup(old_runtime);
+
+        g_assert_no_error(error);
+        g_setenv("XDG_RUNTIME_DIR", directory, TRUE);
+        root = g_build_filename(directory, "root.conf", NULL);
+        g_assert_true(g_file_set_contents(
+                root,
+                "<busconfig><type>accessibility</type><standard_session_servicedirs/>"
+                "<selinux><associate own='org.example.Same' context='system_u:object_r:example_t:s0'/></selinux>"
+                "<policy context='default'><allow own='org.example.Same'/><allow own='org.example.Same'/></policy>"
+                "</busconfig>",
+                -1, &error));
+        g_assert_no_error(error);
+        config = launcher_config_new();
+        g_assert_true(launcher_config_load(config, root, &error));
+        g_assert_no_error(error);
+        dirs = launcher_config_service_dirs(config);
+        g_assert_cmpuint(dirs->len, >=, 1);
+        {
+                gchar *expected = g_build_filename(directory, "dbus-1", "services", NULL);
+                g_assert_cmpstr(g_ptr_array_index(dirs, 0), ==, expected);
+                g_free(expected);
+        }
+        policy = launcher_config_export_policy(config, TRUE, 999, NULL);
+        bus_type = g_variant_get_child_value(policy, 4);
+        g_assert_cmpstr(g_variant_get_string(bus_type, NULL), ==, "accessibility");
+        selinux = g_variant_get_child_value(policy, 2);
+        g_assert_cmpuint(g_variant_n_children(selinux), ==, 1);
+        uids = g_variant_get_child_value(policy, 0);
+        entry = g_variant_get_child_value(uids, 0);
+        batch = g_variant_get_child_value(entry, 1);
+        own_rules = g_variant_get_child_value(batch, 2);
+        g_assert_cmpuint(g_variant_n_children(own_rules), ==, 1);
+        g_variant_unref(own_rules);
+        g_variant_unref(batch);
+        g_variant_unref(entry);
+        g_variant_unref(uids);
+        g_variant_unref(bus_type);
+        g_variant_unref(selinux);
+        g_variant_unref(policy);
+        launcher_config_free(config);
+        if (saved_runtime)
+                g_setenv("XDG_RUNTIME_DIR", saved_runtime, TRUE);
+        else
+                g_unsetenv("XDG_RUNTIME_DIR");
+        g_free(saved_runtime);
+        g_assert_cmpint(g_remove(root), ==, 0);
+        g_assert_cmpint(g_rmdir(directory), ==, 0);
+        g_free(root);
+        g_free(directory);
+}
+
+static void test_validation_diagnostics(void)
+{
+        LauncherConfig *config;
+        GError *error = NULL;
+        gchar *directory = g_dir_make_tmp("broker-validation-config-XXXXXX", &error);
+        gchar *root;
+
+        g_assert_no_error(error);
+        root = g_build_filename(directory, "root.conf", NULL);
+        g_assert_true(g_file_set_contents(
+                root,
+                "<busconfig mystery='value'><policy context='default'><unknown><allow own='org.example.Bad'/>"
+                "</unknown><allow own='org.example.Good'/></policy></busconfig>",
+                -1, &error));
+        g_assert_no_error(error);
+        config = launcher_config_new();
+        g_test_expect_message(NULL, G_LOG_LEVEL_WARNING, "*unknown attribute mystery=\"value\"*");
+        g_test_expect_message(NULL, G_LOG_LEVEL_WARNING, "*unknown or misplaced element <unknown>*");
+        g_assert_true(launcher_config_load(config, root, &error));
+        g_test_assert_expected_messages();
+        g_assert_no_error(error);
+        launcher_config_free(config);
+        g_assert_cmpint(g_remove(root), ==, 0);
+        g_assert_cmpint(g_rmdir(directory), ==, 0);
+        g_free(root);
+        g_free(directory);
+}
+
+static void test_include_recursion_and_repetition(void)
+{
+        LauncherConfig *config;
+        GError *error = NULL;
+        gchar *directory = g_dir_make_tmp("broker-include-order-XXXXXX", &error);
+        gchar *root;
+        gchar *included;
+
+        g_assert_no_error(error);
+        root = g_build_filename(directory, "root.conf", NULL);
+        included = g_build_filename(directory, "included.conf", NULL);
+        g_assert_true(g_file_set_contents(
+                included, "<busconfig><type>included</type><include>included.conf</include></busconfig>",
+                -1, &error));
+        g_assert_no_error(error);
+        g_assert_true(g_file_set_contents(
+                root,
+                "<busconfig><include>included.conf</include><type>middle</type>"
+                "<include>included.conf</include></busconfig>",
+                -1, &error));
+        g_assert_no_error(error);
+        config = launcher_config_new();
+        g_test_expect_message(NULL, G_LOG_LEVEL_WARNING, "*recursive D-Bus configuration include ignored*");
+        g_test_expect_message(NULL, G_LOG_LEVEL_WARNING, "*recursive D-Bus configuration include ignored*");
+        g_assert_true(launcher_config_load(config, root, &error));
+        g_test_assert_expected_messages();
+        g_assert_no_error(error);
+        g_assert_cmpstr(launcher_config_bus_type(config), ==, "included");
+        launcher_config_free(config);
+        g_assert_cmpint(g_remove(included), ==, 0);
+        g_assert_cmpint(g_remove(root), ==, 0);
+        g_assert_cmpint(g_rmdir(directory), ==, 0);
+        g_free(included);
+        g_free(root);
+        g_free(directory);
+}
+
 int main(int argc, char **argv)
 {
         g_test_init(&argc, &argv, NULL);
@@ -194,5 +320,10 @@ int main(int argc, char **argv)
         g_test_add_func("/config-policy/unknown-identity", test_unknown_identity_is_ignored);
         g_test_add_func("/config-policy/standard-system-service-dirs", test_standard_system_service_dirs);
         g_test_add_func("/config-policy/limits-and-apparmor", test_limits_and_apparmor);
+        g_test_add_func("/config-policy/transient-type-optimization",
+                        test_transient_services_bus_type_and_optimization);
+        g_test_add_func("/config-policy/validation-diagnostics", test_validation_diagnostics);
+        g_test_add_func("/config-policy/include-recursion-and-repetition",
+                        test_include_recursion_and_repetition);
         return g_test_run();
 }

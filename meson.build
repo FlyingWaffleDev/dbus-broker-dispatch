@@ -5,6 +5,7 @@ glib = dependency('glib-2.0', version: '>= 2.56')
 gio = dependency('gio-2.0')
 gio_unix = dependency('gio-unix-2.0')
 expat = dependency('expat')
+selinux = dependency('libselinux', required: get_option('selinux'))
 conf = configuration_data()
 conf.set_quoted('PROJECT_VERSION', meson.project_version())
 conf.set_quoted('DEFAULT_BROKER', get_option('prefix') / get_option('libexecdir') / 'dbus-broker')
@@ -16,16 +17,30 @@ if get_option('elogind')
 else
   elogind = disabler()
 endif
+if selinux.found()
+  conf.set('HAVE_SELINUX', 1)
+endif
 configure_file(output: 'config.h', configuration: conf)
 
 deps = [glib, gio, gio_unix, expat]
+if selinux.found()
+  deps += selinux
+endif
 if get_option('elogind')
   deps += elogind
 endif
 src_inc = include_directories('src')
+root_inc = include_directories('.')
 dbus_broker_dispatch = executable(
   'dbus-broker-dispatch',
-  ['src/launcher.c', 'src/config-policy.c'],
+  [
+    'src/launcher.c',
+    'src/config-policy.c',
+    'src/policy-export.c',
+    'src/nss-cache.c',
+    'src/file-watch.c',
+    'src/service.c',
+  ],
   dependencies: deps,
   include_directories: src_inc,
   install: true,

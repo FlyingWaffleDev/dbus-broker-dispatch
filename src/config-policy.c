@@ -1,77 +1,35 @@
-#include "config-policy.h"
+#include "config-policy-internal.h"
+#include "config.h"
 
 #include <expat.h>
-#include <grp.h>
-#include <pwd.h>
-
-#define BATCH_TYPE "(bta(btbs)a(btssssuutt)a(btssssuutt))"
-#define UID_POLICY_TYPE "a(u" BATCH_TYPE ")"
-#define GID_POLICY_TYPE "a(buu" BATCH_TYPE ")"
-
-typedef enum {
-        POLICY_CONTEXT_NONE,
-        POLICY_CONTEXT_DEFAULT = 1,
-        POLICY_CONTEXT_GROUP,
-        POLICY_CONTEXT_USER,
-        POLICY_CONTEXT_AT_CONSOLE,
-        POLICY_CONTEXT_NO_CONSOLE,
-        POLICY_CONTEXT_MANDATORY,
-} PolicyContext;
-
-typedef enum {
-        POLICY_RULE_CONNECT,
-        POLICY_RULE_OWN,
-        POLICY_RULE_SEND,
-        POLICY_RULE_RECV,
-} PolicyRuleType;
-
-typedef struct {
-        PolicyRuleType type;
-        gboolean allow;
-        gboolean own_prefix;
-        guint64 priority;
-        gchar *name;
-        gchar *path;
-        gchar *interface;
-        gchar *member;
-        guint message_type;
-        guint broadcast;
-        guint64 min_fds;
-        guint64 max_fds;
-} PolicyRule;
-
-struct LauncherConfig {
-        GPtrArray *default_rules;
-        GHashTable *user_rules;
-        GHashTable *group_rules;
-        GPtrArray *at_console_rules;
-        GPtrArray *no_console_rules;
-        GPtrArray *service_dirs;
-        GHashTable *loaded_files;
-        gchar *address;
-        gchar *user;
-        guint64 priority;
-        gboolean uses_console_policy;
-        guint apparmor_mode;
-        guint64 max_outgoing_bytes;
-        guint64 max_outgoing_fds;
-        guint64 max_connections_per_user;
-        guint64 max_matches_per_connection;
-};
+#include <stdarg.h>
+#ifdef HAVE_SELINUX
+#include <selinux/selinux.h>
+#endif
 
 typedef struct {
         LauncherConfig *config;
         gchar *base_dir;
+        const gchar *file;
         PolicyContext context;
         guint uid;
         guint gid;
         const gchar *text_element;
         GString *text;
         gboolean include_ignore_missing;
+        gboolean include_if_selinux;
+        gboolean include_selinux_root_relative;
         gchar *limit_name;
         XML_Parser parser;
         GError *error;
+        GPtrArray *elements;
+        guint ignored_depth;
 } ParserState;
+
+static void optimize_rule_array(GPtrArray *rules);
+static void optimize_rule_table(GHashTable *table);
+static void optimize_strings(GPtrArray *strings);
+static void parser_warning(ParserState *state, const gchar *format, ...);
 
 static void policy_rule_free(PolicyRule *rule)
 {
@@ -99,7 +57,10 @@ LauncherConfig *launcher_config_new(void)
         config->at_console_rules = g_ptr_array_new_with_free_func((GDestroyNotify)policy_rule_free);
         config->no_console_rules = g_ptr_array_new_with_free_func((GDestroyNotify)policy_rule_free);
         config->service_dirs = g_ptr_array_new_with_free_func(g_free);
-        config->loaded_files = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        config->watch_paths = g_ptr_array_new_with_free_func(g_free);
+        config->active_files = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+        config->selinux_associations = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        config->nss = nss_cache_new();
         config->apparmor_mode = 1;
         config->max_outgoing_bytes = G_GUINT64_CONSTANT(8) * 1024 * 1024;
         config->max_outgoing_fds = 64;
@@ -118,15 +79,29 @@ void launcher_config_free(LauncherConfig *config)
         g_ptr_array_unref(config->at_console_rules);
         g_ptr_array_unref(config->no_console_rules);
         g_ptr_array_unref(config->service_dirs);
-        g_hash_table_unref(config->loaded_files);
+        g_ptr_array_unref(config->watch_paths);
+        g_hash_table_unref(config->active_files);
+        g_hash_table_unref(config->selinux_associations);
+        nss_cache_free(config->nss);
         g_free(config->address);
         g_free(config->user);
+        g_free(config->bus_type);
         g_free(config);
 }
 
 GPtrArray *launcher_config_service_dirs(LauncherConfig *config)
 {
         return config->service_dirs;
+}
+
+GPtrArray *launcher_config_watch_paths(LauncherConfig *config)
+{
+        return config->watch_paths;
+}
+
+NssCache *launcher_config_nss_cache(LauncherConfig *config)
+{
+        return config->nss;
 }
 
 const gchar *launcher_config_address(LauncherConfig *config)
@@ -137,6 +112,11 @@ const gchar *launcher_config_address(LauncherConfig *config)
 const gchar *launcher_config_user(LauncherConfig *config)
 {
         return config->user;
+}
+
+const gchar *launcher_config_bus_type(LauncherConfig *config)
+{
+        return config->bus_type;
 }
 
 gboolean launcher_config_uses_console_policy(LauncherConfig *config)
@@ -182,36 +162,27 @@ static const gchar *attribute(const gchar **attributes, const gchar *name)
         return NULL;
 }
 
-static gboolean parse_uint(const gchar *text, guint *value)
+static gboolean lookup_uid(LauncherConfig *config, const gchar *name, guint *uid)
 {
-        guint64 parsed;
-
-        return text && g_ascii_string_to_unsigned(text, 10, 0, G_MAXUINT, &parsed, NULL) && ((*value = parsed), TRUE);
-}
-
-static gboolean lookup_uid(const gchar *name, guint *uid)
-{
-        struct passwd *entry;
-
-        if (parse_uint(name, uid))
-                return TRUE;
-        entry = getpwnam(name);
-        if (!entry)
+        uid_t resolved;
+        GError *error = NULL;
+        if (!nss_cache_lookup_uid(config->nss, name, &resolved, &error)) {
+                g_clear_error(&error);
                 return FALSE;
-        *uid = entry->pw_uid;
+        }
+        *uid = resolved;
         return TRUE;
 }
 
-static gboolean lookup_gid(const gchar *name, guint *gid)
+static gboolean lookup_gid(LauncherConfig *config, const gchar *name, guint *gid)
 {
-        struct group *entry;
-
-        if (parse_uint(name, gid))
-                return TRUE;
-        entry = getgrnam(name);
-        if (!entry)
+        gid_t resolved;
+        GError *error = NULL;
+        if (!nss_cache_lookup_gid(config->nss, name, &resolved, &error)) {
+                g_clear_error(&error);
                 return FALSE;
-        *gid = entry->gr_gid;
+        }
+        *gid = resolved;
         return TRUE;
 }
 
@@ -335,10 +306,10 @@ static void parse_rule(ParserState *state, const gchar *element, const gchar **a
                 rule->type = POLICY_RULE_CONNECT;
                 connection_target = TRUE;
                 group_target = group != NULL;
-                if ((user && !g_str_equal(user, "*") && !lookup_uid(user, &id)) ||
-                    (group && !g_str_equal(group, "*") && !lookup_gid(group, &id))) {
-                        g_warning("Ignoring D-Bus policy rule for unknown %s '%s'", user ? "user" : "group",
-                                  user ? user : group);
+                if ((user && !g_str_equal(user, "*") && !lookup_uid(state->config, user, &id)) ||
+                    (group && !g_str_equal(group, "*") && !lookup_gid(state->config, group, &id))) {
+                        parser_warning(state, "ignoring D-Bus policy rule for unknown %s '%s'",
+                                       user ? "user" : "group", user ? user : group);
                         policy_rule_free(rule);
                         return;
                 }
@@ -369,7 +340,7 @@ static void parse_rule(ParserState *state, const gchar *element, const gchar **a
             !parse_uint64(attribute(attributes, "min_fds"), 0, &rule->min_fds) ||
             !parse_uint64(attribute(attributes, "max_fds"), G_MAXUINT64, &rule->max_fds) ||
             rule->min_fds > rule->max_fds) {
-                g_warning("Ignoring invalid D-Bus policy rule");
+                parser_warning(state, "ignoring invalid D-Bus policy rule");
                 policy_rule_free(rule);
                 return;
         }
@@ -386,7 +357,7 @@ static void parse_rule(ParserState *state, const gchar *element, const gchar **a
         return;
 
 invalid:
-        g_warning("Ignoring invalid D-Bus policy attribute combination");
+        parser_warning(state, "ignoring invalid D-Bus policy attribute combination");
         policy_rule_free(rule);
 }
 
@@ -399,40 +370,202 @@ static gchar *resolve_path(const gchar *base_dir, const gchar *path)
         return g_build_filename(base_dir, path, NULL);
 }
 
+static void parser_warning(ParserState *state, const gchar *format, ...)
+{
+        va_list arguments;
+        gchar *message;
+
+        va_start(arguments, format);
+        message = g_strdup_vprintf(format, arguments);
+        va_end(arguments);
+        g_warning("%s:%lu: %s", state->file, (unsigned long)XML_GetCurrentLineNumber(state->parser), message);
+        g_free(message);
+}
+
+static gboolean string_in(const gchar *value, const gchar *const *values)
+{
+        for (; *values; ++values)
+                if (g_str_equal(value, *values))
+                        return TRUE;
+        return FALSE;
+}
+
+static gboolean element_is_bus_child(const gchar *element)
+{
+        static const gchar *const children[] = {
+                "user", "type", "fork", "syslog", "keep_umask", "listen", "pidfile", "includedir",
+                "standard_session_servicedirs", "standard_system_servicedirs", "servicedir", "servicehelper",
+                "auth", "include", "policy", "limit", "selinux", "apparmor", NULL,
+        };
+        return string_in(element, children);
+}
+
+static gboolean validate_element(ParserState *state, const gchar *element)
+{
+        const gchar *parent = state->elements->len
+                                      ? g_ptr_array_index(state->elements, state->elements->len - 1)
+                                      : NULL;
+
+        if (!parent)
+                return g_str_equal(element, "busconfig");
+        if (g_str_equal(parent, "busconfig"))
+                return element_is_bus_child(element);
+        if (g_str_equal(parent, "policy"))
+                return g_str_equal(element, "allow") || g_str_equal(element, "deny");
+        if (g_str_equal(parent, "selinux"))
+                return g_str_equal(element, "associate");
+        return FALSE;
+}
+
+static gboolean valid_boolean(const gchar *value)
+{
+        return g_str_equal(value, "true") || g_str_equal(value, "false");
+}
+
+static void validate_attributes(ParserState *state, const gchar *element, const gchar **attributes)
+{
+        static const gchar *const allow_deny[] = {
+                "send_interface", "send_member", "send_error", "send_destination", "send_path", "send_type",
+                "send_requested_reply", "send_broadcast", "receive_interface", "receive_member", "receive_error",
+                "receive_sender", "receive_path", "receive_type", "receive_requested_reply", "eavesdrop",
+                "min_fds", "max_fds", "own", "own_prefix", "user", "group", "log", NULL,
+        };
+        static const gchar *const no_attributes[] = {NULL};
+        static const gchar *const include_attributes[] = {
+                "ignore_missing", "if_selinux_enabled", "selinux_root_relative", NULL,
+        };
+        static const gchar *const policy_attributes[] = {"context", "user", "group", "at_console", NULL};
+        static const gchar *const associate_attributes[] = {"own", "context", NULL};
+        static const gchar *const apparmor_attributes[] = {"mode", NULL};
+        static const gchar *const limit_attributes[] = {"name", NULL};
+        static const gchar *const limit_names[] = {
+                "max_incoming_bytes", "max_incoming_unix_fds", "max_outgoing_bytes",
+                "max_outgoing_unix_fds", "max_message_size", "max_message_unix_fds",
+                "service_start_timeout", "auth_timeout", "pending_fd_timeout", "max_completed_connections",
+                "max_incomplete_connections", "max_connections_per_user", "max_pending_service_starts",
+                "max_names_per_connection", "max_match_rules_per_connection", "max_replies_per_connection",
+                "max_containers_per_user", "max_containers", "max_connections_per_container",
+                "max_container_metadata_bytes", "reply_timeout", NULL,
+        };
+        const gchar *const *allowed = no_attributes;
+
+        if (g_str_equal(element, "include"))
+                allowed = include_attributes;
+        else if (g_str_equal(element, "policy"))
+                allowed = policy_attributes;
+        else if (g_str_equal(element, "allow") || g_str_equal(element, "deny"))
+                allowed = allow_deny;
+        else if (g_str_equal(element, "associate"))
+                allowed = associate_attributes;
+        else if (g_str_equal(element, "apparmor"))
+                allowed = apparmor_attributes;
+        else if (g_str_equal(element, "limit"))
+                allowed = limit_attributes;
+
+        for (const gchar **item = attributes; item && *item; item += 2) {
+                const gchar *name = item[0], *value = item[1];
+                if (!string_in(name, allowed)) {
+                        parser_warning(state, "unknown attribute %s=\"%s\" on <%s>", name, value, element);
+                        continue;
+                }
+                if (g_str_equal(element, "include") &&
+                    (g_str_equal(name, "ignore_missing") || g_str_equal(name, "if_selinux_enabled") ||
+                     g_str_equal(name, "selinux_root_relative")) &&
+                    !g_str_equal(value, "yes") && !g_str_equal(value, "no"))
+                        parser_warning(state, "invalid value %s=\"%s\"", name, value);
+                else if (g_str_equal(element, "policy") && g_str_equal(name, "context") &&
+                         !g_str_equal(value, "default") && !g_str_equal(value, "mandatory"))
+                        parser_warning(state, "invalid policy context=\"%s\"", value);
+                else if (g_str_equal(element, "policy") && g_str_equal(name, "at_console") &&
+                         !valid_boolean(value))
+                        parser_warning(state, "invalid at_console=\"%s\"", value);
+                else if ((g_str_has_suffix(name, "_requested_reply") || g_str_equal(name, "send_broadcast") ||
+                          g_str_equal(name, "eavesdrop") || g_str_equal(name, "log")) &&
+                         !valid_boolean(value))
+                        parser_warning(state, "invalid boolean %s=\"%s\"", name, value);
+                else if ((g_str_equal(name, "send_type") || g_str_equal(name, "receive_type")) &&
+                         !g_str_equal(value, "method_call") && !g_str_equal(value, "method_return") &&
+                         !g_str_equal(value, "signal") && !g_str_equal(value, "error"))
+                        parser_warning(state, "invalid message type %s=\"%s\"", name, value);
+                else if (g_str_equal(element, "apparmor") && g_str_equal(name, "mode") &&
+                         !g_str_equal(value, "enabled") && !g_str_equal(value, "disabled") &&
+                         !g_str_equal(value, "required"))
+                        parser_warning(state, "invalid AppArmor mode=\"%s\"", value);
+                else if (g_str_equal(element, "limit") && g_str_equal(name, "name") &&
+                         !string_in(value, limit_names))
+                        parser_warning(state, "invalid limit name=\"%s\"", value);
+        }
+
+        if (g_str_equal(element, "policy")) {
+                guint contexts = (attribute(attributes, "context") != NULL) +
+                                 (attribute(attributes, "user") != NULL) +
+                                 (attribute(attributes, "group") != NULL) +
+                                 (attribute(attributes, "at_console") != NULL);
+                if (contexts == 0)
+                        parser_warning(state, "missing context attribute on <policy>");
+                else if (contexts > 1)
+                        parser_warning(state, "conflicting context attributes on <policy>");
+        } else if (g_str_equal(element, "limit") && !attribute(attributes, "name")) {
+                parser_warning(state, "required attribute name missing on <limit>");
+        } else if (g_str_equal(element, "associate")) {
+                if (!attribute(attributes, "own"))
+                        parser_warning(state, "required attribute own missing on <associate>");
+                if (!attribute(attributes, "context"))
+                        parser_warning(state, "required attribute context missing on <associate>");
+        }
+}
+
 static void parser_start(void *data, const XML_Char *element, const XML_Char **attributes)
 {
         ParserState *state = data;
         const gchar *context;
 
+        if (state->ignored_depth) {
+                ++state->ignored_depth;
+                return;
+        }
+        if (!validate_element(state, element)) {
+                parser_warning(state, "unknown or misplaced element <%s>; ignoring its subtree", element);
+                state->ignored_depth = 1;
+                return;
+        }
+        validate_attributes(state, element, attributes);
+        g_ptr_array_add(state->elements, g_strdup(element));
+
         if (g_str_equal(element, "policy")) {
                 context = attribute(attributes, "context");
                 state->context = POLICY_CONTEXT_DEFAULT;
                 state->uid = state->gid = 0;
-                if (!!attribute(attributes, "user") + !!attribute(attributes, "group") + !!context > 1) {
-                        g_warning("Ignoring D-Bus policy with conflicting identity contexts");
+                const gchar *at_console = attribute(attributes, "at_console");
+                if (!!attribute(attributes, "user") + !!attribute(attributes, "group") + !!context +
+                            !!at_console >
+                    1) {
+                        parser_warning(state, "ignoring D-Bus policy with conflicting identity contexts");
                         state->context = POLICY_CONTEXT_NONE;
                 } else if (attribute(attributes, "user")) {
                         state->context = POLICY_CONTEXT_USER;
-                        if (!lookup_uid(attribute(attributes, "user"), &state->uid)) {
-                                g_warning("Ignoring policy for unknown user '%s'", attribute(attributes, "user"));
+                        if (!lookup_uid(state->config, attribute(attributes, "user"), &state->uid)) {
+                                parser_warning(state, "ignoring policy for unknown user '%s'",
+                                               attribute(attributes, "user"));
                                 state->context = POLICY_CONTEXT_NONE;
                         }
                 } else if (attribute(attributes, "group")) {
                         state->context = POLICY_CONTEXT_GROUP;
-                        if (!lookup_gid(attribute(attributes, "group"), &state->gid)) {
-                                g_warning("Ignoring policy for unknown group '%s'", attribute(attributes, "group"));
+                        if (!lookup_gid(state->config, attribute(attributes, "group"), &state->gid)) {
+                                parser_warning(state, "ignoring policy for unknown group '%s'",
+                                               attribute(attributes, "group"));
                                 state->context = POLICY_CONTEXT_NONE;
                         }
                 } else if (context && g_str_equal(context, "mandatory")) {
                         state->context = POLICY_CONTEXT_MANDATORY;
-                } else if (context && g_str_equal(context, "at_console")) {
+                } else if (at_console && g_str_equal(at_console, "true")) {
                         state->context = POLICY_CONTEXT_AT_CONSOLE;
                         state->config->uses_console_policy = TRUE;
-                } else if (context && g_str_equal(context, "no_console")) {
+                } else if (at_console && g_str_equal(at_console, "false")) {
                         state->context = POLICY_CONTEXT_NO_CONSOLE;
                         state->config->uses_console_policy = TRUE;
                 } else if (context && !g_str_equal(context, "default")) {
-                        g_warning("Ignoring D-Bus policy with unknown context '%s'", context);
+                        parser_warning(state, "ignoring D-Bus policy with unknown context '%s'", context);
                         state->context = POLICY_CONTEXT_NONE;
                 }
         } else if (g_str_equal(element, "apparmor")) {
@@ -444,15 +577,25 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 else if (g_str_equal(mode, "required"))
                         state->config->apparmor_mode = 2;
                 else
-                        g_warning("Ignoring invalid AppArmor policy mode '%s'", mode);
+                        parser_warning(state, "ignoring invalid AppArmor policy mode '%s'", mode);
         } else if (g_str_equal(element, "allow") || g_str_equal(element, "deny")) {
                 parse_rule(state, element, attributes);
+        } else if (g_str_equal(element, "associate")) {
+                const gchar *own = attribute(attributes, "own");
+                const gchar *context_value = attribute(attributes, "context");
+                if (own && context_value)
+                        g_hash_table_replace(state->config->selinux_associations, g_strdup(own),
+                                             g_strdup(context_value));
         } else if (g_str_equal(element, "include") || g_str_equal(element, "includedir") ||
                    g_str_equal(element, "servicedir") || g_str_equal(element, "listen") ||
-                   g_str_equal(element, "user")) {
+                   g_str_equal(element, "user") || g_str_equal(element, "type")) {
                 state->text_element = element;
-                state->include_ignore_missing = g_strcmp0(attribute(attributes, "ignore_missing"), "yes") == 0 ||
-                                                g_strcmp0(attribute(attributes, "if_selinux_enabled"), "yes") == 0;
+                state->include_ignore_missing =
+                        g_strcmp0(attribute(attributes, "ignore_missing"), "yes") == 0;
+                state->include_if_selinux =
+                        g_strcmp0(attribute(attributes, "if_selinux_enabled"), "yes") == 0;
+                state->include_selinux_root_relative =
+                        g_strcmp0(attribute(attributes, "selinux_root_relative"), "yes") == 0;
                 g_string_truncate(state->text, 0);
         } else if (g_str_equal(element, "limit")) {
                 state->text_element = element;
@@ -466,6 +609,10 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 g_ptr_array_add(state->config->service_dirs, g_strdup("/usr/share/dbus-1/system-services"));
                 g_ptr_array_add(state->config->service_dirs, g_strdup("/lib/dbus-1/system-services"));
         } else if (g_str_equal(element, "standard_session_servicedirs")) {
+                const gchar *runtime = g_getenv("XDG_RUNTIME_DIR");
+                if (runtime && g_path_is_absolute(runtime))
+                        g_ptr_array_add(state->config->service_dirs,
+                                        g_build_filename(runtime, "dbus-1", "services", NULL));
                 g_ptr_array_add(state->config->service_dirs,
                                 g_build_filename(g_get_user_data_dir(), "dbus-1", "services", NULL));
                 for (const gchar *const *dirs = g_get_system_data_dirs(); *dirs; ++dirs)
@@ -486,6 +633,7 @@ static gboolean load_directory(LauncherConfig *config, const gchar *path, GError
         const gchar *name;
         GPtrArray *names;
 
+        g_ptr_array_add(config->watch_paths, g_canonicalize_filename(path, NULL));
         directory = g_dir_open(path, 0, &directory_error);
         if (!directory) {
                 if (g_error_matches(directory_error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
@@ -530,6 +678,16 @@ static void parser_end(void *data, const XML_Char *element)
         gchar *path;
         GError *error = NULL;
 
+        if (state->ignored_depth) {
+                --state->ignored_depth;
+                return;
+        }
+        if (state->elements->len == 0 ||
+            !g_str_equal(element, g_ptr_array_index(state->elements, state->elements->len - 1))) {
+                parser_warning(state, "internal element-stack mismatch at </%s>", element);
+                return;
+        }
+        g_ptr_array_remove_index(state->elements, state->elements->len - 1);
         if (g_str_equal(element, "policy")) {
                 state->context = POLICY_CONTEXT_DEFAULT;
                 return;
@@ -545,12 +703,26 @@ static void parser_end(void *data, const XML_Char *element)
         }
         if (*value) {
                 if (g_str_equal(element, "include")) {
-                        path = resolve_path(state->base_dir, value);
+                        gboolean selinux_enabled = FALSE;
+                        const gchar *selinux_root = NULL;
+#ifdef HAVE_SELINUX
+                        selinux_enabled = is_selinux_enabled() > 0;
+                        selinux_root = selinux_policy_root();
+#endif
+                        if (state->include_if_selinux && !selinux_enabled)
+                                goto include_done;
+                        if (state->include_selinux_root_relative && selinux_root &&
+                            !g_path_is_absolute(value))
+                                path = g_build_filename(selinux_root, value, NULL);
+                        else
+                                path = resolve_path(state->base_dir, value);
                         if (!load_file(state->config, path, state->include_ignore_missing, &error)) {
                                 g_prefix_error(&error, "Invalid D-Bus include %s: ", path);
                                 parser_fail(state, g_steal_pointer(&error));
                         }
                         g_free(path);
+include_done:
+                        ;
                 } else if (g_str_equal(element, "includedir")) {
                         path = resolve_path(state->base_dir, value);
                         if (!load_directory(state->config, path, &error)) {
@@ -567,6 +739,9 @@ static void parser_end(void *data, const XML_Char *element)
                 } else if (g_str_equal(element, "user")) {
                         g_free(state->config->user);
                         state->config->user = g_strdup(value);
+                } else if (g_str_equal(element, "type")) {
+                        g_free(state->config->bus_type);
+                        state->config->bus_type = g_strdup(value);
                 } else if (g_str_equal(element, "limit")) {
                         guint64 parsed;
                         if (!state->limit_name ||
@@ -593,7 +768,7 @@ static void parser_end(void *data, const XML_Char *element)
 static void parser_text(void *data, const XML_Char *text, int length)
 {
         ParserState *state = data;
-        if (state->text_element)
+        if (!state->ignored_depth && state->text_element)
                 g_string_append_len(state->text, text, length);
 }
 
@@ -607,7 +782,9 @@ static gboolean load_file(LauncherConfig *config, const gchar *path, gboolean ig
         gboolean success = FALSE;
 
         canonical = g_canonicalize_filename(path, NULL);
-        if (g_hash_table_contains(config->loaded_files, canonical)) {
+        g_ptr_array_add(config->watch_paths, g_strdup(canonical));
+        if (g_hash_table_contains(config->active_files, canonical)) {
+                g_warning("%s: recursive D-Bus configuration include ignored", canonical);
                 g_free(canonical);
                 return TRUE;
         }
@@ -627,15 +804,20 @@ static gboolean load_file(LauncherConfig *config, const gchar *path, gboolean ig
                 g_free(canonical);
                 return FALSE;
         }
-        g_hash_table_add(config->loaded_files, canonical);
+        g_hash_table_add(config->active_files, g_strdup(canonical));
         state.base_dir = g_path_get_dirname(canonical);
+        state.file = canonical;
         state.text = g_string_new(NULL);
+        state.elements = g_ptr_array_new_with_free_func(g_free);
         parser = XML_ParserCreate(NULL);
         if (!parser) {
                 g_set_error(error, G_MARKUP_ERROR, G_MARKUP_ERROR_PARSE, "%s: cannot allocate XML parser", canonical);
                 g_string_free(state.text, TRUE);
+                g_ptr_array_unref(state.elements);
                 g_free(state.base_dir);
                 g_free(contents);
+                g_hash_table_remove(config->active_files, canonical);
+                g_free(canonical);
                 return FALSE;
         }
         state.parser = parser;
@@ -655,141 +837,77 @@ static gboolean load_file(LauncherConfig *config, const gchar *path, gboolean ig
         }
         XML_ParserFree(parser);
         g_string_free(state.text, TRUE);
+        g_ptr_array_unref(state.elements);
         g_free(state.limit_name);
         g_free(state.base_dir);
         g_free(contents);
+        g_hash_table_remove(config->active_files, canonical);
+        g_free(canonical);
         return success;
 }
 
 gboolean launcher_config_load(LauncherConfig *config, const gchar *path, GError **error)
 {
-        return load_file(config, path, FALSE, error);
+        if (!load_file(config, path, FALSE, error))
+                return FALSE;
+        optimize_rule_array(config->default_rules);
+        optimize_rule_array(config->at_console_rules);
+        optimize_rule_array(config->no_console_rules);
+        optimize_rule_table(config->user_rules);
+        optimize_rule_table(config->group_rules);
+        optimize_strings(config->service_dirs);
+        optimize_strings(config->watch_paths);
+        return TRUE;
 }
 
-static GVariant *batch_from_rules(GPtrArray *base, GPtrArray *specific, gboolean default_connect)
+static gchar *rule_signature(const PolicyRule *rule)
 {
-        GVariantBuilder own, send, recv;
-        gboolean connect = default_connect;
-        /* Priority zero is the broker's implicit deny and is never selected.
-         * Match the compatibility launcher's POLICY_PRIORITY_DEFAULT. */
-        guint64 connect_priority = 1;
-        GPtrArray *arrays[] = {base, specific, NULL};
+        return g_strdup_printf("%u:%u:%u:%s:%s:%s:%s:%u:%u:%" G_GUINT64_FORMAT ":%" G_GUINT64_FORMAT,
+                               rule->type, rule->allow, rule->own_prefix, rule->name ? rule->name : "",
+                               rule->path ? rule->path : "", rule->interface ? rule->interface : "",
+                               rule->member ? rule->member : "", rule->message_type, rule->broadcast,
+                               rule->min_fds, rule->max_fds);
+}
 
-        g_variant_builder_init(&own, G_VARIANT_TYPE("a(btbs)"));
-        g_variant_builder_init(&send, G_VARIANT_TYPE("a(btssssuutt)"));
-        g_variant_builder_init(&recv, G_VARIANT_TYPE("a(btssssuutt)"));
-        for (guint array_index = 0; arrays[array_index]; ++array_index) {
-                for (guint index = 0; index < arrays[array_index]->len; ++index) {
-                        PolicyRule *rule = g_ptr_array_index(arrays[array_index], index);
-                        if (rule->type == POLICY_RULE_CONNECT) {
-                                if (rule->priority > connect_priority) {
-                                        connect = rule->allow;
-                                        connect_priority = rule->priority;
-                                }
-                        } else if (rule->type == POLICY_RULE_OWN) {
-                                g_variant_builder_add(&own, "(btbs)", rule->allow, rule->priority, rule->own_prefix,
-                                                      rule->name ? rule->name : "");
-                        } else if (rule->type == POLICY_RULE_SEND) {
-                                g_variant_builder_add(&send, "(btssssuutt)", rule->allow, rule->priority,
-                                                      rule->name ? rule->name : "", rule->path ? rule->path : "",
-                                                      rule->interface ? rule->interface : "",
-                                                      rule->member ? rule->member : "", rule->message_type,
-                                                      rule->broadcast, rule->min_fds, rule->max_fds);
-                        } else if (rule->type == POLICY_RULE_RECV) {
-                                g_variant_builder_add(&recv, "(btssssuutt)", rule->allow, rule->priority,
-                                                      rule->name ? rule->name : "", rule->path ? rule->path : "",
-                                                      rule->interface ? rule->interface : "",
-                                                      rule->member ? rule->member : "", rule->message_type, 0,
-                                                      rule->min_fds, rule->max_fds);
-                        }
+static void optimize_rule_array(GPtrArray *rules)
+{
+        GHashTable *seen = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
+
+        /* Later rules have higher priority. An earlier byte-for-byte equivalent
+         * rule with the same verdict can therefore never affect a decision. */
+        for (guint index = rules->len; index > 0; --index) {
+                PolicyRule *rule = g_ptr_array_index(rules, index - 1);
+                gchar *signature = rule_signature(rule);
+                if (g_hash_table_contains(seen, signature)) {
+                        g_free(signature);
+                        g_ptr_array_remove_index(rules, index - 1);
+                } else {
+                        g_hash_table_add(seen, signature);
                 }
         }
-        return g_variant_new("(bt@a(btbs)@a(btssssuutt)@a(btssssuutt))", connect, connect_priority,
-                             g_variant_builder_end(&own), g_variant_builder_end(&send), g_variant_builder_end(&recv));
+        g_hash_table_unref(seen);
 }
 
-static void add_uid_batches(GVariantBuilder *builder, LauncherConfig *config, gboolean user_scope)
+static void optimize_rule_table(GHashTable *table)
 {
-        GHashTableIter iter;
-        gpointer key;
+        GHashTableIter iterator;
         gpointer value;
-        guint self = getuid();
-        gboolean have_self = FALSE;
-
-        g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", G_MAXUINT32,
-                              batch_from_rules(config->default_rules, NULL, FALSE));
-        g_hash_table_iter_init(&iter, config->user_rules);
-        while (g_hash_table_iter_next(&iter, &key, &value)) {
-                gboolean is_self = *(guint *)key == self;
-                g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", *(guint *)key,
-                                      batch_from_rules(config->default_rules, value, user_scope && is_self));
-                have_self |= is_self;
-        }
-
-        /* dbus-daemon implicitly permits the UID that owns a session bus to
-         * connect. dbus-broker denies by default, so model that fallback as a
-         * UID-specific entry; do not grant other local users access. */
-        if (user_scope && !have_self)
-                g_variant_builder_add(builder, "(u@" BATCH_TYPE ")", self,
-                                      batch_from_rules(config->default_rules, NULL, TRUE));
+        g_hash_table_iter_init(&iterator, table);
+        while (g_hash_table_iter_next(&iterator, NULL, &value))
+                optimize_rule_array(value);
 }
 
-static void add_gid_batches(GVariantBuilder *builder, LauncherConfig *config)
+static void optimize_strings(GPtrArray *strings)
 {
-        GHashTableIter iter;
-        gpointer key;
-        gpointer value;
-
-        g_hash_table_iter_init(&iter, config->group_rules);
-        while (g_hash_table_iter_next(&iter, &key, &value)) {
-                guint gid = *(guint *)key;
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", TRUE, gid, gid,
-                                      batch_from_rules(value, NULL, FALSE));
+        GHashTable *seen = g_hash_table_new(g_str_hash, g_str_equal);
+        for (guint index = 0; index < strings->len;) {
+                const gchar *value = g_ptr_array_index(strings, index);
+                if (g_hash_table_contains(seen, value))
+                        g_ptr_array_remove_index(strings, index);
+                else {
+                        g_hash_table_add(seen, (gpointer)value);
+                        ++index;
+                }
         }
-}
-
-static void add_console_batches(GVariantBuilder *builder, LauncherConfig *config, guint max_uid,
-                                const GArray *console_uids)
-{
-        guint next = 0;
-
-        if (config->no_console_rules->len == 0 && config->at_console_rules->len == 0)
-                return;
-        for (guint index = 0; console_uids && index < console_uids->len; ++index) {
-                guint uid = g_array_index(console_uids, guint, index);
-                if (uid > max_uid || uid < next)
-                        continue;
-                if (uid > next)
-                        g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, uid - 1,
-                                              batch_from_rules(config->no_console_rules, NULL, FALSE));
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, uid, uid,
-                                      batch_from_rules(config->at_console_rules, NULL, FALSE));
-                next = uid + 1;
-        }
-        if (next <= max_uid)
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, next, max_uid,
-                                      batch_from_rules(config->no_console_rules, NULL, FALSE));
-        if (max_uid < G_MAXUINT)
-                g_variant_builder_add(builder, "(buu@" BATCH_TYPE ")", FALSE, max_uid + 1, G_MAXUINT,
-                                      batch_from_rules(config->at_console_rules, NULL, FALSE));
-}
-
-GVariant *launcher_config_export_policy(LauncherConfig *config, gboolean user_scope, guint system_uid_max,
-                                        const GArray *console_uids)
-{
-        GVariantBuilder uids, gids, selinux;
-
-        g_variant_builder_init(&uids, G_VARIANT_TYPE(UID_POLICY_TYPE));
-        g_variant_builder_init(&gids, G_VARIANT_TYPE(GID_POLICY_TYPE));
-        g_variant_builder_init(&selinux, G_VARIANT_TYPE("a(ss)"));
-        /* dbus-daemon session.conf has no explicit connection grant: session
-         * buses permit their owning user's local clients by default. System
-         * buses remain deny-by-default unless their policy grants access. */
-        add_uid_batches(&uids, config, user_scope);
-        add_gid_batches(&gids, config);
-        if (!user_scope)
-                add_console_batches(&gids, config, system_uid_max, console_uids);
-        return g_variant_new("(@" UID_POLICY_TYPE "@" GID_POLICY_TYPE "@a(ss)bs)", g_variant_builder_end(&uids),
-                             g_variant_builder_end(&gids), g_variant_builder_end(&selinux), config->apparmor_mode != 0,
-                             user_scope ? "session" : "system");
+        g_hash_table_unref(seen);
 }

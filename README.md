@@ -20,9 +20,15 @@ the system or desktop-session bus on a primary machine.
   removal.
 - Activation-environment propagation and `DBUS_STARTER_*` variables.
 - Transactional configuration reloads through SIGHUP or the broker reload API.
+- Debounced automatic reloads for configuration files, include directories,
+  and service directories, including paths that do not exist at startup.
 - D-Bus resource limits mapped to the broker's per-user quotas.
 - Optional live elogind session monitoring for console-sensitive policy.
 - AppArmor feature detection and `enabled`, `disabled`, and `required` modes.
+- Consistent per-generation NSS identity snapshots for policy and activated
+  service users, including supplementary groups.
+- Upstream-compatible configuration structure and attribute diagnostics,
+  SELinux name associations, custom bus types, and optimized policy batches.
 - A `dbus-run-session`-style wrapper for isolated user buses.
 - An optional PAM session module that starts one shared user bus after the
   session manager has created a secure `XDG_RUNTIME_DIR`.
@@ -47,6 +53,12 @@ distribution keeps PAM modules outside the normal prefix.
 Enable elogind policy updates with `-Delogind=true`. Configure additional
 users that should always receive `at_console` policy with, for example,
 `-Dsystem-console-users=root,rescue`.
+
+SELinux-aware conditional and policy-root-relative includes are enabled
+automatically when libselinux is available. Select this explicitly with
+`-Dselinux=enabled` or `-Dselinux=disabled`. SELinux `<associate>` mappings are
+exported regardless; libselinux is only needed to query the active policy and
+its root.
 
 For a sanitizer build:
 
@@ -110,10 +122,6 @@ and controlled deployments; normal installations need no arguments.
 
 - Only filesystem-backed `unix:path=` listeners are accepted. Abstract and
   non-Unix transports are intentionally rejected.
-- SELinux `<associate>` mappings and SELinux-root-relative includes are not yet
-  exported. Do not deploy this as a system bus on an SELinux-enforcing host.
-- Configuration-file and service-directory changes take effect on an explicit
-  reload; there is no filesystem watcher.
 - Container policy and several legacy dbus-daemon-only limits are not
   implemented. The four limits used by dbus-broker are honored:
   `max_outgoing_bytes`, `max_outgoing_unix_fds`,

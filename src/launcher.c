@@ -1,6 +1,8 @@
 #define _GNU_SOURCE
 #include "config-policy.h"
 #include "config.h"
+#include "file-watch.h"
+#include "service.h"
 #include <errno.h>
 #include <expat.h>
 #include <fcntl.h>
@@ -26,14 +28,6 @@
 #endif
 
 typedef struct {
-        gchar *name, *path, *exec, *user;
-        gint ref_count;
-        uid_t uid;
-        gid_t gid;
-        guint64 serial;
-        gboolean starting;
-} Service;
-typedef struct {
         gboolean user, audit, daemonize;
         int startup_fd;
         gchar *config, *address, *broker, *socket_path, *pid_file;
@@ -48,11 +42,11 @@ typedef struct {
         GMainLoop *loop;
         gboolean broker_failed;
         guint broker_watch_source;
-        GHashTable *services;
+        ServiceManager *service_manager;
         GPtrArray *service_dirs;
-        GHashTable *environment;
         GArray *static_uids, *dynamic_uids;
         LauncherConfig *config_state;
+        FileWatch *file_watch;
 #ifdef HAVE_ELOGIND
         sd_login_monitor *console_monitor;
         guint console_source;
@@ -68,24 +62,6 @@ typedef struct {
         gboolean retain_audit;
 } BrokerChild;
 
-static Service *service_ref(Service *s)
-{
-        g_atomic_int_inc(&s->ref_count);
-        return s;
-}
-
-static void service_unref(Service *s)
-{
-        if (!s)
-                return;
-        if (!g_atomic_int_dec_and_test(&s->ref_count))
-                return;
-        g_free(s->name);
-        g_free(s->path);
-        g_free(s->exec);
-        g_free(s->user);
-        g_free(s);
-}
 static void die_error(const gchar *what, GError *e)
 {
         g_printerr("%s: %s\n", what, e ? e->message : "unknown error");
@@ -276,23 +252,23 @@ static gboolean configure_apparmor(LauncherConfig *config, GError **error)
 static gboolean configure_broker_user(Launcher *l, GError **error)
 {
         const gchar *user = launcher_config_user(l->config_state);
-        struct passwd *entry;
+        const NssUser *entry;
 
         if (!user || !*user)
                 return TRUE;
-        entry = getpwnam(user);
+        entry = nss_cache_lookup_user(launcher_config_nss_cache(l->config_state), user, error);
         if (!entry) {
-                g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "Unknown D-Bus broker user %s", user);
+                g_prefix_error(error, "Invalid D-Bus broker user: ");
                 return FALSE;
         }
-        if (geteuid() != 0 && (geteuid() != entry->pw_uid || getegid() != entry->pw_gid)) {
+        if (geteuid() != 0 && (geteuid() != nss_user_uid(entry) || getegid() != nss_user_gid(entry))) {
                 g_set_error(error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
                             "Only root can start dbus-broker as configured user %s", user);
                 return FALSE;
         }
-        l->broker_uid = entry->pw_uid;
-        l->broker_gid = entry->pw_gid;
-        l->drop_broker_privileges = geteuid() != entry->pw_uid || getegid() != entry->pw_gid;
+        l->broker_uid = nss_user_uid(entry);
+        l->broker_gid = nss_user_gid(entry);
+        l->drop_broker_privileges = geteuid() != l->broker_uid || getegid() != l->broker_gid;
         return TRUE;
 }
 
@@ -425,306 +401,39 @@ static void destroy_console_monitor(Launcher *l)
 #endif
 static gboolean reload_config(Launcher *l, GError **error);
 
-static gchar *service_object_path(const gchar *name, const gchar *exec, const gchar *user)
+static GPtrArray *watch_paths_for_config(LauncherConfig *config)
 {
-        GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
-        const guchar separator = 0;
-        gchar *path;
+        GPtrArray *paths = g_ptr_array_new_with_free_func(g_free);
+        GPtrArray *config_paths = launcher_config_watch_paths(config);
+        GPtrArray *service_dirs = launcher_config_service_dirs(config);
 
-        g_checksum_update(checksum, (const guchar *)name, -1);
-        g_checksum_update(checksum, &separator, 1);
-        g_checksum_update(checksum, (const guchar *)exec, -1);
-        g_checksum_update(checksum, &separator, 1);
-        if (user)
-                g_checksum_update(checksum, (const guchar *)user, -1);
-        path = g_strdup_printf("/org/bus1/DBus/Name/%s", g_checksum_get_string(checksum));
-        g_checksum_free(checksum);
-        return path;
-}
-static gboolean register_service(Launcher *l, Service *s, GError **error)
-{
-        return call(l, "/org/bus1/DBus/Broker", "org.bus1.DBus.Broker", "AddName",
-                    g_variant_new("(osu)", s->path, s->name, (guint)s->uid), error);
-}
-static void reset_service(Launcher *l, Service *s, const gchar *why)
-{
-        GError *e = NULL;
-        call(l, s->path, "org.bus1.DBus.Name", "Reset", g_variant_new("(ts)", s->serial, why), &e);
-        g_clear_error(&e);
-        s->starting = FALSE;
-}
-typedef struct {
-        Launcher *launcher;
-        Service *service;
-        gchar *user;
-        uid_t uid;
-        gid_t gid;
-        gid_t *groups;
-        int n_groups;
-} Activation;
-static void activation_free(Activation *a)
-{
-        if (!a)
-                return;
-        service_unref(a->service);
-        g_free(a->user);
-        g_free(a->groups);
-        g_free(a);
-}
-static void activation_child_setup(gpointer data)
-{
-        Activation *a = data;
-
-        if (!a->user || (geteuid() == a->uid && getegid() == a->gid))
-                return;
-        /* User= is meaningful for system service activation.  Do the privilege
-         * transition in the child so the launcher itself remains the controller. */
-        if (geteuid() != 0 || syscall(SYS_setgroups, a->n_groups, a->groups) < 0 ||
-            syscall(SYS_setresgid, a->gid, a->gid, a->gid) < 0 || syscall(SYS_setresuid, a->uid, a->uid, a->uid) < 0)
-                _exit(127);
-}
-static void child_done(GPid pid, gint status, gpointer data)
-{
-        Activation *a = data;
-        if (!WIFEXITED(status) || WEXITSTATUS(status))
-                reset_service(a->launcher, a->service, "org.bus1.DBus.Name.Error.UnitFailure");
-        else
-                a->service->starting = FALSE;
-        g_spawn_close_pid(pid);
-        activation_free(a);
-}
-static gchar **activation_environment(Launcher *l)
-{
-        gchar **env = g_get_environ();
-        GHashTableIter iter;
-        gpointer key, value;
-        g_hash_table_iter_init(&iter, l->environment);
-        while (g_hash_table_iter_next(&iter, &key, &value))
-                env = g_environ_setenv(env, key, value, TRUE);
-        return env;
-}
-static void activate(Launcher *l, Service *s, guint64 serial)
-{
-        GError *e = NULL;
-        gchar **argv = NULL;
-        gchar **env;
-        struct passwd *pw = NULL;
-        Activation *activation;
-        if (s->starting)
-                return;
-        s->starting = TRUE;
-        s->serial = serial;
-        if (!g_shell_parse_argv(s->exec, NULL, &argv, &e)) {
-                die_error("Invalid service Exec", e);
-                reset_service(l, s, "org.bus1.DBus.Name.Error.InvalidUnit");
-                return;
+        for (guint index = 0; index < config_paths->len; ++index)
+                g_ptr_array_add(paths, g_strdup(g_ptr_array_index(config_paths, index)));
+        for (guint index = 0; index < service_dirs->len; ++index) {
+                const gchar *directory = g_ptr_array_index(service_dirs, index);
+                /* Missing directories must remain watched via their nearest
+                 * existing ancestor. Existing but inaccessible service
+                 * directories are optional and were already skipped by the
+                 * scanner, so do not turn them into a startup failure here. */
+                if (g_file_test(directory, G_FILE_TEST_EXISTS) &&
+                    access(directory, R_OK | X_OK) < 0 &&
+                    (errno == EACCES || errno == EPERM))
+                        continue;
+                g_ptr_array_add(paths, g_canonicalize_filename(directory, NULL));
         }
-        if (s->user && *s->user) {
-                pw = getpwnam(s->user);
-                if (!pw) {
-                        g_set_error(&e, G_IO_ERROR, G_IO_ERROR_NOT_FOUND, "Unknown service user %s", s->user);
-                        die_error("Service activation failed", e);
-                        reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure");
-                        g_strfreev(argv);
-                        return;
-                }
-        }
-        env = activation_environment(l);
-        env = g_environ_setenv(env, "DBUS_STARTER_ADDRESS", l->address, TRUE);
-        env = g_environ_setenv(env, "DBUS_STARTER_BUS_TYPE", l->user ? "session" : "system", TRUE);
-        activation = g_new0(Activation, 1);
-        activation->launcher = l;
-        activation->service = service_ref(s);
-        if (pw) {
-                activation->user = g_strdup(pw->pw_name);
-                activation->uid = pw->pw_uid;
-                activation->gid = pw->pw_gid;
-                env = g_environ_setenv(env, "HOME", pw->pw_dir, TRUE);
-                env = g_environ_setenv(env, "USER", pw->pw_name, TRUE);
-                env = g_environ_setenv(env, "LOGNAME", pw->pw_name, TRUE);
-                env = g_environ_setenv(env, "SHELL", pw->pw_shell, TRUE);
-                if (geteuid() != pw->pw_uid || getegid() != pw->pw_gid) {
-                        if (geteuid() != 0 ||
-                            (getgrouplist(pw->pw_name, pw->pw_gid, NULL, &activation->n_groups) >= 0) ||
-                            activation->n_groups <= 0) {
-                                g_set_error(&e, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
-                                            "Cannot prepare credentials for service user %s", pw->pw_name);
-                                die_error("Service activation failed", e);
-                                reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure");
-                                activation_free(activation);
-                                g_strfreev(argv);
-                                g_strfreev(env);
-                                return;
-                        }
-                        activation->groups = g_new(gid_t, activation->n_groups);
-                        if (getgrouplist(pw->pw_name, pw->pw_gid, activation->groups, &activation->n_groups) < 0) {
-                                g_set_error(&e, G_IO_ERROR, G_IO_ERROR_FAILED,
-                                            "Cannot resolve supplementary groups for service user %s", pw->pw_name);
-                                die_error("Service activation failed", e);
-                                reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure");
-                                activation_free(activation);
-                                g_strfreev(argv);
-                                g_strfreev(env);
-                                return;
-                        }
-                }
-        }
-        GPid pid;
-        if (!g_spawn_async(NULL, argv, env, G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH_FROM_ENVP,
-                           activation_child_setup, activation, &pid, &e)) {
-                die_error("Service activation failed", e);
-                reset_service(l, s, "org.bus1.DBus.Name.Error.StartupFailure");
-                activation_free(activation);
-        } else
-                g_child_watch_add(pid, child_done, activation);
-        g_strfreev(argv);
-        g_strfreev(env);
+        return paths;
 }
 
-static void on_signal(GDBusConnection *c, const gchar *sender, const gchar *path, const gchar *iface,
-                      const gchar *signal, GVariant *params, gpointer data)
+static void automatic_reload(gpointer data)
 {
-        Launcher *l = data;
-        (void)c;
-        (void)sender;
-        if (g_str_equal(iface, "org.bus1.DBus.Name") && g_str_equal(signal, "Activate")) {
-                Service *s = g_hash_table_lookup(l->services, path);
-                if (s) {
-                        guint64 serial;
-                        g_variant_get(params, "(t)", &serial);
-                        activate(l, s, serial);
-                }
-        } else if (g_str_equal(iface, "org.bus1.DBus.Broker") && g_str_equal(signal, "SetActivationEnvironment")) {
-                GVariant *dict;
-                GVariantIter iter;
-                gchar *key, *value;
-                g_variant_get(params, "(@a{ss})", &dict);
-                g_variant_iter_init(&iter, dict);
-                while (g_variant_iter_next(&iter, "{ss}", &key, &value)) {
-                        if (*key && !strchr(key, '='))
-                                g_hash_table_replace(l->environment, key, value);
-                        else {
-                                g_warning("Ignoring invalid D-Bus activation environment variable");
-                                g_free(key);
-                                g_free(value);
-                        }
-                }
-                g_variant_unref(dict);
+        Launcher *launcher = data;
+        GError *error = NULL;
+        if (!reload_config(launcher, &error)) {
+                g_warning("Automatic D-Bus configuration reload failed: %s", error->message);
+                g_clear_error(&error);
+        } else {
+                g_message("Automatically reloaded D-Bus configuration and services");
         }
-}
-
-static GHashTable *new_service_table(void)
-{
-        return g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)service_unref);
-}
-static gboolean scan_services(GPtrArray *service_dirs, GHashTable *services, GError **error)
-{
-        GHashTable *names = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-
-        for (guint i = 0; i < service_dirs->len; i++) {
-                GDir *d;
-                const gchar *n;
-                GError *directory_error = NULL;
-                d = g_dir_open(g_ptr_array_index(service_dirs, i), 0, &directory_error);
-                if (!d) {
-                        if (g_error_matches(directory_error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-                                g_clear_error(&directory_error);
-                                continue;
-                        }
-                        g_propagate_prefixed_error(error, directory_error, "Cannot scan D-Bus services in %s: ",
-                                                   (gchar *)g_ptr_array_index(service_dirs, i));
-                        g_hash_table_unref(names);
-                        return FALSE;
-                }
-                while ((n = g_dir_read_name(d))) {
-                        gchar *file;
-                        GKeyFile *k;
-                        Service *s;
-                        if (!g_str_has_suffix(n, ".service"))
-                                continue;
-                        file = g_build_filename(g_ptr_array_index(service_dirs, i), n, NULL);
-                        k = g_key_file_new();
-                        GError *service_error = NULL;
-                        if (g_key_file_load_from_file(k, file, G_KEY_FILE_NONE, &service_error)) {
-                                gchar *name = g_key_file_get_string(k, "D-BUS Service", "Name", NULL),
-                                      *exec = g_key_file_get_string(k, "D-BUS Service", "Exec", NULL);
-                                if (name && exec) {
-                                        gchar **argv = NULL;
-                                        gchar *user = g_key_file_get_string(k, "D-BUS Service", "User", NULL);
-                                        struct passwd *pw = user && *user ? getpwnam(user) : NULL;
-
-                                        if (!g_dbus_is_name(name) || name[0] == ':' ||
-                                            !g_shell_parse_argv(exec, NULL, &argv, NULL) || !argv[0] || !*argv[0]) {
-                                                g_warning("Ignoring invalid D-Bus service file %s", file);
-                                                g_free(user);
-                                                g_free(name);
-                                                g_free(exec);
-                                        } else if (user && *user && !pw) {
-                                                g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND,
-                                                            "%s: unknown service user %s", file, user);
-                                                g_strfreev(argv);
-                                                g_free(user);
-                                                g_free(name);
-                                                g_free(exec);
-                                                g_key_file_unref(k);
-                                                g_free(file);
-                                                g_dir_close(d);
-                                                g_hash_table_unref(names);
-                                                return FALSE;
-                                        } else if (!g_hash_table_contains(names, name)) {
-                                                s = g_new0(Service, 1);
-                                                s->ref_count = 1;
-                                                s->name = name;
-                                                s->exec = exec;
-                                                s->user = user;
-                                                s->uid = pw ? pw->pw_uid : getuid();
-                                                s->gid = pw ? pw->pw_gid : getgid();
-                                                s->path = service_object_path(name, exec, user);
-                                                g_hash_table_add(names, g_strdup(name));
-                                                g_hash_table_insert(services, g_strdup(s->path), s);
-                                        } else {
-                                                g_free(user);
-                                                g_free(name);
-                                                g_free(exec);
-                                        }
-                                        g_strfreev(argv);
-                                } else {
-                                        if (name && !exec)
-                                                g_message("Ignoring systemd-only D-Bus service %s", file);
-                                        g_free(name);
-                                        g_free(exec);
-                                }
-                        } else {
-                                g_warning("Ignoring unreadable D-Bus service file %s: %s", file,
-                                          service_error->message);
-                                g_clear_error(&service_error);
-                        }
-                        g_key_file_unref(k);
-                        g_free(file);
-                }
-                g_dir_close(d);
-        }
-        g_hash_table_unref(names);
-        return TRUE;
-}
-static gboolean register_services(Launcher *l, GHashTable *services, GError **error)
-{
-        GHashTableIter it;
-        gpointer key, val;
-        g_hash_table_iter_init(&it, services);
-        while (g_hash_table_iter_next(&it, &key, &val))
-                if (!register_service(l, val, error))
-                        return FALSE;
-        return TRUE;
-}
-static gboolean services_equal(Service *left, Service *right)
-{
-        return g_strcmp0(left->name, right->name) == 0 && g_strcmp0(left->exec, right->exec) == 0 &&
-               g_strcmp0(left->user, right->user) == 0;
-}
-static gboolean release_service(Launcher *l, Service *service, GError **error)
-{
-        return call(l, service->path, "org.bus1.DBus.Name", "Release", NULL, error);
 }
 
 static void controller_method(GDBusConnection *connection, const gchar *sender, const gchar *path,
@@ -754,7 +463,10 @@ static const GDBusInterfaceVTable controller_vtable = {.method_call = controller
 static gboolean reload_config(Launcher *l, GError **error)
 {
         LauncherConfig *candidate = launcher_config_new();
-        GHashTable *candidate_services = new_service_table();
+        GHashTable *candidate_services = service_table_new();
+        GHashTable *current_services = service_manager_table(l->service_manager);
+        FileWatch *candidate_watch = file_watch_new(automatic_reload, l);
+        GPtrArray *candidate_paths = NULL;
         GPtrArray *unchanged = g_ptr_array_new_with_free_func(g_free);
         GPtrArray *released = g_ptr_array_new();
         GPtrArray *added = g_ptr_array_new();
@@ -766,14 +478,28 @@ static gboolean reload_config(Launcher *l, GError **error)
         gboolean success = FALSE;
 
         if (!launcher_config_load(candidate, l->config, error) || !configure_apparmor(candidate, error) ||
-            !scan_services(launcher_config_service_dirs(candidate), candidate_services, error)) {
+            !service_table_scan(launcher_config_service_dirs(candidate), launcher_config_nss_cache(candidate),
+                                l->user, candidate_services, error)) {
                 launcher_config_free(candidate);
                 g_hash_table_unref(candidate_services);
                 g_ptr_array_unref(unchanged);
                 g_ptr_array_unref(released);
                 g_ptr_array_unref(added);
+                file_watch_free(candidate_watch);
                 return FALSE;
         }
+        candidate_paths = watch_paths_for_config(candidate);
+        if (!file_watch_set_paths(candidate_watch, candidate_paths, error)) {
+                launcher_config_free(candidate);
+                g_hash_table_unref(candidate_services);
+                g_ptr_array_unref(unchanged);
+                g_ptr_array_unref(released);
+                g_ptr_array_unref(added);
+                g_ptr_array_unref(candidate_paths);
+                file_watch_free(candidate_watch);
+                return FALSE;
+        }
+        g_clear_pointer(&candidate_paths, g_ptr_array_unref);
         address = launcher_config_address(candidate);
         if (g_strcmp0(address, launcher_config_address(l->config_state)) != 0) {
                 g_set_error(error, G_IO_ERROR, G_IO_ERROR_NOT_SUPPORTED,
@@ -783,6 +509,7 @@ static gboolean reload_config(Launcher *l, GError **error)
                 g_ptr_array_unref(unchanged);
                 g_ptr_array_unref(released);
                 g_ptr_array_unref(added);
+                file_watch_free(candidate_watch);
                 return FALSE;
         }
         if (launcher_config_max_bytes(candidate) != l->max_bytes || launcher_config_max_fds(candidate) != l->max_fds ||
@@ -794,6 +521,7 @@ static gboolean reload_config(Launcher *l, GError **error)
                 g_ptr_array_unref(unchanged);
                 g_ptr_array_unref(released);
                 g_ptr_array_unref(added);
+                file_watch_free(candidate_watch);
                 return FALSE;
         }
         if (g_strcmp0(launcher_config_user(candidate), launcher_config_user(l->config_state)) != 0) {
@@ -804,36 +532,39 @@ static gboolean reload_config(Launcher *l, GError **error)
                 g_ptr_array_unref(unchanged);
                 g_ptr_array_unref(released);
                 g_ptr_array_unref(added);
+                file_watch_free(candidate_watch);
                 return FALSE;
         }
 
         /* Preserve runtime activation state for unchanged services. */
         g_hash_table_iter_init(&iter, candidate_services);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-                Service *previous = g_hash_table_lookup(l->services, key);
-                if (previous && services_equal(previous, value))
+                Service *previous = g_hash_table_lookup(current_services, key);
+                if (previous && service_equal(previous, value))
                         g_ptr_array_add(unchanged, g_strdup(key));
         }
         for (guint index = 0; index < unchanged->len; ++index) {
                 const gchar *unchanged_key = g_ptr_array_index(unchanged, index);
-                Service *previous = g_hash_table_lookup(l->services, unchanged_key);
-                g_hash_table_replace(candidate_services, g_strdup(unchanged_key), service_ref(previous));
+                Service *previous = g_hash_table_lookup(current_services, unchanged_key);
+                g_hash_table_replace(candidate_services, g_strdup(unchanged_key), service_reference(previous));
         }
 
-        g_hash_table_iter_init(&iter, l->services);
+        g_hash_table_iter_init(&iter, current_services);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
                 Service *replacement = g_hash_table_lookup(candidate_services, key);
-                if ((!replacement || !services_equal(value, replacement)) && !release_service(l, value, error))
+                if ((!replacement || !service_equal(value, replacement)) &&
+                    !service_release(l->service_manager, value, error))
                         goto rollback;
-                if (!replacement || !services_equal(value, replacement))
+                if (!replacement || !service_equal(value, replacement))
                         g_ptr_array_add(released, value);
         }
         g_hash_table_iter_init(&iter, candidate_services);
         while (g_hash_table_iter_next(&iter, &key, &value)) {
-                Service *previous = g_hash_table_lookup(l->services, key);
-                if ((!previous || !services_equal(previous, value)) && !register_service(l, value, error))
+                Service *previous = g_hash_table_lookup(current_services, key);
+                if ((!previous || !service_equal(previous, value)) &&
+                    !service_register(l->service_manager, value, error))
                         goto rollback;
-                if (!previous || !services_equal(previous, value))
+                if (!previous || !service_equal(previous, value))
                         g_ptr_array_add(added, value);
         }
         policy = make_policy(l, candidate);
@@ -842,10 +573,16 @@ static gboolean reload_config(Launcher *l, GError **error)
                 goto rollback;
 
         launcher_config_free(l->config_state);
-        g_hash_table_unref(l->services);
         l->config_state = candidate;
         l->service_dirs = launcher_config_service_dirs(candidate);
-        l->services = candidate_services;
+        service_manager_take_table(l->service_manager, candidate_services);
+        service_manager_set_connection(l->service_manager, l->controller, l->address,
+                                       launcher_config_bus_type(candidate)
+                                               ? launcher_config_bus_type(candidate)
+                                               : (l->user ? "session" : "system"));
+        file_watch_free(l->file_watch);
+        l->file_watch = candidate_watch;
+        candidate_watch = NULL;
         configure_console_monitor(l);
         success = TRUE;
         goto out;
@@ -853,7 +590,7 @@ static gboolean reload_config(Launcher *l, GError **error)
 rollback:
         for (guint index = added->len; index > 0; --index) {
                 GError *rollback_error = NULL;
-                if (!release_service(l, g_ptr_array_index(added, index - 1), &rollback_error)) {
+                if (!service_release(l->service_manager, g_ptr_array_index(added, index - 1), &rollback_error)) {
                         g_warning("Reload rollback could not release a newly added service: %s",
                                   rollback_error->message);
                         g_clear_error(&rollback_error);
@@ -861,7 +598,7 @@ rollback:
         }
         for (guint index = 0; index < released->len; ++index) {
                 GError *rollback_error = NULL;
-                if (!register_service(l, g_ptr_array_index(released, index), &rollback_error)) {
+                if (!service_register(l->service_manager, g_ptr_array_index(released, index), &rollback_error)) {
                         g_warning("Reload rollback could not restore a released service: %s", rollback_error->message);
                         g_clear_error(&rollback_error);
                 }
@@ -870,6 +607,7 @@ rollback:
         g_hash_table_unref(candidate_services);
 
 out:
+        file_watch_free(candidate_watch);
         g_ptr_array_unref(unchanged);
         g_ptr_array_unref(released);
         g_ptr_array_unref(added);
@@ -1362,8 +1100,7 @@ int main(int argc, char **argv)
                 g_printerr("--scope=system or --scope=user is required\n");
                 return 2;
         }
-        l.services = new_service_table();
-        l.environment = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        l.service_manager = service_manager_new();
         if (!l.broker)
                 l.broker = g_strdup(DEFAULT_BROKER);
         if (!g_file_test(l.broker, G_FILE_TEST_IS_EXECUTABLE)) {
@@ -1427,17 +1164,57 @@ int main(int argc, char **argv)
                 if (launcher_config_uses_console_policy(l.config_state))
                         refresh_console_users(&l);
         }
-        if (!scan_services(l.service_dirs, l.services, &e) || !daemonize(&l, &e)) {
+        if (!service_table_scan(l.service_dirs, launcher_config_nss_cache(l.config_state), l.user,
+                                service_manager_table(l.service_manager), &e)) {
                 die_error("Cannot start dispatcher", e);
                 return 1;
         }
+        if (!daemonize(&l, &e)) {
+                die_error("Cannot start dispatcher", e);
+                return 1;
+        }
+        l.file_watch = file_watch_new(automatic_reload, &l);
+        GPtrArray *initial_watch_paths = watch_paths_for_config(l.config_state);
+        if (!file_watch_set_paths(l.file_watch, initial_watch_paths, &e)) {
+                g_ptr_array_unref(initial_watch_paths);
+                notify_startup(&l, FALSE);
+                die_error("Cannot monitor D-Bus configuration", e);
+                if (l.pid_file)
+                        unlink(l.pid_file);
+                return 1;
+        }
+        g_ptr_array_unref(initial_watch_paths);
         loop = g_main_loop_new(NULL, FALSE);
         l.loop = loop;
         hup_source = g_unix_signal_add(SIGHUP, on_hup, &l);
         term_source = g_unix_signal_add(SIGTERM, quit_loop, loop);
         int_source = g_unix_signal_add(SIGINT, quit_loop, loop);
-        if (!bind_listener(&l, &e) || !start_broker(&l, &e) || !add_listener(&l, &e) ||
-            !register_services(&l, l.services, &e)) {
+        if (!bind_listener(&l, &e) || !start_broker(&l, &e)) {
+                notify_startup(&l, FALSE);
+                die_error("Cannot start dispatcher", e);
+                if (l.controller)
+                        g_object_unref(l.controller);
+                if (l.listener) {
+                        g_object_unref(l.listener);
+                        unlink(l.socket_path);
+                }
+                if (l.pid_file)
+                        unlink(l.pid_file);
+                g_source_remove(hup_source);
+                g_source_remove(term_source);
+                g_source_remove(int_source);
+                g_main_loop_unref(loop);
+                return 1;
+        }
+        service_manager_set_connection(l.service_manager, l.controller, l.address,
+                                       launcher_config_bus_type(l.config_state)
+                                               ? launcher_config_bus_type(l.config_state)
+                                               : (l.user ? "session" : "system"));
+        /* Keep the listening socket private until policy and every activation
+         * name are installed.  Otherwise a fast client can connect through the
+         * broker and observe a partially initialized bus. */
+        if (!service_table_register_all(l.service_manager, service_manager_table(l.service_manager), &e) ||
+            !add_listener(&l, &e)) {
                 notify_startup(&l, FALSE);
                 die_error("Cannot start dispatcher", e);
                 if (l.controller)
@@ -1489,7 +1266,7 @@ int main(int argc, char **argv)
                 return 1;
         }
         g_dbus_connection_signal_subscribe(l.controller, NULL, NULL, NULL, NULL, NULL, G_DBUS_SIGNAL_FLAGS_NONE,
-                                           on_signal, &l, NULL);
+                                           service_manager_signal, l.service_manager, NULL);
         configure_console_monitor(&l);
         l.broker_watch_source = g_child_watch_add(l.broker_pid, broker_exit, &l);
         notify_startup(&l, TRUE);
@@ -1501,10 +1278,18 @@ int main(int argc, char **argv)
         g_main_loop_unref(loop);
         g_dbus_node_info_unref(info);
         destroy_console_monitor(&l);
+        file_watch_free(l.file_watch);
         if (l.broker_watch_source) {
                 g_source_remove(l.broker_watch_source);
                 l.broker_watch_source = 0;
         }
+        /* Drop the service manager's controller reference before synchronously
+         * closing the connection; GDBus otherwise keeps its worker alive while
+         * the manager and connection retain each other through subscriptions. */
+        service_manager_set_connection(l.service_manager, NULL, l.address,
+                                       launcher_config_bus_type(l.config_state)
+                                               ? launcher_config_bus_type(l.config_state)
+                                               : (l.user ? "session" : "system"));
         g_dbus_connection_close_sync(l.controller, NULL, NULL);
         if (l.broker_pid) {
                 int broker_status;
@@ -1523,8 +1308,7 @@ int main(int argc, char **argv)
                 g_array_unref(l.static_uids);
         if (l.dynamic_uids)
                 g_array_unref(l.dynamic_uids);
-        g_hash_table_unref(l.services);
-        g_hash_table_unref(l.environment);
+        service_manager_free(l.service_manager);
         launcher_config_free(l.config_state);
         g_free(l.config);
         g_free(l.address);
