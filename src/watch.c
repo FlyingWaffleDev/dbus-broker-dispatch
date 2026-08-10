@@ -233,9 +233,13 @@ bool watch_dispatch_inotify(Watch *watch, Error **error)
                 if (n > 0) {
                         for (size_t offset = 0; offset < (size_t)n;) {
                                 struct inotify_event *event = (struct inotify_event *)(buffer + offset);
+                                /* inotify_rm_watch() queues IN_IGNORED. Rebuilds intentionally remove all old
+                                 * watches, so treating that notification as a new change creates a permanent
+                                 * rebuild/IN_IGNORED feedback loop. Real path removal and movement are already
+                                 * reported through IN_DELETE_SELF and IN_MOVE_SELF. */
                                 if (event->mask &
                                     (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
-                                     IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_Q_OVERFLOW | IN_IGNORED))
+                                     IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_Q_OVERFLOW))
                                         changed = true;
                                 offset += sizeof(*event) + event->len;
                         }

@@ -62,6 +62,11 @@ static void test_watch(void)
         timer_poll = (struct pollfd){.fd = watch_timer_fd(watch), .events = POLLIN};
         assert(poll(&timer_poll, 1, 1000) == 1);
         assert(watch_dispatch_timer(watch, &error) && calls == 1);
+        /* Replacing an inotify watch emits IN_IGNORED for the old descriptor.
+         * Draining it must not rebuild the watcher again forever. */
+        if (poll(&inotify_poll, 1, 100) == 1)
+                assert(watch_dispatch_inotify(watch, &error));
+        assert(poll(&inotify_poll, 1, 0) == 0);
         watch_free(watch);
         ptr_vec_clear(&paths);
         assert(rmdir(parent) == 0 && rmdir(root) == 0);
