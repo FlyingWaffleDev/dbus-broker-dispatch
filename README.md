@@ -7,6 +7,13 @@ loads standard D-Bus XML policy, and provides service activation and reloads.
 The companion Gentoo overlay supplies `dbus-broker-dispatch-openrc`; the
 dispatcher itself does not call or depend on OpenRC.
 
+The dispatcher and its test suite do not depend on GLib or GIO. D-Bus
+authentication, wire encoding, Unix-FD transport, process supervision, the
+epoll reactor, file watching, service-file parsing, and policy serialization
+are implemented locally on top of libc and Linux interfaces. Expat remains the
+only mandatory library dependency; elogind, Linux-PAM, and libselinux are
+optional feature dependencies.
+
 This is pre-release software. Test it in a disposable system before replacing
 the system or desktop-session bus on a primary machine.
 
@@ -127,5 +134,5 @@ and controlled deployments; normal installations need no arguments.
   `max_outgoing_bytes`, `max_outgoing_unix_fds`,
   `max_connections_per_user`, and `max_match_rules_per_connection`.
 
-Before a wider release, add a project license file and replace the placeholder
-repository URLs in the companion overlay.
+Before a wider release, replace the placeholder repository URLs in the
+companion overlay.

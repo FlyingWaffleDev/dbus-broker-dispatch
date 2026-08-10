@@ -1,6 +1,6 @@
 #define _GNU_SOURCE
-#include "config.h"
 #include "pam-dbus-broker-dispatch.h"
+#include "config.h"
 
 #include <errno.h>
 #include <fcntl.h>
@@ -20,10 +20,10 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
-#include <syslog.h>
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <syslog.h>
 #include <unistd.h>
 
 #define STATE_NAME ".dbus-broker-dispatch.pam"
@@ -257,8 +257,8 @@ static char *escape_address_path(const char *path)
         if (!escaped)
                 return NULL;
         for (const unsigned char *p = (const unsigned char *)path; *p; ++p) {
-                if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') ||
-                    *p == '_' || *p == '-' || *p == '/' || *p == '.' || *p == '\\') {
+                if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') || (*p >= '0' && *p <= '9') || *p == '_' ||
+                    *p == '-' || *p == '/' || *p == '.' || *p == '\\') {
                         *out++ = (char)*p;
                 } else {
                         *out++ = '%';
@@ -343,8 +343,15 @@ static char **build_environment(pam_handle_t *pamh, const struct passwd *entry, 
         char **source = pam_getenvlist(pamh);
         size_t count = 0, capacity = 16;
         char **environment = calloc(capacity, sizeof(*environment));
-        const char *blocked[] = {"HOME=", "USER=", "LOGNAME=", "SHELL=", "PATH=", "XDG_RUNTIME_DIR=",
-                                 "DBUS_SESSION_BUS_ADDRESS=", "LD_PRELOAD=", "LD_LIBRARY_PATH="};
+        const char *blocked[] = {"HOME=",
+                                 "USER=",
+                                 "LOGNAME=",
+                                 "SHELL=",
+                                 "PATH=",
+                                 "XDG_RUNTIME_DIR=",
+                                 "DBUS_SESSION_BUS_ADDRESS=",
+                                 "LD_PRELOAD=",
+                                 "LD_LIBRARY_PATH="};
 
         if (!environment) {
                 if (source) {
@@ -376,7 +383,7 @@ static char **build_environment(pam_handle_t *pamh, const struct passwd *entry, 
         }
 #define ADD_ENV(format, value)                                                                                         \
         do {                                                                                                           \
-                if (asprintf(&environment[count++], format, value) < 0)                                               \
+                if (asprintf(&environment[count++], format, value) < 0)                                                \
                         goto fail;                                                                                     \
         } while (0)
         ADD_ENV("HOME=%s", entry->pw_dir && *entry->pw_dir ? entry->pw_dir : "/");
@@ -444,8 +451,8 @@ static void child_exec(const Options *options, const struct passwd *entry, const
         sigaction(SIGPIPE, &action, NULL);
         umask(077);
         if (geteuid() == 0 && (syscall(SYS_setgroups, group_count, groups) < 0 ||
-                              syscall(SYS_setresgid, entry->pw_gid, entry->pw_gid, entry->pw_gid) < 0 ||
-                              syscall(SYS_setresuid, entry->pw_uid, entry->pw_uid, entry->pw_uid) < 0))
+                               syscall(SYS_setresgid, entry->pw_gid, entry->pw_gid, entry->pw_gid) < 0 ||
+                               syscall(SYS_setresuid, entry->pw_uid, entry->pw_uid, entry->pw_uid) < 0))
                 _exit(126);
         bool close_fallback = true;
 #ifdef SYS_close_range
@@ -588,9 +595,9 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
 
         if (socket_is_live(runtime)) {
                 if (state_matches_bus(directory_fd, entry.pw_uid, &state)) {
-                        if (state.count == UINT_MAX || !write_state(directory_fd, entry.pw_uid,
-                                                                    &(State){state.pid, state.start_time,
-                                                                             state.count + 1}))
+                        if (state.count == UINT_MAX ||
+                            !write_state(directory_fd, entry.pw_uid,
+                                         &(State){state.pid, state.start_time, state.count + 1}))
                                 goto out;
                         counted = true;
                 }

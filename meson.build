@@ -1,9 +1,6 @@
 project('dbus-broker-dispatch', 'c', version: '0.1.0',
         default_options: ['c_std=c11', 'warning_level=3'])
 
-glib = dependency('glib-2.0', version: '>= 2.56')
-gio = dependency('gio-2.0')
-gio_unix = dependency('gio-unix-2.0')
 expat = dependency('expat')
 selinux = dependency('libselinux', required: get_option('selinux'))
 conf = configuration_data()
@@ -22,7 +19,7 @@ if selinux.found()
 endif
 configure_file(output: 'config.h', configuration: conf)
 
-deps = [glib, gio, gio_unix, expat]
+deps = [expat]
 if selinux.found()
   deps += selinux
 endif
@@ -34,11 +31,18 @@ root_inc = include_directories('.')
 dbus_broker_dispatch = executable(
   'dbus-broker-dispatch',
   [
+    'src/util.c',
+    'src/process.c',
+    'src/service-file.c',
+    'src/dbus-wire.c',
+    'src/dbus-transport.c',
+    'src/controller.c',
+    'src/event.c',
+    'src/watch.c',
     'src/launcher.c',
     'src/config-policy.c',
-    'src/policy-export.c',
+    'src/policy-wire.c',
     'src/nss-cache.c',
-    'src/file-watch.c',
     'src/service.c',
   ],
   dependencies: deps,
@@ -48,8 +52,7 @@ dbus_broker_dispatch = executable(
 
 dbus_broker_run_session = executable(
   'dbus-broker-run-session',
-  'src/run-session.c',
-  dependencies: [glib],
+  ['src/run-session.c', 'src/process.c', 'src/util.c'],
   include_directories: src_inc,
   install: true,
 )

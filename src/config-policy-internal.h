@@ -1,6 +1,7 @@
 #pragma once
 
 #include "config-policy.h"
+#include "util.h"
 
 #define BATCH_TYPE "(bta(btbs)a(btssssuutt)a(btssssuutt))"
 #define UID_POLICY_TYPE "a(u" BATCH_TYPE ")"
@@ -25,38 +26,38 @@ typedef enum {
 
 typedef struct {
         PolicyRuleType type;
-        gboolean allow;
-        gboolean own_prefix;
-        guint64 priority;
-        gchar *name;
-        gchar *path;
-        gchar *interface;
-        gchar *member;
-        guint message_type;
-        guint broadcast;
-        guint64 min_fds;
-        guint64 max_fds;
+        bool allow;
+        bool own_prefix;
+        uint64_t priority;
+        char *name;
+        char *path;
+        char *interface;
+        char *member;
+        uint32_t message_type;
+        uint32_t broadcast;
+        uint64_t min_fds;
+        uint64_t max_fds;
 } PolicyRule;
 
 struct LauncherConfig {
-        GPtrArray *default_rules;
-        GHashTable *user_rules;
-        GHashTable *group_rules;
-        GPtrArray *at_console_rules;
-        GPtrArray *no_console_rules;
-        GPtrArray *service_dirs;
-        GPtrArray *watch_paths;
-        GHashTable *active_files;
-        GHashTable *selinux_associations;
+        PtrVec *default_rules;
+        U32Map *user_rules;
+        U32Map *group_rules;
+        PtrVec *at_console_rules;
+        PtrVec *no_console_rules;
+        PtrVec *service_dirs;
+        PtrVec *watch_paths;
+        StrMap *active_files;
+        StrMap *selinux_associations;
         NssCache *nss;
-        gchar *address;
-        gchar *user;
-        gchar *bus_type;
-        guint64 priority;
-        gboolean uses_console_policy;
-        guint apparmor_mode;
-        guint64 max_outgoing_bytes;
-        guint64 max_outgoing_fds;
-        guint64 max_connections_per_user;
-        guint64 max_matches_per_connection;
+        char *address;
+        char *user;
+        char *bus_type;
+        uint64_t priority;
+        bool uses_console_policy;
+        uint32_t apparmor_mode;
+        uint64_t max_outgoing_bytes;
+        uint64_t max_outgoing_fds;
+        uint64_t max_connections_per_user;
+        uint64_t max_matches_per_connection;
 };

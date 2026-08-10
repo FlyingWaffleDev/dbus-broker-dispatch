@@ -1,84 +1,109 @@
 #define _GNU_SOURCE
 #include "service.h"
+#include "process.h"
+#include "service-file.h"
 
+#include <dirent.h>
+#include <errno.h>
+#include <limits.h>
 #include <linux/capability.h>
 #include <signal.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern char **environ;
+
 struct Service {
-        gchar *name;
-        gchar *path;
-        gchar *exec;
-        gchar *user;
+        char *name;
+        char *path;
+        char *exec;
+        char *user;
+        PtrVec arguments;
         NssUser *identity;
-        gint ref_count;
+        atomic_uint ref_count;
         uid_t uid;
         gid_t gid;
-        guint64 serial;
-        gboolean starting;
+        uint64_t serial;
+        bool starting;
 };
 
-struct ServiceManager {
-        GDBusConnection *controller;
-        gchar *address;
-        gchar *bus_type;
-        GHashTable *services;
-        GHashTable *environment;
-};
-
-typedef struct {
+typedef struct Activation {
         ServiceManager *manager;
         Service *service;
-        gchar *user;
+        char *user;
         uid_t uid;
         gid_t gid;
         gid_t *groups;
-        gint n_groups;
+        size_t n_groups;
 } Activation;
 
-static gboolean controller_call(ServiceManager *manager, const gchar *path, const gchar *interface,
-                                const gchar *method, GVariant *arguments, GError **error)
-{
-        GVariant *reply = g_dbus_connection_call_sync(manager->controller, NULL, path, interface, method, arguments,
-                                                      NULL, G_DBUS_CALL_FLAGS_NONE, -1, NULL, error);
-        if (!reply)
-                return FALSE;
-        g_variant_unref(reply);
-        return TRUE;
-}
-
-static void report_error(const gchar *what, GError *error)
-{
-        g_printerr("%s: %s\n", what, error ? error->message : "unknown error");
-        g_clear_error(&error);
-}
+struct ServiceManager {
+        Controller *controller;
+        char *address;
+        char *bus_type;
+        ServiceTable *services;
+        StrMap environment;
+        U32Map activations;
+};
 
 Service *service_reference(Service *service)
 {
-        g_atomic_int_inc(&service->ref_count);
+        atomic_fetch_add_explicit(&service->ref_count, 1, memory_order_relaxed);
         return service;
 }
 
-static void service_unref(Service *service)
+static void service_unref(void *data)
 {
-        if (!service || !g_atomic_int_dec_and_test(&service->ref_count))
+        Service *service = data;
+        if (!service || atomic_fetch_sub_explicit(&service->ref_count, 1, memory_order_acq_rel) != 1)
                 return;
-        g_free(service->name);
-        g_free(service->path);
-        g_free(service->exec);
-        g_free(service->user);
+        free(service->name);
+        free(service->path);
+        free(service->exec);
+        free(service->user);
+        ptr_vec_clear(&service->arguments);
         nss_user_unref(service->identity);
-        g_free(service);
+        free(service);
+}
+
+static void activation_free(void *data)
+{
+        Activation *activation = data;
+        if (!activation)
+                return;
+        service_unref(activation->service);
+        free(activation->user);
+        free(activation->groups);
+        free(activation);
+}
+
+ServiceTable *service_table_new(void)
+{
+        return str_map_new(service_unref);
+}
+
+void service_table_free(ServiceTable *services)
+{
+        str_map_free(services);
 }
 
 ServiceManager *service_manager_new(void)
 {
-        ServiceManager *manager = g_new0(ServiceManager, 1);
+        ServiceManager *manager = calloc(1, sizeof(*manager));
+        if (!manager)
+                return NULL;
         manager->services = service_table_new();
-        manager->environment = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, g_free);
+        str_map_init(&manager->environment, free);
+        u32_map_init(&manager->activations, activation_free);
+        if (!manager->services) {
+                service_manager_free(manager);
+                return NULL;
+        }
         return manager;
 }
 
@@ -86,360 +111,438 @@ void service_manager_free(ServiceManager *manager)
 {
         if (!manager)
                 return;
-        g_clear_object(&manager->controller);
-        g_hash_table_unref(manager->services);
-        g_hash_table_unref(manager->environment);
-        g_free(manager->address);
-        g_free(manager->bus_type);
-        g_free(manager);
+        service_table_free(manager->services);
+        str_map_clear(&manager->environment);
+        u32_map_clear(&manager->activations);
+        free(manager->address);
+        free(manager->bus_type);
+        free(manager);
 }
 
-void service_manager_set_connection(ServiceManager *manager, GDBusConnection *controller, const gchar *address,
-                                    const gchar *bus_type)
+void service_manager_set_controller(ServiceManager *manager, Controller *controller, const char *address,
+                                    const char *bus_type)
 {
-        g_set_object(&manager->controller, controller);
-        g_free(manager->address);
-        g_free(manager->bus_type);
-        manager->address = g_strdup(address);
-        manager->bus_type = g_strdup(bus_type);
+        manager->controller = controller;
+        free(manager->address);
+        free(manager->bus_type);
+        manager->address = str_dup(address);
+        manager->bus_type = str_dup(bus_type);
 }
 
-GHashTable *service_manager_table(ServiceManager *manager)
+ServiceTable *service_manager_table(ServiceManager *manager)
 {
         return manager->services;
 }
 
-void service_manager_take_table(ServiceManager *manager, GHashTable *services)
+void service_manager_take_table(ServiceManager *manager, ServiceTable *services)
 {
-        g_hash_table_unref(manager->services);
+        service_table_free(manager->services);
         manager->services = services;
 }
 
-static gchar *service_object_path(const gchar *name, const gchar *exec, const gchar *user)
+static char *service_object_path(const char *name)
 {
-        GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
-        const guchar separator = 0;
-        gchar *path;
-
-        g_checksum_update(checksum, (const guchar *)name, -1);
-        g_checksum_update(checksum, &separator, 1);
-        g_checksum_update(checksum, (const guchar *)exec, -1);
-        g_checksum_update(checksum, &separator, 1);
-        if (user)
-                g_checksum_update(checksum, (const guchar *)user, -1);
-        path = g_strdup_printf("/org/bus1/DBus/Name/%s", g_checksum_get_string(checksum));
-        g_checksum_free(checksum);
+        static const char hex[] = "0123456789abcdef";
+        const char prefix[] = "/org/bus1/DBus/Name/_";
+        size_t prefix_length = sizeof(prefix) - 1, length = strlen(name);
+        char *path;
+        if (length > (SIZE_MAX - prefix_length - 1) / 2)
+                return NULL;
+        path = malloc(prefix_length + length * 2 + 1);
+        if (!path)
+                return NULL;
+        memcpy(path, prefix, prefix_length);
+        for (size_t i = 0; i < length; ++i) {
+                unsigned char byte = (unsigned char)name[i];
+                path[prefix_length + i * 2] = hex[byte >> 4];
+                path[prefix_length + i * 2 + 1] = hex[byte & 15];
+        }
+        path[prefix_length + length * 2] = 0;
         return path;
 }
 
-gboolean service_register(ServiceManager *manager, Service *service, GError **error)
+bool service_register(ServiceManager *manager, Service *service, Error **error)
 {
-        g_debug("Registering activatable D-Bus name %s from %s", service->name, service->path);
-        return controller_call(manager, "/org/bus1/DBus/Broker", "org.bus1.DBus.Broker", "AddName",
-                               g_variant_new("(osu)", service->path, service->name, (guint)service->uid), error);
+        return controller_add_name(manager->controller, service->path, service->name, service->uid, error);
 }
 
-gboolean service_release(ServiceManager *manager, Service *service, GError **error)
+bool service_release(ServiceManager *manager, Service *service, Error **error)
 {
-        return controller_call(manager, service->path, "org.bus1.DBus.Name", "Release", NULL, error);
+        return controller_release(manager->controller, service->path, error);
 }
 
-static void reset_service(ServiceManager *manager, Service *service, const gchar *reason)
+static void reset_service(ServiceManager *manager, Service *service, const char *reason)
 {
-        GError *error = NULL;
-        controller_call(manager, service->path, "org.bus1.DBus.Name", "Reset",
-                        g_variant_new("(ts)", service->serial, reason), &error);
-        g_clear_error(&error);
-        service->starting = FALSE;
+        Error *error = NULL;
+        if (manager->controller &&
+            !controller_reset(manager->controller, service->path, service->serial, reason, &error)) {
+                fprintf(stderr, "Cannot reset D-Bus service %s: %s\n", service->name,
+                        error ? error->message : "unknown error");
+                error_free(error);
+        }
+        service->starting = false;
 }
 
-static void activation_free(Activation *activation)
-{
-        if (!activation)
-                return;
-        service_unref(activation->service);
-        g_free(activation->user);
-        g_free(activation->groups);
-        g_free(activation);
-}
-
-static void activation_child_setup(gpointer data)
+static bool activation_child_setup(void *data, int *error_number)
 {
         Activation *activation = data;
         if (!activation->user || (geteuid() == activation->uid && getegid() == activation->gid))
-                return;
+                return true;
         if (geteuid() != 0 || syscall(SYS_setgroups, activation->n_groups, activation->groups) < 0 ||
             syscall(SYS_setresgid, activation->gid, activation->gid, activation->gid) < 0 ||
-            syscall(SYS_setresuid, activation->uid, activation->uid, activation->uid) < 0)
-                _exit(127);
+            syscall(SYS_setresuid, activation->uid, activation->uid, activation->uid) < 0) {
+                *error_number = errno ? errno : EPERM;
+                return false;
+        }
+        return true;
 }
 
-static void activation_done(GPid pid, gint status, gpointer data)
+static bool environment_set(StrMap *environment, const char *key, const char *value)
 {
-        Activation *activation = data;
-        if (!WIFEXITED(status) || WEXITSTATUS(status))
-                reset_service(activation->manager, activation->service, "org.bus1.DBus.Name.Error.UnitFailure");
-        else
-                activation->service->starting = FALSE;
-        g_spawn_close_pid(pid);
-        activation_free(activation);
+        char *copy = str_dup(value);
+        if (!copy || !str_map_set(environment, key, copy)) {
+                free(copy);
+                return false;
+        }
+        return true;
 }
 
-static gchar **activation_environment(ServiceManager *manager)
+static bool environment_current(StrMap *environment)
 {
-        gchar **environment = g_get_environ();
-        GHashTableIter iterator;
-        gpointer key, value;
-        g_hash_table_iter_init(&iterator, manager->environment);
-        while (g_hash_table_iter_next(&iterator, &key, &value))
-                environment = g_environ_setenv(environment, key, value, TRUE);
-        return environment;
+        str_map_init(environment, free);
+        for (char **item = environ; item && *item; ++item) {
+                char *equal = strchr(*item, '=');
+                char *key;
+                if (!equal)
+                        continue;
+                key = strndup(*item, (size_t)(equal - *item));
+                if (!key || !environment_set(environment, key, equal + 1)) {
+                        free(key);
+                        str_map_clear(environment);
+                        return false;
+                }
+                free(key);
+        }
+        return true;
 }
 
-static void activate(ServiceManager *manager, Service *service, guint64 serial)
+static char **environment_export(const StrMap *environment)
 {
-        GError *error = NULL;
-        gchar **arguments = NULL;
-        gchar **environment;
+        char **values = calloc(environment->len + 1, sizeof(*values));
+        if (!values)
+                return NULL;
+        for (size_t i = 0; i < environment->len; ++i) {
+                values[i] = str_printf("%s=%s", environment->entries[i].key, (char *)environment->entries[i].value);
+                if (!values[i]) {
+                        for (size_t j = 0; j < i; ++j)
+                                free(values[j]);
+                        free(values);
+                        return NULL;
+                }
+        }
+        return values;
+}
+
+static void string_vector_free(char **values)
+{
+        if (!values)
+                return;
+        for (size_t i = 0; values[i]; ++i)
+                free(values[i]);
+        free(values);
+}
+
+static void activate(ServiceManager *manager, Service *service, uint64_t serial)
+{
+        Error *error = NULL;
+        StrMap environment;
+        char **environment_vector = NULL, **arguments = NULL;
         const NssUser *identity = service->identity;
-        Activation *activation;
-        GPid pid;
+        Activation *activation = NULL;
+        ProcessSpec spec;
+        pid_t pid;
 
         if (service->starting)
                 return;
-        service->starting = TRUE;
+        service->starting = true;
         service->serial = serial;
-        if (!g_shell_parse_argv(service->exec, NULL, &arguments, &error)) {
-                report_error("Invalid service Exec", error);
-                reset_service(manager, service, "org.bus1.DBus.Name.Error.InvalidUnit");
-                return;
-        }
-        environment = activation_environment(manager);
-        environment = g_environ_setenv(environment, "DBUS_STARTER_ADDRESS", manager->address, TRUE);
-        environment = g_environ_setenv(environment, "DBUS_STARTER_BUS_TYPE", manager->bus_type, TRUE);
-        activation = g_new0(Activation, 1);
+        if (!environment_current(&environment))
+                goto memory;
+        for (size_t i = 0; i < manager->environment.len; ++i)
+                if (!environment_set(&environment, manager->environment.entries[i].key,
+                                     manager->environment.entries[i].value))
+                        goto memory_environment;
+        if (!environment_set(&environment, "DBUS_STARTER_ADDRESS", manager->address) ||
+            !environment_set(&environment, "DBUS_STARTER_BUS_TYPE", manager->bus_type))
+                goto memory_environment;
+        activation = calloc(1, sizeof(*activation));
+        if (!activation)
+                goto memory_environment;
         activation->manager = manager;
         activation->service = service_reference(service);
         if (identity) {
-                gsize n_groups = 0;
-                const gid_t *groups = nss_user_groups(identity, &n_groups);
-                activation->user = g_strdup(nss_user_name(identity));
+                const gid_t *groups = nss_user_groups(identity, &activation->n_groups);
+                activation->user = str_dup(nss_user_name(identity));
                 activation->uid = nss_user_uid(identity);
                 activation->gid = nss_user_gid(identity);
-                environment = g_environ_setenv(environment, "HOME", nss_user_home(identity), TRUE);
-                environment = g_environ_setenv(environment, "USER", nss_user_name(identity), TRUE);
-                environment = g_environ_setenv(environment, "LOGNAME", nss_user_name(identity), TRUE);
-                environment = g_environ_setenv(environment, "SHELL", nss_user_shell(identity), TRUE);
+                if (!activation->user || !environment_set(&environment, "HOME", nss_user_home(identity)) ||
+                    !environment_set(&environment, "USER", nss_user_name(identity)) ||
+                    !environment_set(&environment, "LOGNAME", nss_user_name(identity)) ||
+                    !environment_set(&environment, "SHELL", nss_user_shell(identity)))
+                        goto memory_environment;
                 if (geteuid() != activation->uid || getegid() != activation->gid) {
-                        if (geteuid() != 0 || n_groups > G_MAXINT) {
-                                g_set_error(&error, G_IO_ERROR, G_IO_ERROR_PERMISSION_DENIED,
-                                            "Cannot prepare credentials for service user %s",
-                                            nss_user_name(identity));
-                                report_error("Service activation failed", error);
-                                reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
-                                activation_free(activation);
-                                g_strfreev(arguments);
-                                g_strfreev(environment);
-                                return;
+                        if (geteuid() != 0 || activation->n_groups > INT_MAX) {
+                                error_set(&error, EPERM, "Cannot prepare credentials for service user %s",
+                                          nss_user_name(identity));
+                                goto failure;
                         }
-                        activation->n_groups = n_groups;
-                        activation->groups = g_memdup2(groups, sizeof(*groups) * n_groups);
+                        activation->groups = malloc(sizeof(*groups) * activation->n_groups);
+                        if (!activation->groups)
+                                goto memory_environment;
+                        memcpy(activation->groups, groups, sizeof(*groups) * activation->n_groups);
                 }
         }
-        if (!g_spawn_async(NULL, arguments, environment,
-                           G_SPAWN_DO_NOT_REAP_CHILD | G_SPAWN_SEARCH_PATH_FROM_ENVP, activation_child_setup,
-                           activation, &pid, &error)) {
-                report_error("Service activation failed", error);
-                reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
-                activation_free(activation);
-        } else {
-                g_child_watch_add(pid, activation_done, activation);
+        arguments = calloc(service->arguments.len + 1, sizeof(*arguments));
+        if (!arguments)
+                goto memory_environment;
+        for (size_t i = 0; i < service->arguments.len; ++i)
+                arguments[i] = service->arguments.items[i];
+        environment_vector = environment_export(&environment);
+        if (!environment_vector)
+                goto memory_environment;
+        spec = (ProcessSpec){
+                .argv = arguments,
+                .environment = environment_vector,
+                .search_path = true,
+                .child_setup = activation_child_setup,
+                .child_setup_data = activation,
+        };
+        if (!process_spawn(&spec, &pid, &error))
+                goto failure;
+        if (!u32_map_set(&manager->activations, (uint32_t)pid, activation)) {
+                kill(pid, SIGTERM);
+                while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
+                        ;
+                error_set(&error, ENOMEM, "Cannot track activated service");
+                goto failure;
         }
-        g_strfreev(arguments);
-        g_strfreev(environment);
+        activation = NULL;
+        free(arguments);
+        string_vector_free(environment_vector);
+        str_map_clear(&environment);
+        return;
+memory_environment:
+        error_set(&error, ENOMEM, "Cannot allocate activation state");
+failure:
+        fprintf(stderr, "Service activation failed for %s: %s\n", service->name,
+                error ? error->message : "unknown error");
+        error_free(error);
+        reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
+        activation_free(activation);
+        free(arguments);
+        string_vector_free(environment_vector);
+        str_map_clear(&environment);
+        return;
+memory:
+        fprintf(stderr, "Service activation failed for %s: out of memory\n", service->name);
+        reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
 }
 
-void service_manager_signal(GDBusConnection *connection, const gchar *sender, const gchar *path,
-                            const gchar *interface, const gchar *signal, GVariant *parameters, gpointer data)
+bool service_manager_reap(ServiceManager *manager, pid_t pid, int status)
 {
-        ServiceManager *manager = data;
-        (void)connection;
-        (void)sender;
-        if (g_str_equal(interface, "org.bus1.DBus.Name") && g_str_equal(signal, "Activate")) {
-                Service *service = g_hash_table_lookup(manager->services, path);
-                if (service) {
-                        guint64 serial;
-                        g_variant_get(parameters, "(t)", &serial);
-                        g_debug("Activating D-Bus service %s", service->name);
+        Activation *activation = u32_map_remove(&manager->activations, (uint32_t)pid);
+        if (!activation)
+                return false;
+        if (!WIFEXITED(status) || WEXITSTATUS(status))
+                reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.UnitFailure");
+        else
+                activation->service->starting = false;
+        activation_free(activation);
+        return true;
+}
+
+bool service_manager_handle_packet(ServiceManager *manager, DBusPacket *packet, Error **error)
+{
+        if (packet->header.type != DBUS_MESSAGE_SIGNAL)
+                return true;
+        if (str_equal(packet->header.interface, "org.bus1.DBus.Name") && str_equal(packet->header.member, "Activate")) {
+                uint64_t serial;
+                Service *service = packet->header.path ? str_map_get(manager->services, packet->header.path) : NULL;
+                if (!str_equal(packet->header.signature, "t") || !dbus_reader_u64(&packet->body, &serial) ||
+                    packet->body.offset != packet->body.length)
+                        return error_set(error, EPROTO, "Malformed D-Bus activation signal");
+                if (service)
                         activate(manager, service, serial);
+        } else if (str_equal(packet->header.interface, "org.bus1.DBus.Broker") &&
+                   str_equal(packet->header.member, "SetActivationEnvironment")) {
+                DBusReader dictionary;
+                if (!str_equal(packet->header.signature, "a{ss}") || !dbus_reader_array(&packet->body, 8, &dictionary))
+                        return error_set(error, EPROTO, "Malformed activation environment signal");
+                while (dictionary.offset < dictionary.length) {
+                        const char *key, *value;
+                        size_t key_length, value_length;
+                        if (!dbus_reader_align(&dictionary, 8) || !dbus_reader_string(&dictionary, &key, &key_length) ||
+                            !dbus_reader_string(&dictionary, &value, &value_length))
+                                return error_set(error, EPROTO, "Malformed activation environment entry");
+                        if (key_length && !memchr(key, '=', key_length) &&
+                            !environment_set(&manager->environment, key, value))
+                                return error_set(error, ENOMEM, "Cannot store activation environment");
                 }
-        } else if (g_str_equal(interface, "org.bus1.DBus.Broker") &&
-                   g_str_equal(signal, "SetActivationEnvironment")) {
-                GVariant *dictionary;
-                GVariantIter iterator;
-                gchar *key, *value;
-                g_variant_get(parameters, "(@a{ss})", &dictionary);
-                g_variant_iter_init(&iterator, dictionary);
-                while (g_variant_iter_next(&iterator, "{ss}", &key, &value)) {
-                        if (*key && !strchr(key, '='))
-                                g_hash_table_replace(manager->environment, key, value);
-                        else {
-                                g_warning("Ignoring invalid D-Bus activation environment variable");
-                                g_free(key);
-                                g_free(value);
-                        }
-                }
-                g_variant_unref(dictionary);
         }
+        return true;
 }
 
-GHashTable *service_table_new(void)
+bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, ServiceTable *services, Error **error)
 {
-        return g_hash_table_new_full(g_str_hash, g_str_equal, g_free, (GDestroyNotify)service_unref);
-}
-
-gboolean service_table_scan(GPtrArray *service_dirs, NssCache *nss, gboolean user_scope, GHashTable *services,
-                            GError **error)
-{
-        GHashTable *names = g_hash_table_new_full(g_str_hash, g_str_equal, g_free, NULL);
-
-        for (guint i = 0; i < service_dirs->len; ++i) {
-                GError *directory_error = NULL;
-                GDir *directory = g_dir_open(g_ptr_array_index(service_dirs, i), 0, &directory_error);
-                const gchar *filename;
+        StrMap names;
+        str_map_init(&names, NULL);
+        for (size_t i = 0; i < service_dirs->len; ++i) {
+                const char *directory_path = service_dirs->items[i];
+                DIR *directory = opendir(directory_path);
+                struct dirent *entry;
                 if (!directory) {
-                        if (g_error_matches(directory_error, G_FILE_ERROR, G_FILE_ERROR_NOENT)) {
-                                g_clear_error(&directory_error);
+                        if (errno == ENOENT)
+                                continue;
+                        if (errno == EACCES || errno == EPERM) {
+                                fprintf(stderr, "Cannot access D-Bus service directory %s: %s\n", directory_path,
+                                        strerror(errno));
                                 continue;
                         }
-                        if (g_error_matches(directory_error, G_FILE_ERROR, G_FILE_ERROR_ACCES) ||
-                            g_error_matches(directory_error, G_FILE_ERROR, G_FILE_ERROR_PERM)) {
-                                g_warning("Cannot access D-Bus service directory %s: %s",
-                                          (gchar *)g_ptr_array_index(service_dirs, i),
-                                          directory_error->message);
-                                g_clear_error(&directory_error);
-                                continue;
-                        }
-                        g_propagate_prefixed_error(error, directory_error, "Cannot scan D-Bus services in %s: ",
-                                                   (gchar *)g_ptr_array_index(service_dirs, i));
-                        g_hash_table_unref(names);
-                        return FALSE;
+                        str_map_clear(&names);
+                        return error_set_errno(error, errno, "Cannot scan D-Bus services in %s", directory_path);
                 }
-                while ((filename = g_dir_read_name(directory))) {
-                        gchar *file, *name = NULL, *exec = NULL, *user = NULL, *systemd_service = NULL;
-                        gchar **arguments = NULL;
-                        GKeyFile *key_file;
-                        GError *service_error = NULL;
+                int read_error = 0;
+                for (;;) {
+                        char *path;
+                        ServiceFile parsed = {0};
+                        Error *local_error = NULL;
                         const NssUser *identity = NULL;
                         Service *service;
-
-                        if (!g_str_has_suffix(filename, ".service"))
+                        errno = 0;
+                        entry = readdir(directory);
+                        if (!entry) {
+                                read_error = errno;
+                                break;
+                        }
+                        if (!str_has_suffix(entry->d_name, ".service"))
                                 continue;
-                        file = g_build_filename(g_ptr_array_index(service_dirs, i), filename, NULL);
-                        key_file = g_key_file_new();
-                        if (!g_key_file_load_from_file(key_file, file, G_KEY_FILE_NONE, &service_error)) {
-                                g_warning("Ignoring unreadable D-Bus service file %s: %s", file,
-                                          service_error->message);
-                                g_clear_error(&service_error);
-                                goto next;
+                        path = path_join(directory_path, entry->d_name);
+                        if (!path || !service_file_load(path, &parsed, &local_error)) {
+                                fprintf(stderr, "Ignoring unreadable D-Bus service file %s: %s\n",
+                                        path ? path : entry->d_name,
+                                        local_error ? local_error->message : "out of memory");
+                                error_free(local_error);
+                                free(path);
+                                continue;
                         }
-                        name = g_key_file_get_string(key_file, "D-BUS Service", "Name", NULL);
-                        exec = g_key_file_get_string(key_file, "D-BUS Service", "Exec", NULL);
-                        user = g_key_file_get_string(key_file, "D-BUS Service", "User", NULL);
-                        systemd_service =
-                                g_key_file_get_string(key_file, "D-BUS Service", "SystemdService", NULL);
-                        if (!name || !exec) {
-                                if (name && !exec && systemd_service)
-                                        g_message("Ignoring systemd-only D-Bus service %s", file);
+                        if (!parsed.name || !parsed.exec) {
+                                if (parsed.name && parsed.systemd_service)
+                                        fprintf(stderr, "Ignoring systemd-only D-Bus service %s\n", path);
                                 else
-                                        g_warning("Ignoring D-Bus service file %s: missing %s", file,
-                                                  name ? "Exec" : "Name");
+                                        fprintf(stderr, "Ignoring D-Bus service file %s: missing %s\n", path,
+                                                parsed.name ? "Exec" : "Name");
                                 goto next;
                         }
-                        if (user)
-                                identity = nss_cache_lookup_user(nss, user, &service_error);
-                        if (!g_dbus_is_name(name) || name[0] == ':' ||
-                            !g_shell_parse_argv(exec, NULL, &arguments, NULL) || !arguments[0] || !*arguments[0]) {
-                                g_warning("Ignoring invalid D-Bus service file %s", file);
-                                g_clear_error(&service_error);
+                        if (!dbus_name_is_valid(parsed.name)) {
+                                fprintf(stderr, "Ignoring invalid D-Bus service file %s\n", path);
                                 goto next;
                         }
-                        if (user && !identity) {
-                                if (g_error_matches(service_error, G_IO_ERROR, G_IO_ERROR_NOT_FOUND)) {
-                                        g_warning("Ignoring D-Bus service file %s: %s", file,
-                                                  service_error->message);
-                                        g_clear_error(&service_error);
-                                        goto next;
+                        if (parsed.user) {
+                                identity = nss_cache_lookup_user(nss, parsed.user, &local_error);
+                                if (!identity) {
+                                        if (local_error && local_error->code == NSS_ERROR_NOT_FOUND) {
+                                                fprintf(stderr, "Ignoring D-Bus service file %s: %s\n", path,
+                                                        local_error->message);
+                                                error_free(local_error);
+                                                goto next;
+                                        }
+                                        error_prefix(&local_error, "%s: ", path);
+                                        if (error)
+                                                *error = local_error;
+                                        else
+                                                error_free(local_error);
+                                        service_file_clear(&parsed);
+                                        free(path);
+                                        closedir(directory);
+                                        str_map_clear(&names);
+                                        return false;
                                 }
-                                g_propagate_prefixed_error(error, service_error, "%s: ", file);
-                                g_strfreev(arguments);
-                                g_free(systemd_service);
-                                g_free(user);
-                                g_free(name);
-                                g_free(exec);
-                                g_key_file_unref(key_file);
-                                g_free(file);
-                                g_dir_close(directory);
-                                g_hash_table_unref(names);
-                                return FALSE;
                         }
-                        if (strlen(filename) != strlen(name) + strlen(".service") ||
-                            !g_str_has_prefix(filename, name)) {
+                        if (strlen(entry->d_name) != strlen(parsed.name) + strlen(".service") ||
+                            !str_has_prefix(entry->d_name, parsed.name)) {
                                 if (!user_scope) {
-                                        g_warning("Ignoring system D-Bus service file %s: filename does not match "
-                                                  "Name=%s",
-                                                  file, name);
+                                        fprintf(stderr,
+                                                "Ignoring system D-Bus service file %s: filename does not match "
+                                                "Name=%s\n",
+                                                path, parsed.name);
                                         goto next;
                                 }
-                                g_warning("User D-Bus service file %s is not named after %s", file, name);
+                                fprintf(stderr, "User D-Bus service file %s is not named after %s\n", path,
+                                        parsed.name);
                         }
-                        if (g_hash_table_contains(names, name)) {
-                                g_warning("Ignoring duplicate D-Bus service name %s in %s", name, file);
+                        if (str_map_contains(&names, parsed.name)) {
+                                fprintf(stderr, "Ignoring duplicate D-Bus service name %s in %s\n", parsed.name, path);
                                 goto next;
                         }
-                        service = g_new0(Service, 1);
-                        service->ref_count = 1;
-                        service->name = g_steal_pointer(&name);
-                        service->exec = g_steal_pointer(&exec);
-                        service->user = g_steal_pointer(&user);
+                        service = calloc(1, sizeof(*service));
+                        if (!service) {
+                                service_file_clear(&parsed);
+                                free(path);
+                                closedir(directory);
+                                str_map_clear(&names);
+                                return error_set(error, ENOMEM, "Cannot allocate D-Bus service");
+                        }
+                        atomic_init(&service->ref_count, 1);
+                        service->name = parsed.name;
+                        parsed.name = NULL;
+                        service->exec = parsed.exec;
+                        parsed.exec = NULL;
+                        service->user = parsed.user;
+                        parsed.user = NULL;
+                        service->arguments = parsed.arguments;
+                        parsed.arguments = (PtrVec){0};
                         service->identity = nss_user_ref(identity);
                         service->uid = identity ? nss_user_uid(identity) : getuid();
                         service->gid = identity ? nss_user_gid(identity) : getgid();
-                        service->path = service_object_path(service->name, service->exec, service->user);
-                        g_hash_table_add(names, g_strdup(service->name));
-                        g_hash_table_insert(services, g_strdup(service->path), service);
-next:
-                        g_strfreev(arguments);
-                        g_free(systemd_service);
-                        g_free(user);
-                        g_free(name);
-                        g_free(exec);
-                        g_key_file_unref(key_file);
-                        g_free(file);
+                        service->path = service_object_path(service->name);
+                        if (!service->path || !str_map_set(&names, service->name, NULL) ||
+                            !str_map_set(services, service->path, service)) {
+                                service_unref(service);
+                                service_file_clear(&parsed);
+                                free(path);
+                                closedir(directory);
+                                str_map_clear(&names);
+                                return error_set(error, ENOMEM, "Cannot store D-Bus service");
+                        }
+                next:
+                        service_file_clear(&parsed);
+                        free(path);
                 }
-                g_dir_close(directory);
+                if (read_error) {
+                        closedir(directory);
+                        str_map_clear(&names);
+                        return error_set_errno(error, read_error, "Cannot scan D-Bus services in %s", directory_path);
+                }
+                closedir(directory);
         }
-        g_hash_table_unref(names);
-        return TRUE;
+        str_map_clear(&names);
+        return true;
 }
 
-gboolean service_table_register_all(ServiceManager *manager, GHashTable *services, GError **error)
+bool service_table_register_all(ServiceManager *manager, ServiceTable *services, Error **error)
 {
-        GHashTableIter iterator;
-        gpointer value;
-        g_hash_table_iter_init(&iterator, services);
-        while (g_hash_table_iter_next(&iterator, NULL, &value))
-                if (!service_register(manager, value, error))
-                        return FALSE;
-        return TRUE;
+        for (size_t i = 0; i < services->len; ++i)
+                if (!service_register(manager, services->entries[i].value, error))
+                        return false;
+        return true;
 }
 
-gboolean service_equal(Service *left, Service *right)
+bool service_equal(Service *left, Service *right)
 {
-        gsize left_n = 0, right_n = 0;
+        size_t left_n = 0, right_n = 0;
         const gid_t *left_groups = left->identity ? nss_user_groups(left->identity, &left_n) : NULL;
         const gid_t *right_groups = right->identity ? nss_user_groups(right->identity, &right_n) : NULL;
-        return g_strcmp0(left->name, right->name) == 0 && g_strcmp0(left->exec, right->exec) == 0 &&
-               g_strcmp0(left->user, right->user) == 0 && left->uid == right->uid && left->gid == right->gid &&
-               left_n == right_n && (left_n == 0 || memcmp(left_groups, right_groups, left_n * sizeof(gid_t)) == 0);
+        return str_equal(left->name, right->name) && str_equal(left->exec, right->exec) &&
+               str_equal(left->user, right->user) && left->uid == right->uid && left->gid == right->gid &&
+               left_n == right_n && (!left_n || memcmp(left_groups, right_groups, left_n * sizeof(gid_t)) == 0);
 }
