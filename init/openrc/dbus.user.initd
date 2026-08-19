@@ -1,0 +1,29 @@
+#!/sbin/openrc-run
+
+description="D-Bus user session message bus (dbus-broker-dispatch)"
+
+dbus_socket="${XDG_RUNTIME_DIR}/bus"
+pidfile="${XDG_RUNTIME_DIR}/dbus-broker-dispatch.pid"
+export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket}"
+
+command="/usr/bin/dbus-broker-dispatch"
+command_args="--scope=user --pid-file=${pidfile}"
+
+extra_started_commands="reload"
+
+start_pre() {
+	[ -n "${XDG_RUNTIME_DIR}" ] || {
+		eerror "XDG_RUNTIME_DIR is required for the D-Bus user service"
+		return 1
+	}
+}
+
+stop_post() {
+	[ ! -S "${dbus_socket}" ] || rm -f "${dbus_socket}"
+}
+
+reload() {
+	ebegin "Reloading D-Bus user-session configuration"
+	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	eend $?
+}

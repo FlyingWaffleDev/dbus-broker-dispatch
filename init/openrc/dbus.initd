@@ -1,0 +1,33 @@
+#!/sbin/openrc-run
+
+description="D-Bus system message bus (dbus-broker-dispatch)"
+command="/usr/bin/dbus-broker-dispatch"
+pidfile="/run/dbus/dbus-broker-dispatch.pid"
+command_args="--scope=system --pid-file=${pidfile} ${dbus_dispatch_args}"
+dbus_socket="/run/dbus/system_bus_socket"
+
+extra_started_commands="reload"
+
+depend() {
+	need localmount
+	after bootmisc
+	before net
+}
+
+start_pre() {
+	/usr/bin/dbus-uuidgen --ensure=/etc/machine-id || return 1
+	# The dispatcher binds /run/dbus/system_bus_socket itself.
+	checkpath --directory --mode 0755 /run/dbus || return 1
+}
+
+stop_post() {
+	[ ! -S "${dbus_socket}" ] || rm -f "${dbus_socket}"
+}
+
+reload() {
+	ebegin "Reloading D-Bus system configuration"
+	dbus-send --print-reply --system --type=method_call \
+		--dest=org.freedesktop.DBus \
+		/ org.freedesktop.DBus.ReloadConfig > /dev/null
+	eend $?
+}

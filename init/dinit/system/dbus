@@ -1,0 +1,4 @@
+type = process
+command = /bin/sh -ec "/usr/bin/dbus-uuidgen --ensure=/etc/machine-id && /usr/bin/install -d -m 0755 /run/dbus && exec /usr/bin/dbus-broker-dispatch --scope=system --foreground"
+restart = true
+smooth-recovery = true

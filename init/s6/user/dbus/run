@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+
+: "${XDG_RUNTIME_DIR:?XDG_RUNTIME_DIR is required for the D-Bus user service}"
+
+exec /usr/bin/dbus-broker-dispatch --scope=user --foreground

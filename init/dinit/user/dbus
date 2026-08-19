@@ -1,0 +1,4 @@
+type = process
+command = /usr/bin/dbus-broker-dispatch --scope=user --foreground
+restart = true
+smooth-recovery = true

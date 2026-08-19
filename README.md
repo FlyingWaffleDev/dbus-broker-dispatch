@@ -3,9 +3,11 @@
 `dbus-broker-dispatch` runs [`dbus-broker`](https://github.com/bus1/dbus-broker)
 without systemd. It opens the public Unix socket, starts an unprivileged broker,
 loads standard D-Bus XML policy, activates services, and reloads configuration.
-It works with any supervisor. It does not call or depend on OpenRC.
+It works with any supervisor and does not depend on a particular service
+manager.
 
-The companion Gentoo overlay provides the OpenRC services.
+Service definitions for OpenRC, s6, Dinit, and runit are in [`init`](init/).
+Packagers can install the definitions for their target init system.
 
 This is pre-release software. Test it on a disposable system before replacing
 the system bus or your main desktop session bus.
