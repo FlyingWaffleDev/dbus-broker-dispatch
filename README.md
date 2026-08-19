@@ -1,48 +1,45 @@
 # dbus-broker-dispatch
 
-`dbus-broker-dispatch` is an init-agnostic controller for
-[`dbus-broker`](https://github.com/bus1/dbus-broker). It creates the public
-Unix listener, starts an unprivileged broker with a private controller socket,
-loads standard D-Bus XML policy, and provides service activation and reloads.
-The companion Gentoo overlay supplies `dbus-broker-dispatch-openrc`; the
-dispatcher itself does not call or depend on OpenRC.
+`dbus-broker-dispatch` runs [`dbus-broker`](https://github.com/bus1/dbus-broker)
+without systemd. It opens the public Unix socket, starts an unprivileged broker,
+loads standard D-Bus XML policy, activates services, and reloads configuration.
+It works with any supervisor. It does not call or depend on OpenRC.
 
-The dispatcher and its test suite do not depend on GLib or GIO. D-Bus
-authentication, wire encoding, Unix-FD transport, process supervision, the
-epoll reactor, file watching, service-file parsing, and policy serialization
-are implemented locally on top of libc and Linux interfaces. Expat remains the
-only mandatory library dependency; elogind, Linux-PAM, and libselinux are
-optional feature dependencies.
+The companion Gentoo overlay provides the OpenRC services.
 
-This is pre-release software. Test it in a disposable system before replacing
-the system or desktop-session bus on a primary machine.
+This is pre-release software. Test it on a disposable system before replacing
+the system bus or your main desktop session bus.
 
-## Features
+## What it supports
 
-- System and user buses backed by filesystem `unix:path=` sockets.
-- Standard, mandatory, user, group, `at_console`, and `no_console` policy.
-- Standard service-directory precedence and direct `Exec=` activation without
-  a shell.
-- System-service `User=` privilege transitions, including supplementary-group
-  removal.
-- Activation-environment propagation and `DBUS_STARTER_*` variables.
-- Transactional configuration reloads through SIGHUP or the broker reload API.
-- Debounced automatic reloads for configuration files, include directories,
-  and service directories, including paths that do not exist at startup.
-- D-Bus resource limits mapped to the broker's per-user quotas.
-- Optional live elogind session monitoring for console-sensitive policy.
-- AppArmor feature detection and `enabled`, `disabled`, and `required` modes.
-- Consistent per-generation NSS identity snapshots for policy and activated
-  service users, including supplementary groups.
-- Upstream-compatible configuration structure and attribute diagnostics,
-  SELinux name associations, custom bus types, and optimized policy batches.
-- A `dbus-run-session`-style wrapper for isolated user buses.
-- An optional PAM session module that starts one shared user bus after the
-  session manager has created a secure `XDG_RUNTIME_DIR`.
+- System and user buses on filesystem-backed `unix:path=` sockets
+- Standard D-Bus policy for users, groups, mandatory rules, `at_console`, and
+  `no_console`
+- The standard service-directory search order and direct `Exec=` activation
+  without a shell
+- System service users, cleared supplementary groups, activation environment
+  updates, and `DBUS_STARTER_*` variables
+- Transactional reloads from SIGHUP, the broker reload API, or watched config
+  and service directories
+- Broker quotas derived from the four D-Bus limits that `dbus-broker` uses
+- Optional elogind monitoring for console-sensitive policy
+- AppArmor detection and the `enabled`, `disabled`, and `required` config modes
+- SELinux name associations and optional SELinux-aware config includes
+- A fixed NSS identity snapshot for each config generation
+- Custom bus types and optimized policy batches
+- `dbus-broker-run-session`, an isolated user-bus wrapper
+- An optional PAM module for systems without a per-user service manager
 
-`SystemdService=` is ignored when an `Exec=` command is available. A service
-that contains only `SystemdService=` is not registered; this project never
-starts systemd units or maps them to another service manager.
+`SystemdService=` does not make this project start a systemd unit. If a service
+file also has `Exec=`, the dispatcher uses that command. It does not register a
+service file that has only `SystemdService=`.
+
+## Requirements
+
+The dispatcher uses libc and Linux interfaces for D-Bus authentication, wire
+encoding, Unix file descriptor transport, process supervision, file watching,
+and service activation. Expat is the only required library. Elogind, Linux-PAM,
+and libselinux are optional.
 
 ## Build and test
 
@@ -52,22 +49,21 @@ meson compile -C build
 meson test -C build --print-errorlogs
 ```
 
-The PAM module is built automatically when Linux-PAM is available. Require or
-disable it explicitly with `-Dpam=enabled` or `-Dpam=disabled`; override its
-installation directory with `-Dpam-module-dir=/lib64/security` when a
-distribution keeps PAM modules outside the normal prefix.
+Meson detects the PAM and SELinux dependencies by default. The relevant build
+options are:
 
-Enable elogind policy updates with `-Delogind=true`. Configure additional
-users that should always receive `at_console` policy with, for example,
-`-Dsystem-console-users=root,rescue`.
+- `-Dpam=enabled` or `-Dpam=disabled` requires or disables the PAM module.
+- `-Dpam-module-dir=/lib64/security` changes its install directory.
+- `-Delogind=true` enables live console-policy updates.
+- `-Dsystem-console-users=root,rescue` always treats the listed users as
+  `at_console`.
+- `-Dselinux=enabled` or `-Dselinux=disabled` requires or disables SELinux-aware
+  config includes.
 
-SELinux-aware conditional and policy-root-relative includes are enabled
-automatically when libselinux is available. Select this explicitly with
-`-Dselinux=enabled` or `-Dselinux=disabled`. SELinux `<associate>` mappings are
-exported regardless; libselinux is only needed to query the active policy and
-its root.
+The dispatcher exports SELinux `<associate>` mappings even without libselinux.
+It needs libselinux only to query the active policy and its root.
 
-For a sanitizer build:
+For an AddressSanitizer and UndefinedBehaviorSanitizer build:
 
 ```sh
 meson setup build-asan --buildtype=debugoptimized \
@@ -75,64 +71,67 @@ meson setup build-asan --buildtype=debugoptimized \
 meson test -C build-asan --print-errorlogs
 ```
 
-## Usage
+## Run the dispatcher
 
-Run in the foreground under a supervisor:
+Under a supervisor, keep the dispatcher in the foreground:
 
 ```sh
 dbus-broker-dispatch --scope=system --foreground
 dbus-broker-dispatch --scope=user --foreground
 ```
 
-Run one command in a private session bus:
+`--scope` is required. Without `--foreground`, the dispatcher forks into the
+background. Use `dbus-broker-dispatch --help` for the full option list.
+
+The default config files are `/usr/share/dbus-1/system.conf` and
+`/usr/share/dbus-1/session.conf`. The default sockets are
+`/run/dbus/system_bus_socket` and `$XDG_RUNTIME_DIR/bus`.
+
+To run one command on a temporary user bus:
 
 ```sh
 dbus-broker-run-session -- command arg...
 ```
 
-The dispatcher requires an explicit `--scope`. It accepts `--config-file`,
-`--address`, `--broker`, `--pid-file`, `--system-uid-max`, and `--audit`.
-Omit `--foreground` to self-daemonize. The OpenRC system service uses that
-mode to match Gentoo's reference `dbus` service; the OpenRC user service uses
-self-daemonizing mode as well.
+The wrapper returns the command's exit status and removes the bus when the
+command exits.
 
-## PAM user-bus startup
+## Start user buses from PAM
 
-`pam_dbus_broker_dispatch.so` is an optional session module for systems that
-have no per-user service manager. Add it after the module that creates
-`XDG_RUNTIME_DIR` (normally `pam_elogind.so`):
+`pam_dbus_broker_dispatch.so` is for systems without a per-user service
+manager. Add it after the module that creates `XDG_RUNTIME_DIR`, usually
+`pam_elogind.so`:
 
 ```text
 -session optional pam_dbus_broker_dispatch.so
 ```
 
-On open-session it validates that the runtime directory is an absolute,
-user-owned `0700` directory, serializes concurrent starts, and launches
-`dbus-broker-dispatch --scope=user` with the target user's credentials. It
-then publishes `DBUS_SESSION_BUS_ADDRESS` through the PAM environment. Multiple
-PAM sessions share the same module-owned bus; the last close-session stops it.
-An already-active bus owned by another integration mechanism is reused but is
-never claimed or stopped.
+When a PAM session opens, the module checks that `XDG_RUNTIME_DIR` is an
+absolute, user-owned `0700` directory. It serializes concurrent starts, runs a
+user-scope dispatcher with the user's credentials, and adds
+`DBUS_SESSION_BUS_ADDRESS` to the PAM environment. Sessions for the same user
+share one module-owned bus. The last session to close stops it.
 
-The module does not create or chown runtime directories. A missing
-`XDG_RUNTIME_DIR` returns `PAM_IGNORE`, so ordering after `pam_elogind` (or an
-equivalent session-runtime provider) is required. The optional PAM control
-flag is recommended during initial deployment so a bus failure cannot prevent
-login. Add the line only to session stacks whose processes should inherit a
-user bus.
+If another integration already owns a live bus, the module reuses it but does
+not stop it. The module never creates or changes ownership of a runtime
+directory. A missing runtime directory returns `PAM_IGNORE`, which makes module
+ordering important.
 
-Module arguments are limited to `debug`, `dispatcher=/absolute/path`, and
-`config-file=/absolute/path`. The path overrides are intended for development
-and controlled deployments; normal installations need no arguments.
+Keep the module optional during initial testing so a bus failure cannot block
+login. Add it only to session stacks whose processes need a user bus.
 
-## Current compatibility boundary
+The accepted module arguments are `debug`, `dispatcher=/absolute/path`, and
+`config-file=/absolute/path`. The path overrides are for development or
+controlled deployments. Installed systems normally need no arguments.
 
-- Only filesystem-backed `unix:path=` listeners are accepted. Abstract and
-  non-Unix transports are intentionally rejected.
-- Container policy and several legacy dbus-daemon-only limits are not
-  implemented. The four limits used by dbus-broker are honored:
-  `max_outgoing_bytes`, `max_outgoing_unix_fds`,
-  `max_connections_per_user`, and `max_match_rules_per_connection`.
+## Known limits
 
-Before a wider release, replace the placeholder repository URLs in the
-companion overlay.
+- The dispatcher accepts only filesystem-backed `unix:path=` listeners. It
+  rejects abstract sockets and non-Unix transports.
+- Container policy and several limits used only by `dbus-daemon` are not
+  implemented. The dispatcher supports `max_outgoing_bytes`,
+  `max_outgoing_unix_fds`, `max_connections_per_user`, and
+  `max_match_rules_per_connection`.
+
+The companion overlay still contains placeholder repository URLs. Replace them
+before publishing a release.

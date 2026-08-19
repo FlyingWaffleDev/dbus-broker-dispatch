@@ -1,10 +1,10 @@
 option('elogind', type: 'boolean', value: false,
-       description: 'Enable elogind-backed active-local-session detection')
+       description: 'Use elogind to detect active local sessions')
 option('system-console-users', type: 'array', value: [],
-       description: 'Additional users always considered at-console')
+       description: 'Users that always receive at_console policy')
 option('pam', type: 'feature', value: 'auto',
        description: 'Build the PAM session module')
 option('pam-module-dir', type: 'string', value: '',
-       description: 'PAM module installation directory (defaults to libdir/security)')
+       description: 'PAM module install directory; defaults to libdir/security')
 option('selinux', type: 'feature', value: 'auto',
-       description: 'Enable SELinux-aware conditional and root-relative configuration includes')
+       description: 'Support SELinux conditional and policy-root-relative config includes')

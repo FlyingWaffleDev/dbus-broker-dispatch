@@ -844,8 +844,21 @@ static char *find_program(const char *name)
 
 static void usage(void)
 {
-        puts("Usage: dbus-broker-dispatch --scope=system|user [--config-file=PATH] [--address=ADDRESS] "
-             "[--broker=PATH] [--pid-file=PATH] [--system-uid-max=N] [--audit] [--foreground]");
+        puts("Usage: dbus-broker-dispatch --scope=system|user [OPTIONS]\n"
+             "\n"
+             "Run dbus-broker without systemd.\n"
+             "\n"
+             "Options:\n"
+             "  --scope=system|user   Bus scope. This option is required.\n"
+             "  --config-file=PATH    D-Bus XML configuration file.\n"
+             "  --address=ADDRESS     Public address. Only unix:path= is accepted.\n"
+             "  --broker=PATH         dbus-broker executable.\n"
+             "  --pid-file=PATH       Write the dispatcher PID to PATH.\n"
+             "  --system-uid-max=N    Highest UID treated as a system user.\n"
+             "  --audit               Pass audit capability to dbus-broker.\n"
+             "  --foreground          Stay in the foreground.\n"
+             "  --help                Show this help text.\n"
+             "  --version             Show the version.");
 }
 
 static void launcher_clear(Launcher *launcher)
