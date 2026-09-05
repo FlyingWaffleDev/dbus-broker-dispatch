@@ -173,7 +173,7 @@ bool dbus_transport_send(DBusTransport *transport, const DBusWriter *message, co
         return write_all(transport->fd, message->bytes.data + offset, message->bytes.len - offset, error);
 }
 
-static bool receive_more(DBusTransport *transport, Error **error)
+static bool receive_more(DBusTransport *transport, bool wait, bool *received, Error **error)
 {
         uint8_t bytes[65536];
         /* Aligned for the control messages parsed out of it below. */
@@ -183,6 +183,9 @@ static bool receive_more(DBusTransport *transport, Error **error)
         } control;
         struct iovec iov = {.iov_base = bytes, .iov_len = sizeof(bytes)};
         struct msghdr msg;
+
+        if (received)
+                *received = false;
 
         for (;;) {
                 ssize_t n;
@@ -195,7 +198,7 @@ static bool receive_more(DBusTransport *transport, Error **error)
                         .msg_control = control.bytes,
                         .msg_controllen = sizeof(control.bytes),
                 };
-                n = recvmsg(transport->fd, &msg, MSG_CMSG_CLOEXEC);
+                n = recvmsg(transport->fd, &msg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
                 if (n > 0) {
                         for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
                                 if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
@@ -218,11 +221,16 @@ static bool receive_more(DBusTransport *transport, Error **error)
                                 return error_set(error, EOVERFLOW, "Too many file descriptors in D-Bus message");
                         if (!str_buf_append_n(&transport->incoming, (char *)bytes, (size_t)n))
                                 return error_set(error, ENOMEM, "Cannot buffer D-Bus message");
+                        *received = true;
                         return true;
                 }
                 if (n < 0 && errno == EINTR)
                         continue;
                 if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        if (!wait) {
+                                *received = false;
+                                return true;
+                        }
                         if (!wait_fd(transport->fd, POLLIN, error))
                                 return false;
                         continue;
@@ -240,13 +248,14 @@ void dbus_packet_clear(DBusPacket *packet)
         *packet = (DBusPacket){0};
 }
 
-bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error **error)
+static bool receive_packet(DBusTransport *transport, DBusPacket *packet, bool wait, bool *received, Error **error)
 {
         DBusHeader temporary = {0};
         DBusReader body;
         size_t consumed;
 
         dbus_packet_clear(packet);
+        *received = false;
         for (;;) {
                 Error *parse_error = NULL;
                 if (transport->incoming.len >= 16 &&
@@ -262,6 +271,7 @@ bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error 
                                 dbus_header_clear(&temporary);
                                 return error_set(error, ENOMEM, "Cannot allocate D-Bus packet");
                         }
+                        size_t body_offset = (size_t)(body.bytes - (uint8_t *)transport->incoming.data);
                         memcpy(packet->bytes, transport->incoming.data, consumed);
                         memmove(transport->incoming.data, transport->incoming.data + consumed,
                                 transport->incoming.len - consumed);
@@ -270,12 +280,6 @@ bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error 
                         packet->length = consumed;
                         packet->header = temporary;
                         temporary = (DBusHeader){0};
-                        size_t body_offset;
-                        uint32_t fields_length;
-                        memcpy(&fields_length, packet->bytes + 12, sizeof(fields_length));
-                        if (packet->bytes[0] == 'B')
-                                fields_length = __builtin_bswap32(fields_length);
-                        body_offset = (16 + (size_t)fields_length + 7) & ~(size_t)7;
                         packet->body = (DBusReader){
                                 .bytes = packet->bytes + body_offset,
                                 .length = packet->length - body_offset,
@@ -286,6 +290,7 @@ bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error 
                         memmove(transport->received_fds, transport->received_fds + packet->n_fds,
                                 (transport->n_received_fds - packet->n_fds) * sizeof(int));
                         transport->n_received_fds -= packet->n_fds;
+                        *received = true;
                         return true;
                 }
                 if (parse_error && parse_error->code != EAGAIN) {
@@ -298,7 +303,21 @@ bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error 
                 }
                 error_free(parse_error);
                 dbus_header_clear(&temporary);
-                if (!receive_more(transport, error))
+                bool read = false;
+                if (!receive_more(transport, wait, &read, error))
                         return false;
+                if (!read)
+                        return true;
         }
+}
+
+bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error **error)
+{
+        bool received;
+        return receive_packet(transport, packet, true, &received, error);
+}
+
+bool dbus_transport_receive_ready(DBusTransport *transport, DBusPacket *packet, bool *received, Error **error)
+{
+        return receive_packet(transport, packet, false, received, error);
 }

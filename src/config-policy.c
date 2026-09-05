@@ -38,9 +38,11 @@ static void optimize_rule_array(PtrVec *rules);
 static void optimize_rule_table(U32Map *table);
 static void optimize_strings(PtrVec *strings);
 static void parser_warning(ParserState *state, const char *format, ...);
+static void parser_fail(ParserState *state, Error *error);
 
-static void policy_rule_free(PolicyRule *rule)
+static void policy_rule_free(void *data)
 {
+        PolicyRule *rule = data;
         if (!rule)
                 return;
         free(rule->name);
@@ -62,16 +64,23 @@ LauncherConfig *launcher_config_new(void)
         if (!config)
                 return NULL;
 
-        config->default_rules = ptr_vec_new((DestroyFunc)policy_rule_free);
+        config->default_rules = ptr_vec_new(policy_rule_free);
         config->user_rules = u32_map_new(rule_array_free);
         config->group_rules = u32_map_new(rule_array_free);
-        config->at_console_rules = ptr_vec_new((DestroyFunc)policy_rule_free);
-        config->no_console_rules = ptr_vec_new((DestroyFunc)policy_rule_free);
+        config->at_console_rules = ptr_vec_new(policy_rule_free);
+        config->no_console_rules = ptr_vec_new(policy_rule_free);
         config->service_dirs = ptr_vec_new(free);
         config->watch_paths = ptr_vec_new(free);
         config->active_files = str_map_new(NULL);
         config->selinux_associations = str_map_new(free);
         config->nss = nss_cache_new();
+        if (!config->default_rules || !config->user_rules || !config->group_rules ||
+            !config->at_console_rules || !config->no_console_rules || !config->service_dirs ||
+            !config->watch_paths || !config->active_files || !config->selinux_associations ||
+            !config->nss) {
+                launcher_config_free(config);
+                return NULL;
+        }
         config->apparmor_mode = 1;
         config->max_outgoing_bytes = UINT64_C(8) * 1024 * 1024;
         config->max_outgoing_fds = 64;
@@ -244,22 +253,32 @@ static PtrVec *rules_for_id(U32Map *rules, uint32_t id)
         PtrVec *array = u32_map_get(rules, id);
 
         if (!array) {
-                array = ptr_vec_new((DestroyFunc)policy_rule_free);
-                u32_map_set(rules, id, array);
+                array = ptr_vec_new(policy_rule_free);
+                if (!array)
+                        return NULL;
+                if (!u32_map_set(rules, id, array)) {
+                        ptr_vec_free(array);
+                        return NULL;
+                }
         }
         return array;
 }
 
 /* ptr_vec_push() of a NULL path would later reach opendir(); drop instead. */
-static void push_path(PtrVec *paths, char *path)
+static bool push_path(PtrVec *paths, char *path)
 {
-        if (!path || !ptr_vec_push(paths, path))
+        if (!path)
+                return false;
+        if (!ptr_vec_push(paths, path)) {
                 free(path);
+                return false;
+        }
+        return true;
 }
 
 static void append_rule(ParserState *state, PolicyRule *rule, bool connection_target, bool group_target, uint32_t id)
 {
-        PtrVec *rules;
+        PtrVec *rules = NULL;
 
         if (connection_target) {
                 rules = group_target ? rules_for_id(state->config->group_rules, id)
@@ -275,7 +294,13 @@ static void append_rule(ParserState *state, PolicyRule *rule, bool connection_ta
         } else {
                 rules = state->config->default_rules;
         }
-        ptr_vec_push(rules, rule);
+        if (!rules || !ptr_vec_push(rules, rule)) {
+                policy_rule_free(rule);
+                Error *error = NULL;
+                error_set(&error, ENOMEM, "Out of memory appending policy rule");
+                parser_fail(state, error);
+                return;
+        }
 }
 
 static void parse_rule(ParserState *state, const char *element, const char **attributes)
@@ -309,6 +334,12 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                         attribute(attributes, "receive_interface") || attribute(attributes, "receive_member") ||
                         attribute(attributes, "receive_error") || recv_type || recv_requested_reply;
         PolicyRule *rule = calloc(1, sizeof(*rule));
+        if (!rule) {
+                Error *error = NULL;
+                error_set(&error, ENOMEM, "Out of memory allocating policy rule");
+                parser_fail(state, error);
+                return;
+        }
         uint32_t id = state->context == POLICY_CONTEXT_USER    ? state->uid
                       : state->context == POLICY_CONTEXT_GROUP ? state->gid
                                                                : 0;
@@ -346,6 +377,13 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 rule->type = POLICY_RULE_OWN;
                 rule->own_prefix = own_prefix != NULL || str_equal(own, "*");
                 rule->name = str_dup(own_prefix ? own_prefix : (str_equal(own, "*") ? "" : own));
+                if (!rule->name) {
+                        policy_rule_free(rule);
+                        Error *error = NULL;
+                        error_set(&error, ENOMEM, "Out of memory copying rule name");
+                        parser_fail(state, error);
+                        return;
+                }
         } else if (has_send) {
                 rule->type = POLICY_RULE_SEND;
                 rule->name = copy_match(send_destination);
@@ -354,6 +392,13 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 rule->member = copy_match(attribute(attributes, "send_member"));
                 rule->message_type = parse_message_type(send_type);
                 rule->broadcast = parse_tristate(attribute(attributes, "send_broadcast"));
+                if (!rule->name || !rule->path || !rule->interface || !rule->member) {
+                        policy_rule_free(rule);
+                        Error *error = NULL;
+                        error_set(&error, ENOMEM, "Out of memory copying rule fields");
+                        parser_fail(state, error);
+                        return;
+                }
         } else {
                 rule->type = POLICY_RULE_RECV;
                 rule->name = copy_match(recv_sender);
@@ -361,6 +406,13 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 rule->interface = copy_match(attribute(attributes, "receive_interface"));
                 rule->member = copy_match(attribute(attributes, "receive_member"));
                 rule->message_type = parse_message_type(recv_type);
+                if (!rule->name || !rule->path || !rule->interface || !rule->member) {
+                        policy_rule_free(rule);
+                        Error *error = NULL;
+                        error_set(&error, ENOMEM, "Out of memory copying rule fields");
+                        parser_fail(state, error);
+                        return;
+                }
         }
 
         if (rule->message_type == UINT32_MAX || rule->broadcast == UINT32_MAX ||
@@ -614,7 +666,14 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 return;
         }
         validate_attributes(state, element, attributes);
-        ptr_vec_push(state->elements, str_dup(element));
+        char *element_name = str_dup(element);
+        if (!element_name || !ptr_vec_push(state->elements, element_name)) {
+                free(element_name);
+                Error *error = NULL;
+                error_set(&error, ENOMEM, "Out of memory tracking XML element");
+                parser_fail(state, error);
+                return;
+        }
 
         if (str_equal(element, "policy")) {
                 context = attribute(attributes, "context");
@@ -665,8 +724,16 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
         } else if (str_equal(element, "associate")) {
                 const char *own = attribute(attributes, "own");
                 const char *context_value = attribute(attributes, "context");
-                if (own && context_value)
-                        str_map_set(state->config->selinux_associations, own, str_dup(context_value));
+                if (own && context_value) {
+                        char *context_copy = str_dup(context_value);
+                        if (!context_copy || !str_map_set(state->config->selinux_associations, own, context_copy)) {
+                                free(context_copy);
+                                Error *error = NULL;
+                                error_set(&error, ENOMEM, "Out of memory storing SELinux association");
+                                parser_fail(state, error);
+                                return;
+                        }
+                }
         } else if (str_equal(element, "include") || str_equal(element, "includedir") ||
                    str_equal(element, "servicedir") || str_equal(element, "listen") || str_equal(element, "user") ||
                    str_equal(element, "type")) {
@@ -681,15 +748,32 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 state->text_element = element;
                 free(state->limit_name);
                 state->limit_name = str_dup(attribute(attributes, "name"));
+                if (attribute(attributes, "name") && !state->limit_name) {
+                        Error *error = NULL;
+                        error_set(&error, ENOMEM, "Out of memory storing limit name");
+                        parser_fail(state, error);
+                        return;
+                }
                 state->text->len = 0;
                 if (state->text->data)
                         state->text->data[0] = 0;
         } else if (str_equal(element, "standard_system_servicedirs")) {
-                push_path(state->config->service_dirs, str_dup("/etc/dbus-1/system-services"));
-                push_path(state->config->service_dirs, str_dup("/run/dbus-1/system-services"));
-                push_path(state->config->service_dirs, str_dup("/usr/local/share/dbus-1/system-services"));
-                push_path(state->config->service_dirs, str_dup("/usr/share/dbus-1/system-services"));
-                push_path(state->config->service_dirs, str_dup("/lib/dbus-1/system-services"));
+                const char *dirs[] = {
+                        "/etc/dbus-1/system-services",
+                        "/run/dbus-1/system-services",
+                        "/usr/local/share/dbus-1/system-services",
+                        "/usr/share/dbus-1/system-services",
+                        "/lib/dbus-1/system-services",
+                };
+                for (size_t i = 0; i < sizeof(dirs) / sizeof(dirs[0]); ++i) {
+                        char *path = str_dup(dirs[i]);
+                        if (!push_path(state->config->service_dirs, path)) {
+                                Error *error = NULL;
+                                error_set(&error, ENOMEM, "Out of memory adding standard system servicedirs");
+                                parser_fail(state, error);
+                                return;
+                        }
+                }
         } else if (str_equal(element, "standard_session_servicedirs")) {
                 const char *runtime = getenv("XDG_RUNTIME_DIR");
                 const char *data_home = getenv("XDG_DATA_HOME");
@@ -697,7 +781,12 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 char *base = NULL, *dbus = NULL;
                 if (runtime && path_is_absolute(runtime)) {
                         dbus = path_join(runtime, "dbus-1/services");
-                        push_path(state->config->service_dirs, dbus);
+                        if (!push_path(state->config->service_dirs, dbus)) {
+                                Error *error = NULL;
+                                error_set(&error, ENOMEM, "Out of memory adding standard session servicedirs");
+                                parser_fail(state, error);
+                                return;
+                        }
                 }
                 if (data_home && path_is_absolute(data_home))
                         base = str_dup(data_home);
@@ -705,15 +794,35 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         base = path_join(home, ".local/share");
                 if (base) {
                         dbus = path_join(base, "dbus-1/services");
-                        push_path(state->config->service_dirs, dbus);
                         free(base);
+                        if (!push_path(state->config->service_dirs, dbus)) {
+                                Error *error = NULL;
+                                error_set(&error, ENOMEM, "Out of memory adding standard session servicedirs");
+                                parser_fail(state, error);
+                                return;
+                        }
                 }
                 const char *system_dirs = getenv("XDG_DATA_DIRS");
                 char *copy = str_dup(system_dirs && *system_dirs ? system_dirs : "/usr/local/share:/usr/share");
+                if (!copy) {
+                        Error *error = NULL;
+                        error_set(&error, ENOMEM, "Out of memory adding standard session servicedirs");
+                        parser_fail(state, error);
+                        return;
+                }
                 char *cursor = copy, *directory;
-                while (copy && (directory = strsep(&cursor, ":")))
-                        if (path_is_absolute(directory))
-                                push_path(state->config->service_dirs, path_join(directory, "dbus-1/services"));
+                while ((directory = strsep(&cursor, ":"))) {
+                        if (path_is_absolute(directory)) {
+                                char *dir_path = path_join(directory, "dbus-1/services");
+                                if (!push_path(state->config->service_dirs, dir_path)) {
+                                        free(copy);
+                                        Error *error = NULL;
+                                        error_set(&error, ENOMEM, "Out of memory adding standard session servicedirs");
+                                        parser_fail(state, error);
+                                        return;
+                                }
+                        }
+                }
                 free(copy);
         }
 }
@@ -826,6 +935,12 @@ static void parser_end(void *data, const XML_Char *element)
         if (!state->text_element || !str_equal(element, state->text_element))
                 return;
         value = str_dup(state->text->data ? state->text->data : "");
+        if (!value) {
+                Error *nomem = NULL;
+                error_set(&nomem, ENOMEM, "Out of memory processing element text");
+                parser_fail(state, nomem);
+                return;
+        }
         strip(value);
         if (str_equal(element, "limit") && !*value) {
                 error_set(&error, EINVAL, "D-Bus limit '%s' has no value",
@@ -847,7 +962,11 @@ static void parser_end(void *data, const XML_Char *element)
                                 path = path_join(selinux_root, value);
                         else
                                 path = resolve_path(state->base_dir, value);
-                        if (!load_file(state->config, path, state->include_ignore_missing, &error)) {
+                        if (!path) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory resolving include path");
+                                parser_fail(state, nomem);
+                        } else if (!load_file(state->config, path, state->include_ignore_missing, &error)) {
                                 error_prefix(&error, "Invalid D-Bus include %s: ", path);
                                 parser_fail(state, error);
                                 error = NULL;
@@ -856,7 +975,11 @@ static void parser_end(void *data, const XML_Char *element)
                 include_done:;
                 } else if (str_equal(element, "includedir")) {
                         path = resolve_path(state->base_dir, value);
-                        if (!load_directory(state->config, path, &error)) {
+                        if (!path) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory resolving includedir path");
+                                parser_fail(state, nomem);
+                        } else if (!load_directory(state->config, path, &error)) {
                                 error_prefix(&error, "Invalid D-Bus include directory %s: ", path);
                                 parser_fail(state, error);
                                 error = NULL;
@@ -864,16 +987,35 @@ static void parser_end(void *data, const XML_Char *element)
                         free(path);
                 } else if (str_equal(element, "servicedir")) {
                         path = resolve_path(state->base_dir, value);
-                        push_path(state->config->service_dirs, path);
+                        if (!path || !push_path(state->config->service_dirs, path)) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory adding servicedir");
+                                parser_fail(state, nomem);
+                        }
                 } else if (str_equal(element, "listen") && !state->config->address &&
                            str_has_prefix(value, "unix:path=")) {
                         state->config->address = str_dup(value);
+                        if (!state->config->address) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory setting listen address");
+                                parser_fail(state, nomem);
+                        }
                 } else if (str_equal(element, "user")) {
                         free(state->config->user);
                         state->config->user = str_dup(value);
+                        if (!state->config->user) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory setting user");
+                                parser_fail(state, nomem);
+                        }
                 } else if (str_equal(element, "type")) {
                         free(state->config->bus_type);
                         state->config->bus_type = str_dup(value);
+                        if (!state->config->bus_type) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory setting bus type");
+                                parser_fail(state, nomem);
+                        }
                 } else if (str_equal(element, "limit")) {
                         uint64_t parsed;
                         if (!state->limit_name || !parse_u64(value, UINT64_MAX, &parsed)) {
@@ -900,8 +1042,13 @@ static void parser_end(void *data, const XML_Char *element)
 static void parser_text(void *data, const XML_Char *text, int length)
 {
         ParserState *state = data;
-        if (!state->ignored_depth && state->text_element)
-                str_buf_append_n(state->text, text, (size_t)length);
+        if (!state->ignored_depth && state->text_element) {
+                if (!str_buf_append_n(state->text, text, (size_t)length)) {
+                        Error *nomem = NULL;
+                        error_set(&nomem, ENOMEM, "Out of memory appending text");
+                        parser_fail(state, nomem);
+                }
+        }
 }
 
 static bool load_file(LauncherConfig *config, const char *path, bool ignore_missing, Error **error)
@@ -940,7 +1087,12 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                 free(canonical);
                 return false;
         }
-        str_map_set(config->active_files, canonical, NULL);
+        if (!str_map_set(config->active_files, canonical, NULL)) {
+                error_set(error, ENOMEM, "%s: out of memory", canonical);
+                free(contents);
+                free(canonical);
+                return false;
+        }
         state.base_dir = path_dirname(canonical);
         state.file = canonical;
         state.text = calloc(1, sizeof(*state.text));
@@ -979,6 +1131,10 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                                   XML_ErrorString(XML_GetErrorCode(parser)));
                 }
         } else {
+                if (state.error) {
+                        error_free(state.error);
+                        state.error = NULL;
+                }
                 success = true;
         }
         XML_ParserFree(parser);
@@ -1018,6 +1174,7 @@ static char *rule_signature(const PolicyRule *rule)
 typedef struct {
         char *signature;
         size_t index;
+        uint64_t priority;
 } RuleSignature;
 
 static int compare_rule_signatures(const void *left, const void *right)
@@ -1026,12 +1183,13 @@ static int compare_rule_signatures(const void *left, const void *right)
         int order = strcmp(a->signature, b->signature);
         if (order)
                 return order;
+        if (a->priority != b->priority)
+                return (a->priority > b->priority) - (a->priority < b->priority);
         return (a->index > b->index) - (a->index < b->index);
 }
 
-/* Later rules have higher priority. An earlier byte-for-byte equivalent rule
- * with the same verdict can therefore never affect a decision, so only the last
- * of each group is kept.
+/* Keep the highest-priority equivalent rule. Mandatory and default rules share
+ * an array, so file order alone does not determine priority.
  *
  * Sorting rather than scanning a linear-probe map keeps this O(n log n); large
  * generated policies made the previous form quadratic. */
@@ -1050,11 +1208,12 @@ static void optimize_rule_array(PtrVec *rules)
         for (; built < total; ++built) {
                 signatures[built].signature = rule_signature(rules->items[built]);
                 signatures[built].index = built;
+                signatures[built].priority = ((PolicyRule *)rules->items[built])->priority;
                 if (!signatures[built].signature)
                         goto out; /* Leave the rules untouched; dedup is optional. */
         }
         qsort(signatures, total, sizeof(*signatures), compare_rule_signatures);
-        /* Equal signatures are now adjacent and ordered by position, so every
+        /* Equal signatures are now adjacent and ordered by priority, so every
          * entry but the last of each run is redundant. */
         for (size_t i = 0; i + 1 < total; ++i)
                 if (strcmp(signatures[i].signature, signatures[i + 1].signature) == 0)

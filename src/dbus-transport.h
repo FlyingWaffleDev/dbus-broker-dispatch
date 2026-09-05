@@ -28,4 +28,7 @@ uint32_t dbus_transport_next_serial(DBusTransport *transport);
 bool dbus_transport_send(DBusTransport *transport, const DBusWriter *message, const int *fds, size_t n_fds,
                          Error **error);
 bool dbus_transport_receive(DBusTransport *transport, DBusPacket *packet, Error **error);
+/* Returns success with received=false when only an incomplete packet, or no
+ * data, is available. Never waits for socket readability. */
+bool dbus_transport_receive_ready(DBusTransport *transport, DBusPacket *packet, bool *received, Error **error);
 void dbus_packet_clear(DBusPacket *packet);

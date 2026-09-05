@@ -53,6 +53,8 @@ typedef struct StrMap {
         StrMapEntry *entries;
         size_t len;
         size_t capacity;
+        size_t *buckets;
+        size_t n_buckets;
         DestroyFunc destroy;
 } StrMap;
 
@@ -74,6 +76,8 @@ typedef struct U32Map {
         U32MapEntry *entries;
         size_t len;
         size_t capacity;
+        size_t *buckets;
+        size_t n_buckets;
         DestroyFunc destroy;
 } U32Map;
 

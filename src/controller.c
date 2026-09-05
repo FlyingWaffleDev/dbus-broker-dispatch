@@ -19,10 +19,15 @@ void controller_reply_free(ControllerReply *reply)
         free(reply);
 }
 
+static void reply_destroy(void *data)
+{
+        controller_reply_free(data);
+}
+
 void controller_init(Controller *controller, int fd, ControllerPacketFunc packet_func, void *data)
 {
         *controller = (Controller){.packet_func = packet_func, .packet_data = data};
-        ptr_vec_init(&controller->pending_replies, (DestroyFunc)controller_reply_free);
+        ptr_vec_init(&controller->pending_replies, reply_destroy);
         dbus_transport_init(&controller->transport, fd);
 }
 
@@ -106,13 +111,22 @@ static bool dispatch_packet(Controller *controller, DBusPacket *packet, Error **
 
 bool controller_dispatch(Controller *controller, Error **error)
 {
-        DBusPacket packet = {0};
-        bool result;
-        if (!dbus_transport_receive(&controller->transport, &packet, error))
-                return false;
-        result = dispatch_packet(controller, &packet, error);
-        dbus_packet_clear(&packet);
-        return result;
+        controller->dispatch_pending = false;
+        /* Bound each pass so signals and timers remain responsive under load. */
+        for (unsigned int i = 0; i < 32; ++i) {
+                DBusPacket packet = {0};
+                bool received, result;
+                if (!dbus_transport_receive_ready(&controller->transport, &packet, &received, error))
+                        return false;
+                if (!received)
+                        return true;
+                result = dispatch_packet(controller, &packet, error);
+                dbus_packet_clear(&packet);
+                if (!result)
+                        return false;
+        }
+        controller->dispatch_pending = true;
+        return true;
 }
 
 /* Extracts an error message body, defaulting when the reply has no string. */

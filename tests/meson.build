@@ -27,13 +27,14 @@ test_session_bus = executable(
   ['test-session-bus.c', '../src/util.c', '../src/log.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
   include_directories: src_inc,
 )
-test('session-bus', test_session_bus, args: [dbus_broker_dispatch.full_path()], timeout: 30)
+test('session-bus', test_session_bus, args: [dbus_broker_dispatch.full_path()], depends: [dbus_broker_dispatch], timeout: 30)
 
 test_run_session = executable('test-run-session', 'test-run-session.c')
 test(
   'run-session',
   test_run_session,
   args: [dbus_broker_run_session.full_path(), dbus_broker_dispatch.full_path()],
+  depends: [dbus_broker_run_session, dbus_broker_dispatch],
   timeout: 30,
 )
 
@@ -43,6 +44,7 @@ if pam.found()
     'pam-session',
     test_pam_session,
     args: [pam_dbus_broker_dispatch.full_path(), dbus_broker_dispatch.full_path()],
+    depends: [pam_dbus_broker_dispatch, dbus_broker_dispatch],
     timeout: 30,
   )
 endif

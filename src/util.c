@@ -2,6 +2,7 @@
 #include "util.h"
 
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -230,6 +231,7 @@ void str_map_clear(StrMap *map)
                         map->destroy(map->entries[i].value);
         }
         free(map->entries);
+        free(map->buckets);
         *map = (StrMap){.destroy = map->destroy};
 }
 
@@ -249,11 +251,36 @@ void str_map_free(StrMap *map)
         }
 }
 
+static inline uint64_t hash_str(const char *str)
+{
+        uint64_t h = 14695981039346656037ULL;
+        while (*str) {
+                h ^= (uint8_t)*str++;
+                h *= 1099511628211ULL;
+        }
+        return h;
+}
+
 static size_t str_map_find(const StrMap *map, const char *key)
 {
-        for (size_t i = 0; i < map->len; ++i)
-                if (strcmp(map->entries[i].key, key) == 0)
-                        return i;
+        if (!map || map->len == 0)
+                return SIZE_MAX;
+        if (!map->buckets || map->n_buckets == 0) {
+                for (size_t i = 0; i < map->len; ++i)
+                        if (strcmp(map->entries[i].key, key) == 0)
+                                return i;
+                return SIZE_MAX;
+        }
+        size_t mask = map->n_buckets - 1;
+        uint64_t h = hash_str(key);
+        for (size_t probe = 0; probe < map->n_buckets; ++probe) {
+                size_t b = (size_t)(h + probe) & mask;
+                size_t idx = map->buckets[b];
+                if (idx == SIZE_MAX)
+                        return SIZE_MAX;
+                if (strcmp(map->entries[idx].key, key) == 0)
+                        return idx;
+        }
         return SIZE_MAX;
 }
 
@@ -268,6 +295,30 @@ bool str_map_contains(const StrMap *map, const char *key)
         return str_map_find(map, key) != SIZE_MAX;
 }
 
+static bool str_map_rehash(StrMap *map, size_t new_n_buckets)
+{
+        size_t *new_buckets = malloc(new_n_buckets * sizeof(size_t));
+        if (!new_buckets)
+                return false;
+        for (size_t i = 0; i < new_n_buckets; ++i)
+                new_buckets[i] = SIZE_MAX;
+        size_t mask = new_n_buckets - 1;
+        for (size_t i = 0; i < map->len; ++i) {
+                uint64_t h = hash_str(map->entries[i].key);
+                for (size_t probe = 0; probe < new_n_buckets; ++probe) {
+                        size_t b = (size_t)(h + probe) & mask;
+                        if (new_buckets[b] == SIZE_MAX) {
+                                new_buckets[b] = i;
+                                break;
+                        }
+                }
+        }
+        free(map->buckets);
+        map->buckets = new_buckets;
+        map->n_buckets = new_n_buckets;
+        return true;
+}
+
 bool str_map_set(StrMap *map, const char *key, void *value)
 {
         size_t index = str_map_find(map, key);
@@ -279,6 +330,10 @@ bool str_map_set(StrMap *map, const char *key, void *value)
                 map->entries[index].value = value;
                 return true;
         }
+        if (map->len >= map->n_buckets / 2) {
+                size_t next_buckets = map->n_buckets ? map->n_buckets * 2 : 16;
+                str_map_rehash(map, next_buckets);
+        }
         copy = strdup(key);
         if (!copy)
                 return false;
@@ -287,7 +342,20 @@ bool str_map_set(StrMap *map, const char *key, void *value)
                 free(copy);
                 return false;
         }
-        map->entries[map->len++] = (StrMapEntry){.key = copy, .value = value};
+        size_t new_idx = map->len;
+        map->entries[new_idx] = (StrMapEntry){.key = copy, .value = value};
+        map->len++;
+        if (map->buckets && map->n_buckets > 0) {
+                size_t mask = map->n_buckets - 1;
+                uint64_t h = hash_str(copy);
+                for (size_t probe = 0; probe < map->n_buckets; ++probe) {
+                        size_t b = (size_t)(h + probe) & mask;
+                        if (map->buckets[b] == SIZE_MAX) {
+                                map->buckets[b] = new_idx;
+                                break;
+                        }
+                }
+        }
         return true;
 }
 
@@ -299,9 +367,22 @@ void *str_map_remove(StrMap *map, const char *key)
                 return NULL;
         value = map->entries[index].value;
         free(map->entries[index].key);
-        memmove(map->entries + index, map->entries + index + 1, (map->len - index - 1) * sizeof(*map->entries));
+        if (index + 1 < map->len) {
+                map->entries[index] = map->entries[map->len - 1];
+        }
         --map->len;
+        if (map->buckets && map->n_buckets > 0)
+                str_map_rehash(map, map->n_buckets);
         return value;
+}
+
+static inline uint64_t hash_u32(uint32_t key)
+{
+        uint64_t x = key;
+        x ^= x >> 16;
+        x *= 0x45d9f3b;
+        x ^= x >> 16;
+        return x;
 }
 
 void u32_map_init(U32Map *map, DestroyFunc destroy)
@@ -315,6 +396,7 @@ void u32_map_clear(U32Map *map)
                 for (size_t i = 0; i < map->len; ++i)
                         map->destroy(map->entries[i].value);
         free(map->entries);
+        free(map->buckets);
         *map = (U32Map){.destroy = map->destroy};
 }
 
@@ -336,9 +418,24 @@ void u32_map_free(U32Map *map)
 
 static size_t u32_map_find(const U32Map *map, uint32_t key)
 {
-        for (size_t i = 0; i < map->len; ++i)
-                if (map->entries[i].key == key)
-                        return i;
+        if (!map || map->len == 0)
+                return SIZE_MAX;
+        if (!map->buckets || map->n_buckets == 0) {
+                for (size_t i = 0; i < map->len; ++i)
+                        if (map->entries[i].key == key)
+                                return i;
+                return SIZE_MAX;
+        }
+        size_t mask = map->n_buckets - 1;
+        uint64_t h = hash_u32(key);
+        for (size_t probe = 0; probe < map->n_buckets; ++probe) {
+                size_t b = (size_t)(h + probe) & mask;
+                size_t idx = map->buckets[b];
+                if (idx == SIZE_MAX)
+                        return SIZE_MAX;
+                if (map->entries[idx].key == key)
+                        return idx;
+        }
         return SIZE_MAX;
 }
 
@@ -353,6 +450,30 @@ bool u32_map_contains(const U32Map *map, uint32_t key)
         return u32_map_find(map, key) != SIZE_MAX;
 }
 
+static bool u32_map_rehash(U32Map *map, size_t new_n_buckets)
+{
+        size_t *new_buckets = malloc(new_n_buckets * sizeof(size_t));
+        if (!new_buckets)
+                return false;
+        for (size_t i = 0; i < new_n_buckets; ++i)
+                new_buckets[i] = SIZE_MAX;
+        size_t mask = new_n_buckets - 1;
+        for (size_t i = 0; i < map->len; ++i) {
+                uint64_t h = hash_u32(map->entries[i].key);
+                for (size_t probe = 0; probe < new_n_buckets; ++probe) {
+                        size_t b = (size_t)(h + probe) & mask;
+                        if (new_buckets[b] == SIZE_MAX) {
+                                new_buckets[b] = i;
+                                break;
+                        }
+                }
+        }
+        free(map->buckets);
+        map->buckets = new_buckets;
+        map->n_buckets = new_n_buckets;
+        return true;
+}
+
 bool u32_map_set(U32Map *map, uint32_t key, void *value)
 {
         size_t index = u32_map_find(map, key);
@@ -362,10 +483,27 @@ bool u32_map_set(U32Map *map, uint32_t key, void *value)
                 map->entries[index].value = value;
                 return true;
         }
+        if (map->len >= map->n_buckets / 2) {
+                size_t next_buckets = map->n_buckets ? map->n_buckets * 2 : 16;
+                u32_map_rehash(map, next_buckets);
+        }
         if (map->len == map->capacity &&
             !grow((void **)&map->entries, &map->capacity, sizeof(*map->entries), map->len + 1))
                 return false;
-        map->entries[map->len++] = (U32MapEntry){.key = key, .value = value};
+        size_t new_idx = map->len;
+        map->entries[new_idx] = (U32MapEntry){.key = key, .value = value};
+        map->len++;
+        if (map->buckets && map->n_buckets > 0) {
+                size_t mask = map->n_buckets - 1;
+                uint64_t h = hash_u32(key);
+                for (size_t probe = 0; probe < map->n_buckets; ++probe) {
+                        size_t b = (size_t)(h + probe) & mask;
+                        if (map->buckets[b] == SIZE_MAX) {
+                                map->buckets[b] = new_idx;
+                                break;
+                        }
+                }
+        }
         return true;
 }
 
@@ -376,8 +514,12 @@ void *u32_map_remove(U32Map *map, uint32_t key)
         if (index == SIZE_MAX)
                 return NULL;
         value = map->entries[index].value;
-        memmove(map->entries + index, map->entries + index + 1, (map->len - index - 1) * sizeof(*map->entries));
+        if (index + 1 < map->len) {
+                map->entries[index] = map->entries[map->len - 1];
+        }
         --map->len;
+        if (map->buckets && map->n_buckets > 0)
+                u32_map_rehash(map, map->n_buckets);
         return value;
 }
 
@@ -545,34 +687,34 @@ memory:
 
 bool read_file(const char *path, char **contents, size_t *length, Error **error)
 {
-        FILE *file;
+        int fd;
         StrBuf buffer = {0};
         char chunk[8192];
-        size_t n;
+        ssize_t n;
 
         *contents = NULL;
-        file = fopen(path, "re");
-        if (!file)
+        fd = open(path, O_RDONLY | O_CLOEXEC);
+        if (fd < 0)
                 return error_set_errno(error, errno, "%s", path);
-        while ((n = fread(chunk, 1, sizeof(chunk), file)) > 0)
-                if (!str_buf_append_n(&buffer, chunk, n)) {
-                        fclose(file);
+        while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+                if (!str_buf_append_n(&buffer, chunk, (size_t)n)) {
+                        close(fd);
                         str_buf_clear(&buffer);
                         return error_set(error, ENOMEM, "%s: out of memory", path);
                 }
-        if (ferror(file)) {
+        }
+        if (n < 0) {
                 int saved = errno;
-                fclose(file);
+                close(fd);
                 str_buf_clear(&buffer);
                 return error_set_errno(error, saved, "%s", path);
         }
-        fclose(file);
+        close(fd);
         if (!buffer.data && !str_buf_append_n(&buffer, "", 0))
                 return error_set(error, ENOMEM, "%s: out of memory", path);
-        n = buffer.len;
-        *contents = str_buf_steal(&buffer);
         if (length)
-                *length = n;
+                *length = buffer.len;
+        *contents = str_buf_steal(&buffer);
         return true;
 }
 

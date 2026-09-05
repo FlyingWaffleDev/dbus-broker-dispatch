@@ -20,6 +20,7 @@ struct Controller {
         ControllerPacketFunc packet_func;
         void *packet_data;
         PtrVec pending_replies;
+        bool dispatch_pending;
 };
 
 /* Reply-queue operations, exposed for the reply-ordering test. */

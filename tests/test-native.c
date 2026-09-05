@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "address.h"
 #include "config-policy.h"
+#include "config-policy-internal.h"
 #include "controller.h"
 #include "dbus-transport.h"
 #include "dbus-wire.h"
@@ -417,12 +418,133 @@ static void test_watch_filters_siblings(void)
         free(target);
 }
 
+static void test_service_quote_parsing(void)
+{
+        PtrVec args;
+        Error *error = NULL;
+
+        ptr_vec_init(&args, free);
+        assert(service_exec_parse("/bin/echo 'hello world' \"foo bar\"", &args, &error));
+        assert(args.len == 3);
+        assert(strcmp(args.items[0], "/bin/echo") == 0);
+        assert(strcmp(args.items[1], "hello world") == 0);
+        assert(strcmp(args.items[2], "foo bar") == 0);
+        ptr_vec_clear(&args);
+
+        /* Empty quotes */
+        assert(service_exec_parse("/bin/echo \"\" ''", &args, &error));
+        assert(args.len == 3);
+        assert(strcmp(args.items[1], "") == 0);
+        assert(strcmp(args.items[2], "") == 0);
+        ptr_vec_clear(&args);
+
+        /* Escaped quotes and backslashes */
+        assert(service_exec_parse("/bin/echo \"a\\\"b\" 'c\\d'", &args, &error));
+        assert(args.len == 3);
+        assert(strcmp(args.items[1], "a\"b") == 0);
+        assert(strcmp(args.items[2], "c\\d") == 0);
+        ptr_vec_clear(&args);
+
+        /* Unterminated single quote must fail cleanly without buffer overflow */
+        assert(!service_exec_parse("/bin/echo 'unfinished", &args, &error));
+        assert(error);
+        error_clear(&error);
+        ptr_vec_clear(&args);
+
+        /* Unterminated double quote must fail cleanly */
+        assert(!service_exec_parse("/bin/echo \"unfinished", &args, &error));
+        assert(error);
+        error_clear(&error);
+        ptr_vec_clear(&args);
+
+        /* Trailing backslash must fail cleanly */
+        assert(!service_exec_parse("/bin/echo \\", &args, &error));
+        assert(error);
+        error_clear(&error);
+        ptr_vec_clear(&args);
+}
+
+static void test_policy_dedup_and_mandatory(void)
+{
+        char path[] = "/tmp/dbd-native-dedup-XXXXXX";
+        int fd = mkstemp(path);
+        assert(fd >= 0);
+        close(fd);
+
+        /* Order 1: Mandatory deny first, Default deny second */
+        const char xml1[] =
+                "<busconfig>"
+                "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
+                "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
+                "</busconfig>";
+        write_contents(path, xml1);
+        LauncherConfig *config1 = launcher_config_new();
+        Error *error = NULL;
+        assert(config1 && launcher_config_load(config1, path, &error));
+        assert(config1->default_rules->len == 1);
+        PolicyRule *rule1 = config1->default_rules->items[0];
+        assert(strcmp(rule1->name, "org.example.Forbidden") == 0);
+        assert(!rule1->allow);
+        assert((rule1->priority >> 56) == (uint64_t)POLICY_CONTEXT_MANDATORY);
+        launcher_config_free(config1);
+
+        /* Order 2: Default deny first, Mandatory deny second */
+        const char xml2[] =
+                "<busconfig>"
+                "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
+                "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
+                "</busconfig>";
+        write_contents(path, xml2);
+        LauncherConfig *config2 = launcher_config_new();
+        assert(config2 && launcher_config_load(config2, path, &error));
+        assert(config2->default_rules->len == 1);
+        PolicyRule *rule2 = config2->default_rules->items[0];
+        assert(strcmp(rule2->name, "org.example.Forbidden") == 0);
+        assert(!rule2->allow);
+        assert((rule2->priority >> 56) == (uint64_t)POLICY_CONTEXT_MANDATORY);
+        launcher_config_free(config2);
+
+        unlink(path);
+}
+
+static void test_policy_invalid_xml(void)
+{
+        char path[] = "/tmp/dbd-native-invalid-XXXXXX";
+        int fd = mkstemp(path);
+        assert(fd >= 0);
+        close(fd);
+
+        /* Unclosed tag */
+        const char unclosed[] = "<busconfig><policy context='default'><deny own='foo'";
+        write_contents(path, unclosed);
+        LauncherConfig *config = launcher_config_new();
+        Error *error = NULL;
+        assert(!launcher_config_load(config, path, &error));
+        assert(error);
+        error_clear(&error);
+        launcher_config_free(config);
+
+        /* Missing limit value */
+        const char empty_limit[] = "<busconfig><limit name='max_outgoing_bytes'></limit></busconfig>";
+        write_contents(path, empty_limit);
+        config = launcher_config_new();
+        assert(!launcher_config_load(config, path, &error));
+        assert(error);
+        error_clear(&error);
+        launcher_config_free(config);
+
+        unlink(path);
+}
+
 int main(void)
 {
         test_collections();
         test_watch();
         test_config_nss_and_services();
         test_service_parser();
+        test_service_quote_parsing();
+        test_policy_dedup_and_mandatory();
+        test_policy_invalid_xml();
         test_process();
         test_dbus_wire();
         test_dbus_transport();

@@ -536,6 +536,42 @@ static void stop_owned_process(const State *state, uid_t uid)
         }
 }
 
+static int hex_digit(char c)
+{
+        if (c >= '0' && c <= '9')
+                return c - '0';
+        if (c >= 'a' && c <= 'f')
+                return c - 'a' + 10;
+        if (c >= 'A' && c <= 'F')
+                return c - 'A' + 10;
+        return -1;
+}
+
+static bool address_matches_socket(const char *address, const char *socket_path)
+{
+        if (!address || strncmp(address, "unix:path=", 10) != 0)
+                return false;
+        const char *p = address + 10;
+        const char *s = socket_path;
+        while (*p && *p != ',' && *p != ';') {
+                char c;
+                if (*p == '%') {
+                        if (!p[1] || !p[2])
+                                return false;
+                        int h1 = hex_digit(p[1]), h2 = hex_digit(p[2]);
+                        if (h1 < 0 || h2 < 0)
+                                return false;
+                        c = (char)((h1 << 4) | h2);
+                        p += 3;
+                } else {
+                        c = *p++;
+                }
+                if (*s++ != c)
+                        return false;
+        }
+        return *s == '\0';
+}
+
 static int publish_address(pam_handle_t *pamh, const char *runtime)
 {
         char path[PATH_MAX];
@@ -560,20 +596,20 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
         const char *user = NULL, *runtime, *existing;
         struct passwd entry;
         char *passwd_storage = NULL;
-        char pid_path[PATH_MAX];
+        char pid_path[PATH_MAX], socket_path[PATH_MAX];
         Options options;
         SessionData *session = NULL;
         State state;
         int directory_fd = -1, result = PAM_SESSION_ERR;
         bool counted = false;
 
+        if (pam_get_data(pamh, PAM_DATA_KEY, (const void **)&session) == PAM_SUCCESS && session != NULL)
+                return PAM_SUCCESS;
+
         if (!parse_options(argc, argv, &options)) {
                 pam_syslog(pamh, LOG_ERR, "invalid option or dispatcher path");
                 return PAM_SERVICE_ERR;
         }
-        existing = pam_getenv(pamh, "DBUS_SESSION_BUS_ADDRESS");
-        if (existing && *existing)
-                return PAM_SUCCESS;
         if (pam_get_user(pamh, &user, NULL) != PAM_SUCCESS || !user || !lookup_user(user, &entry, &passwd_storage)) {
                 pam_syslog(pamh, LOG_ERR, "cannot resolve PAM user");
                 return PAM_USER_UNKNOWN;
@@ -582,6 +618,17 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
         if (!runtime || !*runtime) {
                 free(passwd_storage);
                 return PAM_IGNORE;
+        }
+        if (!join_path(socket_path, sizeof(socket_path), runtime, "bus")) {
+                free(passwd_storage);
+                return PAM_BUF_ERR;
+        }
+        existing = pam_getenv(pamh, "DBUS_SESSION_BUS_ADDRESS");
+        if (existing && *existing) {
+                if (!address_matches_socket(existing, socket_path)) {
+                        free(passwd_storage);
+                        return PAM_SUCCESS;
+                }
         }
         if (!safe_runtime_dir(runtime, entry.pw_uid, &directory_fd) ||
             !join_path(pid_path, sizeof(pid_path), runtime, PID_NAME)) {

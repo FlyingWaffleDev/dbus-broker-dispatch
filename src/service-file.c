@@ -93,6 +93,10 @@ bool service_exec_parse(const char *command, PtrVec *arguments, Error **error)
         ptr_vec_init(&candidate, free);
         for (const char *p = command;; ++p) {
                 unsigned char c = (unsigned char)*p;
+                if (!c && (single || double_quote)) {
+                        error_set(error, EINVAL, "Unterminated quote in Exec command");
+                        goto fail;
+                }
                 if (escaped) {
                         if (!c) {
                                 error_set(error, EINVAL, "Trailing backslash in Exec command");
@@ -143,10 +147,6 @@ bool service_exec_parse(const char *command, PtrVec *arguments, Error **error)
                 if (!str_buf_append_n(&word, (const char *)&c, 1))
                         goto memory;
                 have_word = true;
-        }
-        if (single || double_quote) {
-                error_set(error, EINVAL, "Unterminated quote in Exec command");
-                goto fail;
         }
         if (!candidate.len || !*(char *)candidate.items[0]) {
                 error_set(error, EINVAL, "Exec command is empty");

@@ -50,8 +50,10 @@ static int compare_gids(const void *left, const void *right)
 static bool resize_buffer(char **buffer, size_t size, Error **error)
 {
         char *replacement = realloc(*buffer, size);
-        if (!replacement)
-                return error_set(error, ENOMEM, "NSS lookup: out of memory");
+        if (!replacement) {
+                error_set(error, ENOMEM, "NSS lookup: out of memory");
+                return false;
+        }
         *buffer = replacement;
         return true;
 }
@@ -176,13 +178,18 @@ static NssUser *nss_user_new(const struct passwd *entry, Error **error)
         return user;
 }
 
+static void user_destroy(void *data)
+{
+        nss_user_unref(data);
+}
+
 NssCache *nss_cache_new(void)
 {
         NssCache *cache = calloc(1, sizeof(*cache));
         if (!cache)
                 return NULL;
-        str_map_init(&cache->users_by_name, (DestroyFunc)nss_user_unref);
-        u32_map_init(&cache->users_by_uid, (DestroyFunc)nss_user_unref);
+        str_map_init(&cache->users_by_name, user_destroy);
+        u32_map_init(&cache->users_by_uid, user_destroy);
         str_map_init(&cache->groups_by_name, free);
         u32_map_init(&cache->groups_by_gid, free);
         str_map_init(&cache->missing_users, NULL);
@@ -246,10 +253,16 @@ const NssUser *nss_cache_lookup_user(NssCache *cache, const char *name, Error **
                 nss_user_unref(user);
                 user = u32_map_get(&cache->users_by_uid, (uint32_t)entry.pw_uid);
         }
-        if (!str_map_contains(&cache->users_by_name, entry.pw_name))
-                str_map_set(&cache->users_by_name, entry.pw_name, nss_user_ref(user));
-        if (!by_id && !str_map_contains(&cache->users_by_name, name))
-                str_map_set(&cache->users_by_name, name, nss_user_ref(user));
+        if (!str_map_contains(&cache->users_by_name, entry.pw_name)) {
+                NssUser *ref = nss_user_ref(user);
+                if (!str_map_set(&cache->users_by_name, entry.pw_name, ref))
+                        nss_user_unref(ref);
+        }
+        if (!by_id && !str_map_contains(&cache->users_by_name, name)) {
+                NssUser *ref = nss_user_ref(user);
+                if (!str_map_set(&cache->users_by_name, name, ref))
+                        nss_user_unref(ref);
+        }
         free(buffer);
         return user;
 }
@@ -302,13 +315,16 @@ bool nss_cache_lookup_gid(NssCache *cache, const char *name, gid_t *gid, Error *
                 return error_set(error, ENOMEM, "NSS group cache: out of memory");
         }
         *by_gid_value = *by_name_value = entry.gr_gid;
-        u32_map_set(&cache->groups_by_gid, (uint32_t)entry.gr_gid, by_gid_value);
-        str_map_set(&cache->groups_by_name, entry.gr_name, by_name_value);
+        if (!u32_map_set(&cache->groups_by_gid, (uint32_t)entry.gr_gid, by_gid_value))
+                free(by_gid_value);
+        if (!str_map_set(&cache->groups_by_name, entry.gr_name, by_name_value))
+                free(by_name_value);
         if (!by_id && strcmp(name, entry.gr_name) != 0) {
                 gid_t *alias = malloc(sizeof(*alias));
                 if (alias) {
                         *alias = entry.gr_gid;
-                        str_map_set(&cache->groups_by_name, name, alias);
+                        if (!str_map_set(&cache->groups_by_name, name, alias))
+                                free(alias);
                 }
         }
         free(buffer);

@@ -21,8 +21,11 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
 bool service_table_register_all(ServiceManager *manager, ServiceTable *services, Error **error);
 
 Service *service_reference(Service *service);
+void service_unref(Service *service);
 bool service_equal(Service *left, Service *right);
 bool service_register(ServiceManager *manager, Service *service, Error **error);
 bool service_release(ServiceManager *manager, Service *service, Error **error);
 bool service_manager_handle_packet(ServiceManager *manager, DBusPacket *packet, Error **error);
 bool service_manager_reap(ServiceManager *manager, pid_t pid, int status);
+int service_manager_timeout_ms(ServiceManager *manager);
+void service_manager_dispatch_timeouts(ServiceManager *manager);

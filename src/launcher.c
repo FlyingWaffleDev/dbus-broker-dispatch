@@ -364,25 +364,36 @@ static bool reload_config(Launcher *launcher, Error **error)
                 goto out;
         for (size_t i = 0; i < candidate_services->len; ++i) {
                 Service *previous = str_map_get(current, candidate_services->entries[i].key);
-                if (previous && service_equal(previous, candidate_services->entries[i].value))
-                        str_map_set(candidate_services, candidate_services->entries[i].key,
-                                    service_reference(previous));
+                if (previous && service_equal(previous, candidate_services->entries[i].value)) {
+                        Service *ref = service_reference(previous);
+                        if (!str_map_set(candidate_services, candidate_services->entries[i].key, ref)) {
+                                service_unref(ref);
+                                error_set(error, ENOMEM, "Out of memory reusing service reference");
+                                goto out;
+                        }
+                }
         }
         for (size_t i = 0; i < current->len; ++i) {
                 Service *replacement = str_map_get(candidate_services, current->entries[i].key);
-                if ((!replacement || !service_equal(current->entries[i].value, replacement)) &&
-                    !service_release(launcher->service_manager, current->entries[i].value, error))
-                        goto rollback;
-                if (!replacement || !service_equal(current->entries[i].value, replacement))
-                        ptr_vec_push(&released, current->entries[i].value);
+                if (!replacement || !service_equal(current->entries[i].value, replacement)) {
+                        if (!service_release(launcher->service_manager, current->entries[i].value, error))
+                                goto rollback;
+                        if (!ptr_vec_push(&released, current->entries[i].value)) {
+                                error_set(error, ENOMEM, "Out of memory tracking released service");
+                                goto rollback;
+                        }
+                }
         }
         for (size_t i = 0; i < candidate_services->len; ++i) {
                 Service *previous = str_map_get(current, candidate_services->entries[i].key);
-                if ((!previous || !service_equal(previous, candidate_services->entries[i].value)) &&
-                    !service_register(launcher->service_manager, candidate_services->entries[i].value, error))
-                        goto rollback;
-                if (!previous || !service_equal(previous, candidate_services->entries[i].value))
-                        ptr_vec_push(&added, candidate_services->entries[i].value);
+                if (!previous || !service_equal(previous, candidate_services->entries[i].value)) {
+                        if (!service_register(launcher->service_manager, candidate_services->entries[i].value, error))
+                                goto rollback;
+                        if (!ptr_vec_push(&added, candidate_services->entries[i].value)) {
+                                error_set(error, ENOMEM, "Out of memory tracking added service");
+                                goto rollback;
+                        }
+                }
         }
         if (!set_policy(launcher, candidate, error))
                 goto rollback;
@@ -420,6 +431,11 @@ rollback:
         for (size_t i = 0; i < released.len; ++i) {
                 Error *ignored = NULL;
                 service_register(launcher->service_manager, released.items[i], &ignored);
+                error_free(ignored);
+        }
+        {
+                Error *ignored = NULL;
+                set_policy(launcher, launcher->config_state, &ignored);
                 error_free(ignored);
         }
         goto out;
@@ -1127,14 +1143,22 @@ int main(int argc, char **argv)
          * inside one. */
         launcher.loop.running = true;
         while (launcher.loop.running) {
-                /* A reload queued while the previous one ran must not wait for
-                 * unrelated traffic before it is serviced. */
-                int timeout = launcher.reload_pending ? 0 : -1;
+                /* Controller calls made by reloads or other callbacks can
+                 * leave complete packets buffered without a readable fd. */
+                if (!controller_dispatch(&launcher.controller, &error)) {
+                        print_error("Dispatcher controller failed", error);
+                        launcher.broker_failed = true;
+                        break;
+                }
+                service_manager_dispatch_timeouts(launcher.service_manager);
+                int manager_timeout = service_manager_timeout_ms(launcher.service_manager);
+                int timeout = launcher.reload_pending || launcher.controller.dispatch_pending ? 0 : manager_timeout;
                 if (!event_loop_dispatch(&launcher.loop, timeout, &error)) {
                         print_error("Dispatcher event loop failed", error);
                         launcher.broker_failed = true;
                         break;
                 }
+                service_manager_dispatch_timeouts(launcher.service_manager);
                 run_pending_reload(&launcher);
         }
         bool failed = launcher.broker_failed;

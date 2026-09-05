@@ -15,6 +15,7 @@
 #include <string.h>
 #include <sys/syscall.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -31,6 +32,7 @@ struct Service {
         gid_t gid;
         uint64_t serial;
         bool starting;
+        uint64_t activation_deadline_ms;
 };
 
 typedef struct Activation {
@@ -50,7 +52,15 @@ struct ServiceManager {
         ServiceTable *services;
         StrMap environment;
         U32Map activations;
+        PtrVec pending_deadlines;
 };
+
+static uint64_t now_monotonic_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 Service *service_reference(Service *service)
 {
@@ -58,9 +68,8 @@ Service *service_reference(Service *service)
         return service;
 }
 
-static void service_unref(void *data)
+void service_unref(Service *service)
 {
-        Service *service = data;
         if (!service || atomic_fetch_sub_explicit(&service->ref_count, 1, memory_order_acq_rel) != 1)
                 return;
         free(service->name);
@@ -70,6 +79,11 @@ static void service_unref(void *data)
         ptr_vec_clear(&service->arguments);
         nss_user_unref(service->identity);
         free(service);
+}
+
+static void service_destroy(void *data)
+{
+        service_unref(data);
 }
 
 static void activation_free(void *data)
@@ -85,7 +99,7 @@ static void activation_free(void *data)
 
 ServiceTable *service_table_new(void)
 {
-        return str_map_new(service_unref);
+        return str_map_new(service_destroy);
 }
 
 void service_table_free(ServiceTable *services)
@@ -101,6 +115,7 @@ ServiceManager *service_manager_new(void)
         manager->services = service_table_new();
         str_map_init(&manager->environment, free);
         u32_map_init(&manager->activations, activation_free);
+        ptr_vec_init(&manager->pending_deadlines, service_destroy);
         if (!manager->services) {
                 service_manager_free(manager);
                 return NULL;
@@ -112,6 +127,7 @@ void service_manager_free(ServiceManager *manager)
 {
         if (!manager)
                 return;
+        ptr_vec_clear(&manager->pending_deadlines);
         service_table_free(manager->services);
         str_map_clear(&manager->environment);
         u32_map_clear(&manager->activations);
@@ -169,18 +185,21 @@ bool service_register(ServiceManager *manager, Service *service, Error **error)
 
 bool service_release(ServiceManager *manager, Service *service, Error **error)
 {
+        service->activation_deadline_ms = 0;
+        service->starting = false;
         return controller_release(manager->controller, service->path, error);
 }
 
 static void reset_service(ServiceManager *manager, Service *service, const char *reason)
 {
         Error *error = NULL;
+        service->activation_deadline_ms = 0;
+        service->starting = false;
         if (manager->controller &&
             !controller_reset(manager->controller, service->path, service->serial, reason, &error)) {
                 log_error("Cannot reset D-Bus service %s: %s", service->name, error ? error->message : "unknown error");
                 error_free(error);
         }
-        service->starting = false;
 }
 
 static bool activation_child_setup(void *data, int *error_number)
@@ -270,10 +289,11 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
         ProcessSpec spec;
         pid_t pid;
 
-        if (service->starting)
+        if (service->starting && service->serial == serial)
                 return;
         service->starting = true;
         service->serial = serial;
+        service->activation_deadline_ms = 0;
         if (!environment_current(&environment))
                 goto memory;
         for (size_t i = 0; i < manager->environment.len; ++i)
@@ -360,15 +380,60 @@ bool service_manager_reap(ServiceManager *manager, pid_t pid, int status)
         Activation *activation = u32_map_remove(&manager->activations, (uint32_t)pid);
         if (!activation)
                 return false;
-        /* Reset regardless of exit status. The broker ignores a reset whose
-         * serial is no longer the pending activation, so a service that forked
-         * into the background and took the name is unaffected, while one that
-         * exited without taking it stops leaving its callers blocked. */
-        reset_service(manager, activation->service,
-                      !WIFEXITED(status) || WEXITSTATUS(status) ? "org.bus1.DBus.Name.Error.UnitFailure"
-                                                                : "org.bus1.DBus.Name.Error.StartupFailure");
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+                reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.UnitFailure");
+        } else {
+                activation->service->activation_deadline_ms = now_monotonic_ms() + 25000;
+                if (!ptr_vec_push(&manager->pending_deadlines, service_reference(activation->service)))
+                        reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.StartupFailure");
+        }
         activation_free(activation);
         return true;
+}
+
+int service_manager_timeout_ms(ServiceManager *manager)
+{
+        if (!manager || manager->pending_deadlines.len == 0)
+                return -1;
+        uint64_t now = now_monotonic_ms();
+        uint64_t min_remaining = UINT64_MAX;
+        for (size_t i = 0; i < manager->pending_deadlines.len; ++i) {
+                Service *service = manager->pending_deadlines.items[i];
+                if (!service->activation_deadline_ms)
+                        continue;
+                if (service->activation_deadline_ms <= now)
+                        return 0;
+                uint64_t diff = service->activation_deadline_ms - now;
+                if (diff < min_remaining)
+                        min_remaining = diff;
+        }
+        if (min_remaining == UINT64_MAX)
+                return -1;
+        if (min_remaining > (uint64_t)INT_MAX)
+                return INT_MAX;
+        return (int)min_remaining;
+}
+
+void service_manager_dispatch_timeouts(ServiceManager *manager)
+{
+        if (!manager || manager->pending_deadlines.len == 0)
+                return;
+        uint64_t now = now_monotonic_ms();
+        size_t i = 0;
+        while (i < manager->pending_deadlines.len) {
+                Service *service = manager->pending_deadlines.items[i];
+                if (!service->activation_deadline_ms) {
+                        ptr_vec_delete(&manager->pending_deadlines, i);
+                        continue;
+                }
+                if (service->activation_deadline_ms <= now) {
+                        service->activation_deadline_ms = 0;
+                        reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
+                        ptr_vec_delete(&manager->pending_deadlines, i);
+                        continue;
+                }
+                ++i;
+        }
 }
 
 bool service_manager_handle_packet(ServiceManager *manager, DBusPacket *packet, Error **error)
