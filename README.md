@@ -137,6 +137,11 @@ The accepted module arguments are `debug`, `dispatcher=/absolute/path`, and
 `config-file=/absolute/path`. The path overrides are for development or
 controlled deployments. Installed systems normally need no arguments.
 
+For login-shell startup without PAM, see the [init setup instructions](init/README.md).
+OpenRC, runit, Dinit, and s6 each have a profile fallback that starts the user
+service and publishes its address. The non-OpenRC fallbacks require an
+already-configured user supervisor.
+
 ## Known limits
 
 - The dispatcher accepts only filesystem-backed `unix:path=` listeners. It

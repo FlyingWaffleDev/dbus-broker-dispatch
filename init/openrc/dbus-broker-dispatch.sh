@@ -6,7 +6,9 @@
 # cannot propagate back into the login session. Start the service first, then
 # export its address only after the listener is ready.
 
-if [ -n "${XDG_RUNTIME_DIR:-}" ]; then
+if [ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ] &&
+	[ -n "${XDG_RUNTIME_DIR:-}" ] &&
+	[ "${DBUS_BROKER_DISPATCH_INIT:-openrc}" = openrc ]; then
 	dbus_socket="${XDG_RUNTIME_DIR}/bus"
 
 	if [ ! -S "${dbus_socket}" ] && command -v rc-service >/dev/null 2>&1 &&
