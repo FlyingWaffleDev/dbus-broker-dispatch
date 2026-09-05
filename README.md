@@ -103,8 +103,11 @@ To run one command on a temporary user bus:
 dbus-broker-run-session -- command arg...
 ```
 
-The wrapper returns the command's exit status and removes the bus when the
-command exits.
+The wrapper creates a private temporary bus beneath `XDG_RUNTIME_DIR`, even
+when a user bus already exists. It sets `DBUS_SESSION_BUS_ADDRESS` for the
+command and leaves `XDG_RUNTIME_DIR` unchanged. Nested invocations each get
+their own bus. The wrapper returns the command's exit status and removes its
+socket and temporary directory when the command exits.
 
 ## Start user buses from PAM
 

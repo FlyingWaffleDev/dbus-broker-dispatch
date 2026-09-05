@@ -29,7 +29,11 @@ test_session_bus = executable(
 )
 test('session-bus', test_session_bus, args: [dbus_broker_dispatch.full_path()], depends: [dbus_broker_dispatch], timeout: 30)
 
-test_run_session = executable('test-run-session', 'test-run-session.c')
+test_run_session = executable(
+  'test-run-session',
+  ['test-run-session.c', '../src/address.c', '../src/util.c', '../src/log.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
+  include_directories: src_inc,
+)
 test(
   'run-session',
   test_run_session,

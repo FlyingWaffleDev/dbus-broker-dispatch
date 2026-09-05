@@ -54,7 +54,7 @@ dbus_broker_dispatch = executable(
 
 dbus_broker_run_session = executable(
   'dbus-broker-run-session',
-  ['src/run-session.c', 'src/process.c', 'src/util.c'],
+  ['src/run-session.c', 'src/address.c', 'src/process.c', 'src/util.c'],
   include_directories: src_inc,
   install: true,
 )

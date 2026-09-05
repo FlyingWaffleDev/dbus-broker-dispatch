@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "address.h"
 #include "process.h"
 #include <errno.h>
 #include <limits.h>
@@ -86,9 +87,10 @@ static bool launcher_child_setup(void *data, int *error_number)
         return true;
 }
 
-static bool start_bus(const char *launcher, pid_t *pid, Error **error)
+static bool start_bus(const char *launcher, const char *address, pid_t *pid, Error **error)
 {
-        char *const arguments[] = {(char *)launcher, "--scope=user", "--foreground", NULL};
+        char *const arguments[] = {(char *)launcher, "--scope=user",  "--foreground",
+                                   "--address",      (char *)address, NULL};
         ProcessSpec spec = {
                 .argv = arguments,
                 .child_setup = launcher_child_setup,
@@ -137,14 +139,15 @@ static void stop_bus(pid_t bus)
 int main(int argc, char **argv)
 {
         const char *runtime;
-        char *launcher, *address, *socket_path, *message = NULL;
+        char *launcher = NULL, *address = NULL, *socket_path = NULL, *message = NULL;
+        char *directory = NULL, *escaped = NULL;
         Error *error = NULL;
-        pid_t bus, child;
+        pid_t bus = 0, child;
         struct sigaction action = {.sa_handler = forward_signal};
         sigset_t blocked_signals, previous_mask;
         struct stat st;
-        int status;
-        bool bus_reaped = false;
+        int status, exit_status = 1;
+        bool bus_reaped = false, directory_created = false;
 
         if (argc < 2) {
                 fputs("Usage: dbus-broker-run-session -- COMMAND [ARGS...]\n", stderr);
@@ -161,55 +164,37 @@ int main(int argc, char **argv)
                 fputs("XDG_RUNTIME_DIR is required for a user D-Bus bus.\n", stderr);
                 return 1;
         }
-        socket_path = join_path(runtime, "bus");
-        if (!socket_path) {
-                fputs("Cannot allocate user bus path.\n", stderr);
+        if (!path_is_absolute(runtime) || lstat(runtime, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+            (st.st_mode & 0077)) {
+                fputs("XDG_RUNTIME_DIR must be an absolute, private, user-owned directory.\n", stderr);
                 return 1;
         }
-        if (lstat(socket_path, &st) == 0) {
-                fprintf(stderr, "A user bus path already exists at %s.\n", socket_path);
-                free(socket_path);
-                return 1;
+        directory = join_path(runtime, "dbus-run-session-XXXXXX");
+        if (!directory || !mkdtemp(directory)) {
+                fprintf(stderr, "Cannot create temporary bus directory: %s\n", strerror(errno));
+                goto out;
         }
-        if (errno != ENOENT) {
-                fprintf(stderr, "Cannot inspect %s: %s\n", socket_path, strerror(errno));
-                free(socket_path);
-                return 1;
+        directory_created = true;
+        socket_path = join_path(directory, "bus");
+        escaped = socket_path ? percent_escape(socket_path) : NULL;
+        address = escaped ? str_printf("unix:path=%s", escaped) : NULL;
+        if (!address || setenv("DBUS_SESSION_BUS_ADDRESS", address, 1) < 0) {
+                fprintf(stderr, "Cannot set session bus address: %s\n", strerror(errno));
+                goto out;
         }
 
         launcher = find_program("dbus-broker-dispatch");
         if (!launcher)
                 launcher = strdup("dbus-broker-dispatch");
-        if (!launcher) {
-                free(socket_path);
-                return 1;
-        }
-        if (!start_bus(launcher, &bus, &error)) {
+        if (!launcher)
+                goto out;
+        if (!start_bus(launcher, address, &bus, &error)) {
                 fprintf(stderr, "Cannot start user bus: %s\n", error ? error->message : "out of memory");
-                error_free(error);
-                free(socket_path);
-                free(launcher);
-                return 1;
+                goto out;
         }
         if (!wait_for_bus(socket_path, bus, &bus_reaped, &message)) {
                 fprintf(stderr, "Cannot start user bus: %s\n", message ? message : "out of memory");
-                free(message);
-                if (!bus_reaped)
-                        stop_bus(bus);
-                free(socket_path);
-                free(launcher);
-                return 1;
-        }
-
-        if (asprintf(&address, "unix:path=%s", socket_path) < 0)
-                address = NULL;
-        if (!address || setenv("DBUS_SESSION_BUS_ADDRESS", address, 1) < 0) {
-                fprintf(stderr, "Cannot set session bus address: %s\n", strerror(errno));
-                stop_bus(bus);
-                free(address);
-                free(socket_path);
-                free(launcher);
-                return 1;
+                goto out;
         }
         sigemptyset(&blocked_signals);
         sigaddset(&blocked_signals, SIGINT);
@@ -221,11 +206,7 @@ int main(int argc, char **argv)
         if (child < 0) {
                 sigprocmask(SIG_SETMASK, &previous_mask, NULL);
                 fprintf(stderr, "Cannot start command: %s\n", strerror(errno));
-                stop_bus(bus);
-                free(address);
-                free(socket_path);
-                free(launcher);
-                return 1;
+                goto out;
         }
         if (child == 0) {
                 sigprocmask(SIG_SETMASK, &previous_mask, NULL);
@@ -246,9 +227,22 @@ int main(int argc, char **argv)
                 }
         }
         command_pid = 0;
-        stop_bus(bus);
+        exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+out:
+        if (bus > 0 && !bus_reaped)
+                stop_bus(bus);
+        if (directory_created) {
+                if (socket_path)
+                        unlink(socket_path);
+                if (rmdir(directory) < 0)
+                        fprintf(stderr, "Cannot remove temporary bus directory %s: %s\n", directory, strerror(errno));
+        }
+        error_free(error);
+        free(message);
+        free(escaped);
+        free(directory);
         free(address);
         free(socket_path);
         free(launcher);
-        return WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
+        return exit_status;
 }
