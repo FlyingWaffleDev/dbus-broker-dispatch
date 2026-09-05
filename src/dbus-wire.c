@@ -246,7 +246,13 @@ bool dbus_message_build(DBusWriter *message, uint8_t type, uint8_t flags, uint32
                         Error **error)
 {
         DBusWriter fields = {0};
+        /* Every writer primitive emits host order, so the declared byte order
+         * must follow the host rather than being hardcoded little-endian. */
+#if __BYTE_ORDER__ == __ORDER_BIG_ENDIAN__
+        uint8_t endian = 'B', version = 1;
+#else
         uint8_t endian = 'l', version = 1;
+#endif
         uint32_t body_length = body ? (uint32_t)body->bytes.len : 0;
 
         dbus_writer_clear(message);
@@ -303,6 +309,40 @@ static bool copy_field(char **target, const char *value, size_t length)
         return true;
 }
 
+/* Steps over a header field we do not consume. Only the fixed-size basic types
+ * and strings can appear unescorted by a full type parser; anything else means
+ * we can no longer locate the next field and must reject the message. */
+static bool skip_basic_value(DBusReader *reader, char type)
+{
+        uint8_t byte;
+        uint32_t word;
+        uint64_t giant;
+        const char *text;
+
+        switch (type) {
+        case 'y':
+                return dbus_reader_u8(reader, &byte);
+        case 'b':
+        case 'i':
+        case 'u':
+                return dbus_reader_u32(reader, &word);
+        case 'n':
+        case 'q':
+                return dbus_reader_align(reader, 2) && dbus_reader_u8(reader, &byte) && dbus_reader_u8(reader, &byte);
+        case 'x':
+        case 't':
+        case 'd':
+                return dbus_reader_u64(reader, &giant);
+        case 's':
+        case 'o':
+                return dbus_reader_string(reader, &text, NULL);
+        case 'g':
+                return dbus_reader_signature(reader, &text, NULL);
+        default:
+                return false;
+        }
+}
+
 static bool parse_fields(DBusReader fields, DBusHeader *header)
 {
         while (fields.offset < fields.length) {
@@ -339,7 +379,9 @@ static bool parse_fields(DBusReader fields, DBusHeader *header)
                                 return false;
                         if (code == FIELD_SIGNATURE && !copy_field(&header->signature, value, value_length))
                                 return false;
-                } else {
+                } else if (!skip_basic_value(&fields, variant_signature[0])) {
+                        /* The spec requires unknown header fields to be
+                         * ignored, so only an unskippable type is fatal. */
                         return false;
                 }
         }

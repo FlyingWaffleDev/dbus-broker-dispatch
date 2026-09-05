@@ -145,6 +145,8 @@ static NssUser *nss_user_new(const struct passwd *entry, Error **error)
                 nss_user_unref(user);
                 return NULL;
         }
+        /* Sizing call: with a zero-length list getgrouplist() cannot succeed,
+         * so a non-negative return means it did not report the count we need. */
         if (getgrouplist(user->name, user->gid, NULL, &count) >= 0 || count <= 0) {
                 error_set(error, NSS_INVALID_DATA, "NSS returned an invalid supplementary-group list for '%s'",
                           user->name);

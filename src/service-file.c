@@ -214,8 +214,8 @@ bool service_file_load(const char *path, ServiceFile *file, Error **error)
                 if (*line == '[') {
                         size_t n = strlen(line);
                         if (n < 2 || line[n - 1] != ']') {
-                                error_set(error, EINVAL, "%s:%zu: malformed section", path, line_number);
-                                goto fail;
+                                error_set(error, EINVAL, "malformed section");
+                                goto located;
                         }
                         line[n - 1] = '\0';
                         section = strcmp(line + 1, "D-BUS Service") == 0;
@@ -223,8 +223,8 @@ bool service_file_load(const char *path, ServiceFile *file, Error **error)
                 }
                 value = strchr(line, '=');
                 if (!value) {
-                        error_set(error, EINVAL, "%s:%zu: expected key=value", path, line_number);
-                        goto fail;
+                        error_set(error, EINVAL, "expected key=value");
+                        goto located;
                 }
                 *value++ = '\0';
                 key = trim(line);
@@ -233,27 +233,31 @@ bool service_file_load(const char *path, ServiceFile *file, Error **error)
                         continue;
                 if (strcmp(key, "Name") == 0) {
                         if (!set_field(&candidate.name, value, error))
-                                goto fail;
+                                goto located;
                 } else if (strcmp(key, "Exec") == 0) {
                         if (!set_field(&candidate.exec, value, error))
-                                goto fail;
+                                goto located;
                 } else if (strcmp(key, "User") == 0) {
                         if (!set_field(&candidate.user, value, error))
-                                goto fail;
+                                goto located;
                 } else if (strcmp(key, "SystemdService") == 0) {
                         if (!set_field(&candidate.systemd_service, value, error))
-                                goto fail;
+                                goto located;
                 }
         }
-        if (candidate.exec && !service_exec_parse(candidate.exec, &candidate.arguments, error))
+        if (candidate.exec && !service_exec_parse(candidate.exec, &candidate.arguments, error)) {
+                /* Exec is parsed after the file, so no single line applies. */
+                error_prefix(error, "%s: ", path);
                 goto fail;
+        }
         free(contents);
         service_file_clear(file);
         *file = candidate;
         return true;
+located:
+        error_prefix(error, "%s:%zu: ", path, line_number);
 fail:
         free(contents);
-        error_prefix(error, "%s:%zu: ", path, line_number);
         service_file_clear(&candidate);
         return false;
 }

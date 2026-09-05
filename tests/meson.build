@@ -3,6 +3,8 @@ test_native = executable(
   [
     'test-native.c',
     '../src/util.c',
+    '../src/log.c',
+    '../src/address.c',
     '../src/process.c',
     '../src/service-file.c',
     '../src/dbus-wire.c',
@@ -22,7 +24,7 @@ test('native', test_native)
 
 test_session_bus = executable(
   'test-session-bus',
-  ['test-session-bus.c', '../src/util.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
+  ['test-session-bus.c', '../src/util.c', '../src/log.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
   include_directories: src_inc,
 )
 test('session-bus', test_session_bus, args: [dbus_broker_dispatch.full_path()], timeout: 30)

@@ -5,11 +5,27 @@
 typedef struct Controller Controller;
 typedef bool (*ControllerPacketFunc)(Controller *controller, DBusPacket *packet, void *data, Error **error);
 
+/* A reply that arrived while a different call was waiting for its own. Nested
+ * calls happen whenever a dispatched packet issues one, so replies must be
+ * matched by serial rather than assumed to arrive in call order. */
+typedef struct ControllerReply {
+        uint32_t serial;
+        bool is_error;
+        char *error_name;
+        char *error_message;
+} ControllerReply;
+
 struct Controller {
         DBusTransport transport;
         ControllerPacketFunc packet_func;
         void *packet_data;
+        PtrVec pending_replies;
 };
+
+/* Reply-queue operations, exposed for the reply-ordering test. */
+void controller_reply_free(ControllerReply *reply);
+bool controller_store_reply(Controller *controller, const DBusPacket *packet, const char *message);
+ControllerReply *controller_take_reply(Controller *controller, uint32_t serial);
 
 void controller_init(Controller *controller, int fd, ControllerPacketFunc packet_func, void *data);
 void controller_clear(Controller *controller);

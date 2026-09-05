@@ -1,4 +1,5 @@
 #define _GNU_SOURCE
+#include "address.h"
 #include "config-policy.h"
 #include "controller.h"
 #include "dbus-transport.h"
@@ -298,6 +299,124 @@ static void test_controller_peer(void)
         free(machine_id);
 }
 
+/* A trailing or truncated percent escape must be rejected without reading past
+ * the end of the address string. */
+static void test_address_escapes(void)
+{
+        static const char *const invalid[] = {"unix:path=/tmp/x%",
+                                              "unix:path=/tmp/x%4",
+                                              "unix:path=/tmp/x%zz",
+                                              "unix:path=relative",
+                                              "unix:abstract=/tmp/x",
+                                              "unix:path=",
+                                              NULL};
+        Error *error = NULL;
+        char *path;
+
+        for (size_t i = 0; invalid[i]; ++i) {
+                /* Heap-allocated so ASan can see a read past the terminator. */
+                char *address = strdup(invalid[i]);
+                assert(address);
+                path = socket_path_from_address(address, &error);
+                assert(!path);
+                error_clear(&error);
+                free(address);
+        }
+        path = socket_path_from_address("unix:path=/tmp/a%2Fb", &error);
+        assert(path && strcmp(path, "/tmp/a/b") == 0);
+        free(path);
+}
+
+/* Replies must be matched by serial: a nested call that reads an outer call's
+ * reply has to park it rather than discard it. */
+static void test_controller_reply_ordering(void)
+{
+        int sockets[2];
+        Controller controller;
+        DBusWriter outer = {0}, inner = {0};
+        Error *error = NULL;
+        ControllerReply *stored;
+
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+        controller_init(&controller, sockets[0], NULL, NULL);
+
+        /* Queue replies for serials 1 and 2 in reverse order, as a nested call
+         * would observe them. */
+        assert(dbus_message_build(&outer, DBUS_MESSAGE_METHOD_RETURN, 0, 10, 1, NULL, NULL, NULL, NULL, NULL, NULL, 0,
+                                  NULL, &error));
+        assert(dbus_message_build(&inner, DBUS_MESSAGE_METHOD_RETURN, 0, 11, 2, NULL, NULL, NULL, NULL, NULL, NULL, 0,
+                                  NULL, &error));
+        assert(write(sockets[1], outer.bytes.data, outer.bytes.len) == (ssize_t)outer.bytes.len);
+        assert(write(sockets[1], inner.bytes.data, inner.bytes.len) == (ssize_t)inner.bytes.len);
+
+        for (int i = 0; i < 2; ++i) {
+                DBusPacket packet = {0};
+                assert(dbus_transport_receive(&controller.transport, &packet, &error));
+                assert(packet.header.type == DBUS_MESSAGE_METHOD_RETURN);
+                assert(controller_store_reply(&controller, &packet, "unused"));
+                dbus_packet_clear(&packet);
+        }
+        assert(controller.pending_replies.len == 2);
+        /* Out-of-order retrieval is the whole point. */
+        stored = controller_take_reply(&controller, 2);
+        assert(stored && stored->serial == 2 && !stored->is_error);
+        controller_reply_free(stored);
+        assert(!controller_take_reply(&controller, 2));
+        stored = controller_take_reply(&controller, 1);
+        assert(stored && stored->serial == 1);
+        controller_reply_free(stored);
+        assert(controller.pending_replies.len == 0);
+
+        dbus_writer_clear(&outer);
+        dbus_writer_clear(&inner);
+        controller_clear(&controller);
+        close(sockets[1]);
+}
+
+/* A file target is watched through its parent directory; unrelated siblings in
+ * that directory must not look like changes. */
+static void test_watch_filters_siblings(void)
+{
+        char root[] = "/tmp/dbd-native-filter-XXXXXX";
+        char *target, *sibling;
+        unsigned int calls = 0;
+        PtrVec paths;
+        Error *error = NULL;
+        struct pollfd inotify_poll, timer_poll;
+        Watch *watch;
+
+        assert(mkdtemp(root));
+        assert(asprintf(&target, "%s/watched.conf", root) >= 0);
+        assert(asprintf(&sibling, "%s/unrelated.log", root) >= 0);
+        write_contents(target, "x");
+
+        watch = watch_new(watch_called, &calls, &error);
+        assert(watch);
+        ptr_vec_init(&paths, free);
+        assert(ptr_vec_push(&paths, strdup(target)) && watch_set_paths(watch, &paths, &error));
+
+        inotify_poll = (struct pollfd){.fd = watch_inotify_fd(watch), .events = POLLIN};
+        write_contents(sibling, "noise");
+        if (poll(&inotify_poll, 1, 500) == 1)
+                assert(watch_dispatch_inotify(watch, &error));
+        timer_poll = (struct pollfd){.fd = watch_timer_fd(watch), .events = POLLIN};
+        assert(poll(&timer_poll, 1, 400) == 0);
+        assert(calls == 0);
+
+        /* The watched file itself still reports. */
+        write_contents(target, "changed");
+        assert(poll(&inotify_poll, 1, 1000) == 1);
+        assert(watch_dispatch_inotify(watch, &error));
+        assert(poll(&timer_poll, 1, 1000) == 1);
+        assert(watch_dispatch_timer(watch, &error) && calls == 1);
+
+        watch_free(watch);
+        ptr_vec_clear(&paths);
+        assert(unlink(sibling) == 0 && unlink(target) == 0 && rmdir(root) == 0);
+        free(sibling);
+        free(target);
+}
+
 int main(void)
 {
         test_collections();
@@ -307,6 +426,9 @@ int main(void)
         test_process();
         test_dbus_wire();
         test_dbus_transport();
+        test_address_escapes();
+        test_controller_reply_ordering();
+        test_watch_filters_siblings();
         test_controller_peer();
         return 0;
 }

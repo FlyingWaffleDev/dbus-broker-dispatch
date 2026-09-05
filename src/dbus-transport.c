@@ -176,20 +176,27 @@ bool dbus_transport_send(DBusTransport *transport, const DBusWriter *message, co
 static bool receive_more(DBusTransport *transport, Error **error)
 {
         uint8_t bytes[65536];
-        char control[CMSG_SPACE(sizeof(int) * 64)];
+        /* Aligned for the control messages parsed out of it below. */
+        union {
+                struct cmsghdr header;
+                char bytes[CMSG_SPACE(sizeof(int) * 64)];
+        } control;
         struct iovec iov = {.iov_base = bytes, .iov_len = sizeof(bytes)};
-        struct msghdr msg = {
-                .msg_iov = &iov,
-                .msg_iovlen = 1,
-                .msg_control = control,
-                .msg_controllen = sizeof(control),
-        };
+        struct msghdr msg;
 
         for (;;) {
-                ssize_t n = recvmsg(transport->fd, &msg, MSG_CMSG_CLOEXEC);
+                ssize_t n;
+                /* recvmsg() rewrites msg_controllen, so it must be restored
+                 * before every attempt or a retry would silently drop file
+                 * descriptors. */
+                msg = (struct msghdr){
+                        .msg_iov = &iov,
+                        .msg_iovlen = 1,
+                        .msg_control = control.bytes,
+                        .msg_controllen = sizeof(control.bytes),
+                };
+                n = recvmsg(transport->fd, &msg, MSG_CMSG_CLOEXEC);
                 if (n > 0) {
-                        if (msg.msg_flags & MSG_CTRUNC)
-                                return error_set(error, EOVERFLOW, "Too many file descriptors in D-Bus message");
                         for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
                                 if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
                                         continue;
@@ -204,6 +211,11 @@ static bool receive_more(DBusTransport *transport, Error **error)
                                        count * sizeof(int));
                                 transport->n_received_fds += count;
                         }
+                        /* Checked after collecting, so the descriptors that did
+                         * fit are owned by the transport and get closed with it
+                         * rather than leaked. */
+                        if (msg.msg_flags & MSG_CTRUNC)
+                                return error_set(error, EOVERFLOW, "Too many file descriptors in D-Bus message");
                         if (!str_buf_append_n(&transport->incoming, (char *)bytes, (size_t)n))
                                 return error_set(error, ENOMEM, "Cannot buffer D-Bus message");
                         return true;

@@ -32,6 +32,8 @@ dbus_broker_dispatch = executable(
   'dbus-broker-dispatch',
   [
     'src/util.c',
+    'src/log.c',
+    'src/address.c',
     'src/process.c',
     'src/service-file.c',
     'src/dbus-wire.c',

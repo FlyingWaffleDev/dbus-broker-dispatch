@@ -18,9 +18,7 @@ start_pre() {
 	}
 }
 
-stop_post() {
-	[ ! -S "${dbus_socket}" ] || rm -f "${dbus_socket}"
-}
+# The dispatcher removes its own socket on exit; see /etc/init.d/dbus.
 
 reload() {
 	ebegin "Reloading D-Bus user-session configuration"

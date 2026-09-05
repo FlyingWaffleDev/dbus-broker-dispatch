@@ -85,6 +85,14 @@ dbus-broker-dispatch --scope=user --foreground
 `--scope` is required. Without `--foreground`, the dispatcher forks into the
 background. Use `dbus-broker-dispatch --help` for the full option list.
 
+In the foreground the dispatcher writes diagnostics to standard error. In the
+background it writes them to syslog, because standard error is `/dev/null`
+there. Check the system log when a backgrounded dispatcher misbehaves.
+
+Starting a second dispatcher on a socket that is already served fails without
+disturbing the running one. The dispatcher removes only the socket and PID file
+it created itself.
+
 The default config files are `/usr/share/dbus-1/system.conf` and
 `/usr/share/dbus-1/session.conf`. The default sockets are
 `/run/dbus/system_bus_socket` and `$XDG_RUNTIME_DIR/bus`.
@@ -134,6 +142,10 @@ controlled deployments. Installed systems normally need no arguments.
   implemented. The dispatcher supports `max_outgoing_bytes`,
   `max_outgoing_unix_fds`, `max_connections_per_user`, and
   `max_match_rules_per_connection`.
+- Policy rules whose only condition is `send_requested_reply` or
+  `receive_requested_reply` are ignored with a warning. `dbus-broker` tracks
+  expected replies itself, so there is nothing left for such a rule to match
+  narrowly.
 
 The companion overlay still contains placeholder repository URLs. Replace them
 before publishing a release.

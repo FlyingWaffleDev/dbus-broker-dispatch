@@ -1,8 +1,10 @@
 #define _GNU_SOURCE
+#include "address.h"
 #include "config-policy.h"
 #include "config.h"
 #include "controller.h"
 #include "event.h"
+#include "log.h"
 #include "process.h"
 #include "service.h"
 #include "util.h"
@@ -46,6 +48,9 @@ typedef struct BrokerChild {
 
 struct Launcher {
         bool user, audit, daemonize, broker_failed;
+        /* Only paths this process actually created may be removed on exit. A
+         * failed start must never delete a running dispatcher's socket. */
+        bool listener_bound, pid_file_written;
         int startup_fd, listener_fd, signal_fd;
         char *config, *address, *broker, *socket_path, *pid_file;
         uint32_t system_uid_max;
@@ -55,6 +60,11 @@ struct Launcher {
         bool drop_broker_privileges;
         pid_t broker_pid;
         EventLoop loop;
+        /* Reload requests are recorded here and executed from the main loop.
+         * Running them inside packet dispatch re-entered reload_config through
+         * the blocking controller calls it makes. */
+        bool reload_pending, reloading;
+        U32Vec reload_serials;
         EventSource signal_source, controller_source, watch_source, watch_timer_source;
         Controller controller;
         ServiceManager *service_manager;
@@ -70,7 +80,7 @@ struct Launcher {
 
 static void print_error(const char *what, Error *error)
 {
-        fprintf(stderr, "%s: %s\n", what, error ? error->message : "unknown error");
+        log_error("%s: %s", what, error ? error->message : "unknown error");
         error_free(error);
 }
 
@@ -111,7 +121,7 @@ static bool configure_apparmor(LauncherConfig *config, Error **error)
                 return error_set(error, ENOTSUP,
                                  "D-Bus configuration requires AppArmor, but kernel D-Bus mediation is unavailable");
         if (enabled && !supported)
-                fputs("Disabling D-Bus AppArmor policy because kernel D-Bus mediation is unavailable\n", stderr);
+                log_warning("Disabling D-Bus AppArmor policy because kernel D-Bus mediation is unavailable");
         launcher_config_set_apparmor_mode(config, 0);
         return true;
 }
@@ -152,7 +162,7 @@ static void load_static_console_users(Launcher *launcher)
         while (copy && (name = strsep(&cursor, ","))) {
                 struct passwd *entry = getpwnam(name);
                 if (!entry)
-                        fprintf(stderr, "Ignoring unknown system-console user '%s'\n", name);
+                        log_warning("Ignoring unknown system-console user '%s'", name);
                 else
                         u32_vec_push(&launcher->static_uids, (uint32_t)entry->pw_uid);
         }
@@ -176,15 +186,15 @@ static bool refresh_console_users(Launcher *launcher)
         U32Vec candidate = {0};
         int count = sd_get_uids(&uids);
         if (count < 0) {
-                fprintf(stderr, "elogind local-session query failed: %s\n", strerror(-count));
+                log_error("elogind local-session query failed: %s", strerror(-count));
                 return false;
         }
         for (int i = 0; i < count; ++i) {
                 char **sessions = NULL;
                 int n_sessions = sd_uid_get_sessions(uids[i], 1, &sessions);
                 if (n_sessions < 0) {
-                        fprintf(stderr, "elogind session query for UID %u failed: %s\n", (unsigned)uids[i],
-                                strerror(-n_sessions));
+                        log_error("elogind session query for UID %u failed: %s", (unsigned)uids[i],
+                                  strerror(-n_sessions));
                         free(uids);
                         u32_vec_clear(&candidate);
                         return false;
@@ -293,14 +303,16 @@ static PtrVec *watch_paths_for_config(LauncherConfig *config)
 static bool install_watch_sources(Launcher *launcher, Error **error);
 static bool reload_config(Launcher *launcher, Error **error);
 
+/* Called from the watch timer, SIGHUP, and the controller's ReloadConfig. All
+ * of those run inside packet dispatch, so they only record the request. */
+static void request_reload(Launcher *launcher)
+{
+        launcher->reload_pending = true;
+}
+
 static void automatic_reload(void *data)
 {
-        Launcher *launcher = data;
-        Error *error = NULL;
-        if (!reload_config(launcher, &error))
-                print_error("Automatic D-Bus configuration reload failed", error);
-        else
-                fputs("Automatically reloaded D-Bus configuration and services\n", stderr);
+        request_reload(data);
 }
 
 static bool set_policy(Launcher *launcher, LauncherConfig *config, Error **error)
@@ -315,15 +327,23 @@ static bool set_policy(Launcher *launcher, LauncherConfig *config, Error **error
 
 static bool reload_config(Launcher *launcher, Error **error)
 {
-        LauncherConfig *candidate = launcher_config_new();
-        ServiceTable *candidate_services = service_table_new();
-        ServiceTable *current = service_manager_table(launcher->service_manager);
+        LauncherConfig *candidate;
+        ServiceTable *candidate_services;
+        ServiceTable *current;
         Watch *candidate_watch = NULL;
         PtrVec *paths = NULL;
         PtrVec released, added;
         bool success = false;
         ptr_vec_init(&released, NULL);
         ptr_vec_init(&added, NULL);
+        /* Defence in depth: every caller defers to the main loop, so this can
+         * only fire if a new reload trigger forgets to. */
+        if (launcher->reloading)
+                return error_set(error, EBUSY, "A D-Bus configuration reload is already in progress");
+        launcher->reloading = true;
+        candidate = launcher_config_new();
+        candidate_services = service_table_new();
+        current = service_manager_table(launcher->service_manager);
         if (!candidate || !candidate_services)
                 goto memory;
         if (!launcher_config_load(candidate, launcher->config, error) || !configure_apparmor(candidate, error) ||
@@ -381,9 +401,15 @@ static bool reload_config(Launcher *launcher, Error **error)
         watch_free(launcher->watch);
         launcher->watch = candidate_watch;
         candidate_watch = NULL;
-        if (!install_watch_sources(launcher, error))
-                goto out;
+        /* The new generation is already live at this point, so a watch failure
+         * cannot be reported as a failed reload; it would leave callers
+         * believing the old configuration was kept. */
         success = true;
+        if (!install_watch_sources(launcher, error)) {
+                print_error("Reloaded configuration is active but file watching stopped", error ? *error : NULL);
+                if (error)
+                        *error = NULL;
+        }
         goto out;
 rollback:
         for (size_t i = added.len; i > 0; --i) {
@@ -406,6 +432,7 @@ out:
         ptr_vec_free(paths);
         ptr_vec_clear(&released);
         ptr_vec_clear(&added);
+        launcher->reloading = false;
         return success;
 }
 
@@ -418,17 +445,55 @@ static bool controller_packet(Controller *controller, DBusPacket *packet, void *
             str_equal(packet->header.path, "/org/bus1/DBus/Controller") &&
             str_equal(packet->header.interface, "org.bus1.DBus.Controller") &&
             str_equal(packet->header.member, "ReloadConfig")) {
-                Error *reload_error = NULL;
-                if (!reload_config(launcher, &reload_error)) {
-                        bool result = controller_reply_error(
-                                controller, packet->header.serial, "org.bus1.DBus.Controller.Error.InvalidConfig",
-                                reload_error ? reload_error->message : "Invalid configuration", error);
-                        error_free(reload_error);
-                        return result;
-                }
-                return controller_reply(controller, packet->header.serial, error);
+                (void)controller;
+                /* Queue the caller's serial; the main loop replies once the
+                 * coalesced reload has run. */
+                if (!u32_vec_push(&launcher->reload_serials, packet->header.serial))
+                        return error_set(error, ENOMEM, "Cannot queue D-Bus reload request");
+                request_reload(launcher);
         }
         return true;
+}
+
+/* Runs one reload for however many requests accumulated during dispatch, then
+ * answers every queued ReloadConfig caller. */
+static void run_pending_reload(Launcher *launcher)
+{
+        Error *reload_error = NULL;
+        size_t answered;
+        bool reloaded;
+
+        if (!launcher->reload_pending)
+                return;
+        launcher->reload_pending = false;
+        /* Only requests made before this reload started are satisfied by it.
+         * Anything queued while it runs sets reload_pending again and is
+         * answered by the next pass. */
+        answered = launcher->reload_serials.len;
+        reloaded = reload_config(launcher, &reload_error);
+        if (reloaded)
+                log_info("Reloaded D-Bus configuration and services");
+        else
+                log_error("D-Bus configuration reload failed: %s",
+                          reload_error ? reload_error->message : "unknown error");
+        for (size_t i = 0; i < answered; ++i) {
+                Error *reply_error = NULL;
+                uint32_t serial = launcher->reload_serials.items[i];
+                bool sent =
+                        reloaded
+                                ? controller_reply(&launcher->controller, serial, &reply_error)
+                                : controller_reply_error(
+                                          &launcher->controller, serial, "org.bus1.DBus.Controller.Error.InvalidConfig",
+                                          reload_error ? reload_error->message : "Invalid configuration", &reply_error);
+                if (!sent)
+                        print_error("Cannot answer D-Bus reload request", reply_error);
+        }
+        /* memmove() rejects a null pointer even for a zero count. */
+        if (answered && launcher->reload_serials.len > answered)
+                memmove(launcher->reload_serials.items, launcher->reload_serials.items + answered,
+                        (launcher->reload_serials.len - answered) * sizeof(*launcher->reload_serials.items));
+        launcher->reload_serials.len -= answered;
+        error_free(reload_error);
 }
 
 static bool bind_listener(Launcher *launcher, Error **error)
@@ -475,6 +540,7 @@ static bool bind_listener(Launcher *launcher, Error **error)
             bind(launcher->listener_fd, (struct sockaddr *)&address, sizeof(address)) < 0 ||
             listen(launcher->listener_fd, SOMAXCONN) < 0)
                 return error_set_errno(error, errno, "Cannot bind D-Bus listener %s", launcher->socket_path);
+        launcher->listener_bound = true;
         if (!launcher->user && chmod(launcher->socket_path, 0666) < 0)
                 return error_set_errno(error, errno, "Cannot chmod %s", launcher->socket_path);
         return true;
@@ -485,6 +551,13 @@ static bool broker_child_setup(void *data, int *error_number)
         BrokerChild *child = data;
         bool keep_audit = false;
         pid_t parent = getppid();
+        sigset_t empty;
+        /* The dispatcher blocks its event-loop signals and the mask survives
+         * execve. Leaving it set would, among other things, make the
+         * PR_SET_PDEATHSIG below undeliverable. */
+        sigemptyset(&empty);
+        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
+                goto fail;
         if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || (child->fd != 3 && dup2(child->fd, 3) < 0) ||
             (child->fd == 3 && fcntl(3, F_SETFD, 0) < 0) || getppid() != parent)
                 goto fail;
@@ -549,6 +622,15 @@ static bool start_broker(Launcher *launcher, Error **error)
         ProcessSpec spec;
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
                 return error_set_errno(error, errno, "Cannot create controller socketpair");
+        /* Only our end becomes non-blocking; the broker inherits pair[1] as-is.
+         * Without this the transport's poll timeouts can never fire and any
+         * stalled controller exchange would hang the dispatcher forever. */
+        if (fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL, 0) | O_NONBLOCK) < 0) {
+                int saved = errno;
+                close(pair[0]);
+                close(pair[1]);
+                return error_set_errno(error, saved, "Cannot configure controller socket");
+        }
         machine = read_machine_id(error);
         if (!machine)
                 goto fail;
@@ -614,8 +696,9 @@ static bool add_listener(Launcher *launcher, Error **error)
         return result;
 }
 
-static bool write_pid_file(const char *path, Error **error)
+static bool write_pid_file(Launcher *launcher, Error **error)
 {
+        const char *path = launcher->pid_file;
         char contents[64];
         int fd, length;
         struct stat st;
@@ -644,6 +727,7 @@ static bool write_pid_file(const char *path, Error **error)
         }
         if (close(fd) < 0)
                 return error_set_errno(error, errno, "Cannot close %s", path);
+        launcher->pid_file_written = true;
         return true;
 }
 
@@ -654,7 +738,7 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
         char status;
         ssize_t n;
         if (!launcher->daemonize)
-                return write_pid_file(launcher->pid_file, error);
+                return true;
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
                 return error_set_errno(error, errno, "Cannot create startup socketpair");
         child = fork();
@@ -680,7 +764,9 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
                 return error_set_errno(error, errno, "Cannot configure daemon process");
         if (null_fd > 2)
                 close(null_fd);
-        return write_pid_file(launcher->pid_file, error);
+        /* stderr is /dev/null from here on, so diagnostics must go to syslog. */
+        log_use_syslog("dbus-broker-dispatch");
+        return true;
 }
 
 static void notify_startup(Launcher *launcher, bool ready)
@@ -702,18 +788,33 @@ static bool controller_event(EventSource *source, uint32_t events, void *data, E
         return controller_dispatch(&((Launcher *)data)->controller, error);
 }
 
+/* File watching is an optimisation, not a correctness requirement: losing it
+ * must never terminate a running bus. Failures are logged and a reload is
+ * requested so the current state is at least re-read once. */
 static bool watch_event(EventSource *source, uint32_t events, void *data, Error **error)
 {
+        Launcher *launcher = data;
+        Error *watch_error = NULL;
         (void)source;
         (void)events;
-        return watch_dispatch_inotify(((Launcher *)data)->watch, error);
+        (void)error;
+        if (!watch_dispatch_inotify(launcher->watch, &watch_error)) {
+                print_error("D-Bus configuration watch failed; continuing without it", watch_error);
+                request_reload(launcher);
+        }
+        return true;
 }
 
 static bool watch_timer_event(EventSource *source, uint32_t events, void *data, Error **error)
 {
+        Launcher *launcher = data;
+        Error *watch_error = NULL;
         (void)source;
         (void)events;
-        return watch_dispatch_timer(((Launcher *)data)->watch, error);
+        (void)error;
+        if (!watch_dispatch_timer(launcher->watch, &watch_error))
+                print_error("D-Bus configuration watch timer failed", watch_error);
+        return true;
 }
 
 static bool install_watch_sources(Launcher *launcher, Error **error)
@@ -736,9 +837,7 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
                         if (info.ssi_signo == SIGTERM || info.ssi_signo == SIGINT)
                                 event_loop_quit(&launcher->loop);
                         else if (info.ssi_signo == SIGHUP) {
-                                Error *reload_error = NULL;
-                                if (!reload_config(launcher, &reload_error))
-                                        print_error("Reload failed", reload_error);
+                                request_reload(launcher);
                         } else if (info.ssi_signo == SIGCHLD) {
                                 for (;;) {
                                         int status;
@@ -746,6 +845,14 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
                                         if (pid <= 0)
                                                 break;
                                         if (pid == launcher->broker_pid) {
+                                                if (WIFSIGNALED(status))
+                                                        log_error("dbus-broker was killed by signal %d",
+                                                                  WTERMSIG(status));
+                                                else if (WIFEXITED(status) && WEXITSTATUS(status))
+                                                        log_error("dbus-broker exited with status %d",
+                                                                  WEXITSTATUS(status));
+                                                else
+                                                        log_error("dbus-broker exited unexpectedly");
                                                 launcher->broker_pid = 0;
                                                 launcher->broker_failed = true;
                                                 event_loop_quit(&launcher->loop);
@@ -762,68 +869,6 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
                         return true;
                 return error_set_errno(error, n < 0 ? errno : EIO, "Cannot read signal events");
         }
-}
-
-static char *percent_escape(const char *value)
-{
-        static const char hex[] = "0123456789ABCDEF";
-        StrBuf out = {0};
-        for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
-                if (isalnum(*p) || strchr("_-./", *p))
-                        str_buf_append_n(&out, (const char *)p, 1);
-                else {
-                        char escaped[] = {'%', hex[*p >> 4], hex[*p & 15]};
-                        str_buf_append_n(&out, escaped, sizeof(escaped));
-                }
-        }
-        return str_buf_steal(&out);
-}
-
-static int hex_value(char value)
-{
-        if (value >= '0' && value <= '9')
-                return value - '0';
-        if (value >= 'a' && value <= 'f')
-                return value - 'a' + 10;
-        if (value >= 'A' && value <= 'F')
-                return value - 'A' + 10;
-        return -1;
-}
-
-static char *socket_path_from_address(const char *address, Error **error)
-{
-        const char *encoded;
-        StrBuf path = {0};
-        if (!str_has_prefix(address, "unix:path=")) {
-                error_set(error, ENOTSUP, "Only filesystem-backed unix:path= D-Bus addresses are supported");
-                return NULL;
-        }
-        encoded = address + strlen("unix:path=");
-        if (!*encoded || strpbrk(encoded, ",;")) {
-                error_set(error, EINVAL, "Invalid D-Bus listener address: %s", address);
-                return NULL;
-        }
-        for (const char *p = encoded; *p; ++p) {
-                char byte = *p;
-                if (*p == '%') {
-                        int high = hex_value(p[1]), low = hex_value(p[2]);
-                        if (high < 0 || low < 0)
-                                goto invalid;
-                        byte = (char)((high << 4) | low);
-                        p += 2;
-                        if (!byte)
-                                goto invalid;
-                }
-                if (!str_buf_append_n(&path, &byte, 1))
-                        goto invalid;
-        }
-        if (!path.data || !path_is_absolute(path.data))
-                goto invalid;
-        return str_buf_steal(&path);
-invalid:
-        str_buf_clear(&path);
-        error_set(error, EINVAL, "The unix:path= listener must contain an absolute, valid escaped path");
-        return NULL;
 }
 
 static char *find_program(const char *name)
@@ -883,14 +928,15 @@ static void launcher_clear(Launcher *launcher)
                 while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
                         ;
         }
-        if (launcher->socket_path)
+        if (launcher->listener_bound && launcher->socket_path)
                 unlink(launcher->socket_path);
-        if (launcher->pid_file)
+        if (launcher->pid_file_written && launcher->pid_file)
                 unlink(launcher->pid_file);
         service_manager_free(launcher->service_manager);
         launcher_config_free(launcher->config_state);
         u32_vec_clear(&launcher->static_uids);
         u32_vec_clear(&launcher->dynamic_uids);
+        u32_vec_clear(&launcher->reload_serials);
         event_loop_clear(&launcher->loop);
         free(launcher->config);
         free(launcher->address);
@@ -976,18 +1022,22 @@ int main(int argc, char **argv)
                 return 2;
         }
         launcher.service_manager = service_manager_new();
+        if (!launcher.service_manager) {
+                fputs("Cannot allocate dispatcher state\n", stderr);
+                goto fail;
+        }
         launcher.broker = launcher.broker ? launcher.broker : str_dup(DEFAULT_BROKER);
         if (!launcher.broker || access(launcher.broker, X_OK) < 0) {
                 if (broker_explicit) {
                         fprintf(stderr, "Configured dbus-broker is not executable: %s\n", launcher.broker);
-                        return 1;
+                        goto fail;
                 }
                 free(launcher.broker);
                 launcher.broker = find_program("dbus-broker");
         }
         if (!launcher.broker) {
                 fputs("dbus-broker not found; use --broker=PATH\n", stderr);
-                return 1;
+                goto fail;
         }
         if (launcher.user) {
                 struct stat st;
@@ -995,7 +1045,7 @@ int main(int argc, char **argv)
                 if (!runtime || lstat(runtime, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
                     (st.st_mode & 0077)) {
                         fputs("XDG_RUNTIME_DIR is required for --scope=user\n", stderr);
-                        return 1;
+                        goto fail;
                 }
                 launcher.socket_path = path_join(runtime, "bus");
         } else
@@ -1007,7 +1057,7 @@ int main(int argc, char **argv)
         if (!launcher.config_state || !launcher_config_load(launcher.config_state, launcher.config, &error) ||
             !configure_apparmor(launcher.config_state, &error) || !configure_broker_user(&launcher, &error)) {
                 print_error("Invalid D-Bus configuration", error);
-                return 1;
+                goto fail;
         }
         launcher.max_bytes = launcher_config_max_bytes(launcher.config_state);
         launcher.max_fds = launcher_config_max_fds(launcher.config_state);
@@ -1018,14 +1068,18 @@ int main(int argc, char **argv)
                 launcher.address = str_dup(configured_address);
         if (!launcher.address) {
                 char *escaped = percent_escape(launcher.socket_path);
-                launcher.address = str_printf("unix:path=%s", escaped);
+                launcher.address = escaped ? str_printf("unix:path=%s", escaped) : NULL;
                 free(escaped);
+                if (!launcher.address) {
+                        fputs("Cannot build the D-Bus listener address\n", stderr);
+                        goto fail;
+                }
         }
         free(launcher.socket_path);
         launcher.socket_path = socket_path_from_address(launcher.address, &error);
         if (!launcher.socket_path) {
                 print_error("Invalid D-Bus address", error);
-                return 1;
+                goto fail;
         }
         if (!launcher.user) {
                 load_static_console_users(&launcher);
@@ -1037,7 +1091,7 @@ int main(int argc, char **argv)
             !daemonize_launcher(&launcher, &error) || !event_loop_init(&launcher.loop, &error)) {
                 notify_startup(&launcher, false);
                 print_error("Cannot start dispatcher", error);
-                return 1;
+                goto fail;
         }
         PtrVec *paths = watch_paths_for_config(launcher.config_state);
         launcher.watch = watch_new(automatic_reload, &launcher, &error);
@@ -1051,8 +1105,7 @@ int main(int argc, char **argv)
                 ptr_vec_free(paths);
                 notify_startup(&launcher, false);
                 print_error("Cannot start dispatcher", error);
-                launcher_clear(&launcher);
-                return 1;
+                goto fail;
         }
         ptr_vec_free(paths);
         service_manager_set_controller(launcher.service_manager, &launcher.controller, launcher.address,
@@ -1063,18 +1116,31 @@ int main(int argc, char **argv)
                                         &error) ||
             !add_listener(&launcher, &error) || !configure_console_monitor(&launcher, &error) ||
             !event_source_add(&launcher.loop, &launcher.controller_source, controller_fd(&launcher.controller), EPOLLIN,
-                              controller_event, &launcher, &error)) {
+                              controller_event, &launcher, &error) ||
+            !write_pid_file(&launcher, &error)) {
                 notify_startup(&launcher, false);
                 print_error("Cannot initialize dispatcher", error);
-                launcher_clear(&launcher);
-                return 1;
+                goto fail;
         }
         notify_startup(&launcher, true);
-        if (!event_loop_run(&launcher.loop, &error)) {
-                print_error("Dispatcher event loop failed", error);
-                launcher.broker_failed = true;
+        /* Not event_loop_run(): reloads must happen between dispatches, never
+         * inside one. */
+        launcher.loop.running = true;
+        while (launcher.loop.running) {
+                /* A reload queued while the previous one ran must not wait for
+                 * unrelated traffic before it is serviced. */
+                int timeout = launcher.reload_pending ? 0 : -1;
+                if (!event_loop_dispatch(&launcher.loop, timeout, &error)) {
+                        print_error("Dispatcher event loop failed", error);
+                        launcher.broker_failed = true;
+                        break;
+                }
+                run_pending_reload(&launcher);
         }
         bool failed = launcher.broker_failed;
         launcher_clear(&launcher);
         return failed ? 1 : 0;
+fail:
+        launcher_clear(&launcher);
+        return 1;
 }

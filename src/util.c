@@ -209,8 +209,7 @@ void u32_vec_sort_unique(U32Vec *vec)
 {
         if (vec->len < 2)
                 return;
-        if (vec->len > 1)
-                qsort(vec->items, vec->len, sizeof(*vec->items), compare_u32);
+        qsort(vec->items, vec->len, sizeof(*vec->items), compare_u32);
         size_t out = 1;
         for (size_t i = 1; i < vec->len; ++i)
                 if (vec->items[i] != vec->items[out - 1])
@@ -395,7 +394,10 @@ bool str_buf_append_n(StrBuf *buffer, const char *text, size_t length)
         if (buffer->len + length + 1 > buffer->capacity &&
             !grow((void **)&buffer->data, &buffer->capacity, 1, buffer->len + length + 1))
                 return false;
-        memcpy(buffer->data + buffer->len, text, length);
+        /* memcpy() forbids a null source even for a zero count, and callers
+         * legitimately append an empty region from an unallocated buffer. */
+        if (length)
+                memcpy(buffer->data + buffer->len, text, length);
         buffer->len += length;
         buffer->data[buffer->len] = '\0';
         return true;

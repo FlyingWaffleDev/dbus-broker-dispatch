@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "config-policy-internal.h"
 #include "config.h"
+#include "log.h"
 
 #include <dirent.h>
 #include <errno.h>
@@ -249,6 +250,13 @@ static PtrVec *rules_for_id(U32Map *rules, uint32_t id)
         return array;
 }
 
+/* ptr_vec_push() of a NULL path would later reach opendir(); drop instead. */
+static void push_path(PtrVec *paths, char *path)
+{
+        if (!path || !ptr_vec_push(paths, path))
+                free(path);
+}
+
 static void append_rule(ParserState *state, PolicyRule *rule, bool connection_target, bool group_target, uint32_t id)
 {
         PtrVec *rules;
@@ -280,14 +288,26 @@ static void parse_rule(ParserState *state, const char *element, const char **att
         const char *recv_sender = attribute(attributes, "receive_sender");
         const char *send_type = attribute(attributes, "send_type");
         const char *recv_type = attribute(attributes, "receive_type");
+        const char *send_requested_reply = attribute(attributes, "send_requested_reply");
+        const char *recv_requested_reply = attribute(attributes, "receive_requested_reply");
+        /* dbus-broker tracks expected replies itself, so requested_reply is not
+         * expressible in its policy. A rule that says nothing else would
+         * otherwise widen into a match-everything rule. */
+        bool only_send_requested_reply =
+                send_requested_reply && !send_destination && !attribute(attributes, "send_path") &&
+                !attribute(attributes, "send_interface") && !attribute(attributes, "send_member") &&
+                !attribute(attributes, "send_error") && !send_type && !attribute(attributes, "send_broadcast");
+        bool only_recv_requested_reply =
+                recv_requested_reply && !recv_sender && !attribute(attributes, "receive_path") &&
+                !attribute(attributes, "receive_interface") && !attribute(attributes, "receive_member") &&
+                !attribute(attributes, "receive_error") && !recv_type;
         bool has_send = send_destination || attribute(attributes, "send_path") ||
                         attribute(attributes, "send_interface") || attribute(attributes, "send_member") ||
                         attribute(attributes, "send_error") || send_type || attribute(attributes, "send_broadcast") ||
-                        attribute(attributes, "send_requested_reply");
+                        send_requested_reply;
         bool has_recv = recv_sender || attribute(attributes, "receive_path") ||
                         attribute(attributes, "receive_interface") || attribute(attributes, "receive_member") ||
-                        attribute(attributes, "receive_error") || recv_type ||
-                        attribute(attributes, "receive_requested_reply");
+                        attribute(attributes, "receive_error") || recv_type || recv_requested_reply;
         PolicyRule *rule = calloc(1, sizeof(*rule));
         uint32_t id = state->context == POLICY_CONTEXT_USER    ? state->uid
                       : state->context == POLICY_CONTEXT_GROUP ? state->gid
@@ -356,6 +376,13 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 policy_rule_free(rule);
                 return;
         }
+        if ((rule->type == POLICY_RULE_SEND && only_send_requested_reply) ||
+            (rule->type == POLICY_RULE_RECV && only_recv_requested_reply)) {
+                parser_warning(state, "ignoring D-Bus policy rule that only constrains requested_reply; dbus-broker "
+                                      "tracks expected replies itself");
+                policy_rule_free(rule);
+                return;
+        }
         if (str_equal(attribute(attributes, "eavesdrop"), "true") && !rule->allow) {
                 policy_rule_free(rule);
                 return;
@@ -386,8 +413,8 @@ static void parser_warning(ParserState *state, const char *format, ...)
         if (vasprintf(&message, format, arguments) < 0)
                 message = NULL;
         va_end(arguments);
-        fprintf(stderr, "%s:%lu: %s\n", state->file, (unsigned long)XML_GetCurrentLineNumber(state->parser),
-                message ? message : "out of memory while formatting warning");
+        log_warning("%s:%lu: %s", state->file, (unsigned long)XML_GetCurrentLineNumber(state->parser),
+                    message ? message : "out of memory while formatting warning");
         free(message);
 }
 
@@ -658,11 +685,11 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 if (state->text->data)
                         state->text->data[0] = 0;
         } else if (str_equal(element, "standard_system_servicedirs")) {
-                ptr_vec_push(state->config->service_dirs, str_dup("/etc/dbus-1/system-services"));
-                ptr_vec_push(state->config->service_dirs, str_dup("/run/dbus-1/system-services"));
-                ptr_vec_push(state->config->service_dirs, str_dup("/usr/local/share/dbus-1/system-services"));
-                ptr_vec_push(state->config->service_dirs, str_dup("/usr/share/dbus-1/system-services"));
-                ptr_vec_push(state->config->service_dirs, str_dup("/lib/dbus-1/system-services"));
+                push_path(state->config->service_dirs, str_dup("/etc/dbus-1/system-services"));
+                push_path(state->config->service_dirs, str_dup("/run/dbus-1/system-services"));
+                push_path(state->config->service_dirs, str_dup("/usr/local/share/dbus-1/system-services"));
+                push_path(state->config->service_dirs, str_dup("/usr/share/dbus-1/system-services"));
+                push_path(state->config->service_dirs, str_dup("/lib/dbus-1/system-services"));
         } else if (str_equal(element, "standard_session_servicedirs")) {
                 const char *runtime = getenv("XDG_RUNTIME_DIR");
                 const char *data_home = getenv("XDG_DATA_HOME");
@@ -670,7 +697,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 char *base = NULL, *dbus = NULL;
                 if (runtime && path_is_absolute(runtime)) {
                         dbus = path_join(runtime, "dbus-1/services");
-                        ptr_vec_push(state->config->service_dirs, dbus);
+                        push_path(state->config->service_dirs, dbus);
                 }
                 if (data_home && path_is_absolute(data_home))
                         base = str_dup(data_home);
@@ -678,7 +705,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         base = path_join(home, ".local/share");
                 if (base) {
                         dbus = path_join(base, "dbus-1/services");
-                        ptr_vec_push(state->config->service_dirs, dbus);
+                        push_path(state->config->service_dirs, dbus);
                         free(base);
                 }
                 const char *system_dirs = getenv("XDG_DATA_DIRS");
@@ -686,7 +713,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 char *cursor = copy, *directory;
                 while (copy && (directory = strsep(&cursor, ":")))
                         if (path_is_absolute(directory))
-                                ptr_vec_push(state->config->service_dirs, path_join(directory, "dbus-1/services"));
+                                push_path(state->config->service_dirs, path_join(directory, "dbus-1/services"));
                 free(copy);
         }
 }
@@ -837,7 +864,7 @@ static void parser_end(void *data, const XML_Char *element)
                         free(path);
                 } else if (str_equal(element, "servicedir")) {
                         path = resolve_path(state->base_dir, value);
-                        ptr_vec_push(state->config->service_dirs, path);
+                        push_path(state->config->service_dirs, path);
                 } else if (str_equal(element, "listen") && !state->config->address &&
                            str_has_prefix(value, "unix:path=")) {
                         state->config->address = str_dup(value);
@@ -894,7 +921,7 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                 return error_set(error, ENOMEM, "%s: out of memory", path);
         }
         if (str_map_contains(config->active_files, canonical)) {
-                fprintf(stderr, "%s: recursive D-Bus configuration include ignored\n", canonical);
+                log_warning("%s: recursive D-Bus configuration include ignored", canonical);
                 free(canonical);
                 return true;
         }
@@ -988,25 +1015,62 @@ static char *rule_signature(const PolicyRule *rule)
                           rule->broadcast, rule->min_fds, rule->max_fds);
 }
 
+typedef struct {
+        char *signature;
+        size_t index;
+} RuleSignature;
+
+static int compare_rule_signatures(const void *left, const void *right)
+{
+        const RuleSignature *a = left, *b = right;
+        int order = strcmp(a->signature, b->signature);
+        if (order)
+                return order;
+        return (a->index > b->index) - (a->index < b->index);
+}
+
+/* Later rules have higher priority. An earlier byte-for-byte equivalent rule
+ * with the same verdict can therefore never affect a decision, so only the last
+ * of each group is kept.
+ *
+ * Sorting rather than scanning a linear-probe map keeps this O(n log n); large
+ * generated policies made the previous form quadratic. */
 static void optimize_rule_array(PtrVec *rules)
 {
-        StrMap seen;
-        str_map_init(&seen, NULL);
+        size_t total = rules->len, kept = 0, built = 0;
+        RuleSignature *signatures;
+        bool *drop;
 
-        /* Later rules have higher priority. An earlier byte-for-byte equivalent
-         * rule with the same verdict can therefore never affect a decision. */
-        for (uint32_t index = rules->len; index > 0; --index) {
-                PolicyRule *rule = rules->items[index - 1];
-                char *signature = rule_signature(rule);
-                if (str_map_contains(&seen, signature)) {
-                        free(signature);
-                        ptr_vec_delete(rules, index - 1);
-                } else {
-                        str_map_set(&seen, signature, NULL);
-                        free(signature);
-                }
+        if (total < 2)
+                return;
+        signatures = calloc(total, sizeof(*signatures));
+        drop = calloc(total, sizeof(*drop));
+        if (!signatures || !drop)
+                goto out;
+        for (; built < total; ++built) {
+                signatures[built].signature = rule_signature(rules->items[built]);
+                signatures[built].index = built;
+                if (!signatures[built].signature)
+                        goto out; /* Leave the rules untouched; dedup is optional. */
         }
-        str_map_clear(&seen);
+        qsort(signatures, total, sizeof(*signatures), compare_rule_signatures);
+        /* Equal signatures are now adjacent and ordered by position, so every
+         * entry but the last of each run is redundant. */
+        for (size_t i = 0; i + 1 < total; ++i)
+                if (strcmp(signatures[i].signature, signatures[i + 1].signature) == 0)
+                        drop[signatures[i].index] = true;
+        for (size_t i = 0; i < total; ++i) {
+                if (drop[i])
+                        policy_rule_free(rules->items[i]);
+                else
+                        rules->items[kept++] = rules->items[i];
+        }
+        rules->len = kept;
+out:
+        for (size_t i = 0; i < built; ++i)
+                free(signatures[i].signature);
+        free(signatures);
+        free(drop);
 }
 
 static void optimize_rule_table(U32Map *table)

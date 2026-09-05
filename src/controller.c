@@ -1,18 +1,76 @@
 #include "controller.h"
+#include "log.h"
 
 #include <errno.h>
+#include <stdlib.h>
 #include <string.h>
+
+/* Bounds the queue below. Only replies to in-flight calls are ever stored, so
+ * the depth is the nesting depth of call(); anything beyond this is a broker
+ * that is replying to serials we never sent. */
+enum { MAX_PENDING_REPLIES = 64 };
+
+void controller_reply_free(ControllerReply *reply)
+{
+        if (!reply)
+                return;
+        free(reply->error_name);
+        free(reply->error_message);
+        free(reply);
+}
 
 void controller_init(Controller *controller, int fd, ControllerPacketFunc packet_func, void *data)
 {
         *controller = (Controller){.packet_func = packet_func, .packet_data = data};
+        ptr_vec_init(&controller->pending_replies, (DestroyFunc)controller_reply_free);
         dbus_transport_init(&controller->transport, fd);
 }
 
 void controller_clear(Controller *controller)
 {
+        ptr_vec_clear(&controller->pending_replies);
         dbus_transport_clear(&controller->transport);
         *controller = (Controller){.transport.fd = -1};
+}
+
+/* Removes and returns the stored reply for serial, or NULL. */
+ControllerReply *controller_take_reply(Controller *controller, uint32_t serial)
+{
+        for (size_t i = 0; i < controller->pending_replies.len; ++i) {
+                ControllerReply *reply = controller->pending_replies.items[i];
+                if (reply->serial == serial)
+                        return ptr_vec_remove(&controller->pending_replies, i);
+        }
+        return NULL;
+}
+
+bool controller_store_reply(Controller *controller, const DBusPacket *packet, const char *message)
+{
+        ControllerReply *reply = calloc(1, sizeof(*reply));
+
+        if (!reply)
+                return false;
+        reply->serial = packet->header.reply_serial;
+        reply->is_error = packet->header.type == DBUS_MESSAGE_ERROR;
+        if (reply->is_error) {
+                reply->error_name = str_dup(packet->header.error_name ? packet->header.error_name : "D-Bus error");
+                reply->error_message = str_dup(message);
+                if (!reply->error_name || !reply->error_message) {
+                        controller_reply_free(reply);
+                        return false;
+                }
+        }
+        while (controller->pending_replies.len >= MAX_PENDING_REPLIES) {
+                ControllerReply *dropped = controller->pending_replies.items[0];
+                log_warning("Discarding queued controller reply for serial %u; the call waiting for it will time out",
+                            dropped->serial);
+                ptr_vec_delete(&controller->pending_replies, 0);
+        }
+        if (!ptr_vec_push(&controller->pending_replies, reply)) {
+                controller_reply_free(reply);
+                return false;
+        }
+        return true;
 }
 
 bool controller_authenticate(Controller *controller, uid_t uid, Error **error)
@@ -57,6 +115,17 @@ bool controller_dispatch(Controller *controller, Error **error)
         return result;
 }
 
+/* Extracts an error message body, defaulting when the reply has no string. */
+static const char *reply_error_message(DBusPacket *packet)
+{
+        const char *message = "Controller method failed";
+        size_t length;
+
+        if (packet->header.signature && strcmp(packet->header.signature, "s") == 0)
+                dbus_reader_string(&packet->body, &message, &length);
+        return message;
+}
+
 static bool call(Controller *controller, const char *path, const char *interface, const char *member,
                  const char *signature, const DBusWriter *body, const int *fds, size_t n_fds, Error **error)
 {
@@ -67,23 +136,40 @@ static bool call(Controller *controller, const char *path, const char *interface
                 return false;
         for (;;) {
                 DBusPacket packet = {0};
-                bool result;
+                ControllerReply *stored;
+                bool result, is_reply;
+
+                /* A nested call may already have read and parked our reply. */
+                stored = controller_take_reply(controller, serial);
+                if (stored) {
+                        bool failed = stored->is_error;
+                        if (failed)
+                                error_set(error, EPROTO, "%s: %s", stored->error_name, stored->error_message);
+                        controller_reply_free(stored);
+                        return !failed;
+                }
                 if (!dbus_transport_receive(&controller->transport, &packet, error))
                         return false;
-                if ((packet.header.type == DBUS_MESSAGE_METHOD_RETURN || packet.header.type == DBUS_MESSAGE_ERROR) &&
-                    packet.header.reply_serial == serial) {
+                is_reply = packet.header.type == DBUS_MESSAGE_METHOD_RETURN || packet.header.type == DBUS_MESSAGE_ERROR;
+                if (is_reply && packet.header.reply_serial == serial) {
                         if (packet.header.type == DBUS_MESSAGE_ERROR) {
-                                const char *message = "Controller method failed";
-                                size_t length;
-                                if (packet.header.signature && strcmp(packet.header.signature, "s") == 0)
-                                        dbus_reader_string(&packet.body, &message, &length);
                                 error_set(error, EPROTO, "%s: %s",
-                                          packet.header.error_name ? packet.header.error_name : "D-Bus error", message);
+                                          packet.header.error_name ? packet.header.error_name : "D-Bus error",
+                                          reply_error_message(&packet));
                                 dbus_packet_clear(&packet);
                                 return false;
                         }
                         dbus_packet_clear(&packet);
                         return true;
+                }
+                if (is_reply) {
+                        /* Belongs to an outer call; park it instead of dropping it. */
+                        if (!controller_store_reply(controller, &packet, reply_error_message(&packet))) {
+                                dbus_packet_clear(&packet);
+                                return error_set(error, ENOMEM, "Cannot queue controller reply");
+                        }
+                        dbus_packet_clear(&packet);
+                        continue;
                 }
                 result = dispatch_packet(controller, &packet, error);
                 dbus_packet_clear(&packet);

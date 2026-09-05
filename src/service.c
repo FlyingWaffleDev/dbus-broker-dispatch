@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include "service.h"
+#include "log.h"
 #include "process.h"
 #include "service-file.h"
 
@@ -176,8 +177,7 @@ static void reset_service(ServiceManager *manager, Service *service, const char 
         Error *error = NULL;
         if (manager->controller &&
             !controller_reset(manager->controller, service->path, service->serial, reason, &error)) {
-                fprintf(stderr, "Cannot reset D-Bus service %s: %s\n", service->name,
-                        error ? error->message : "unknown error");
+                log_error("Cannot reset D-Bus service %s: %s", service->name, error ? error->message : "unknown error");
                 error_free(error);
         }
         service->starting = false;
@@ -186,6 +186,14 @@ static void reset_service(ServiceManager *manager, Service *service, const char 
 static bool activation_child_setup(void *data, int *error_number)
 {
         Activation *activation = data;
+        sigset_t empty;
+        /* Activated services must not inherit the dispatcher's blocked
+         * SIGHUP/SIGINT/SIGTERM/SIGCHLD; the mask survives execve. */
+        sigemptyset(&empty);
+        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
+                *error_number = errno ? errno : EPERM;
+                return false;
+        }
         if (!activation->user || (geteuid() == activation->uid && getegid() == activation->gid))
                 return true;
         if (geteuid() != 0 || syscall(SYS_setgroups, activation->n_groups, activation->groups) < 0 ||
@@ -334,8 +342,7 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
 memory_environment:
         error_set(&error, ENOMEM, "Cannot allocate activation state");
 failure:
-        fprintf(stderr, "Service activation failed for %s: %s\n", service->name,
-                error ? error->message : "unknown error");
+        log_error("Service activation failed for %s: %s", service->name, error ? error->message : "unknown error");
         error_free(error);
         reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
         activation_free(activation);
@@ -344,7 +351,7 @@ failure:
         str_map_clear(&environment);
         return;
 memory:
-        fprintf(stderr, "Service activation failed for %s: out of memory\n", service->name);
+        log_error("Service activation failed for %s: out of memory", service->name);
         reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
 }
 
@@ -353,10 +360,13 @@ bool service_manager_reap(ServiceManager *manager, pid_t pid, int status)
         Activation *activation = u32_map_remove(&manager->activations, (uint32_t)pid);
         if (!activation)
                 return false;
-        if (!WIFEXITED(status) || WEXITSTATUS(status))
-                reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.UnitFailure");
-        else
-                activation->service->starting = false;
+        /* Reset regardless of exit status. The broker ignores a reset whose
+         * serial is no longer the pending activation, so a service that forked
+         * into the background and took the name is unaffected, while one that
+         * exited without taking it stops leaving its callers blocked. */
+        reset_service(manager, activation->service,
+                      !WIFEXITED(status) || WEXITSTATUS(status) ? "org.bus1.DBus.Name.Error.UnitFailure"
+                                                                : "org.bus1.DBus.Name.Error.StartupFailure");
         activation_free(activation);
         return true;
 }
@@ -404,8 +414,8 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                         if (errno == ENOENT)
                                 continue;
                         if (errno == EACCES || errno == EPERM) {
-                                fprintf(stderr, "Cannot access D-Bus service directory %s: %s\n", directory_path,
-                                        strerror(errno));
+                                log_warning("Cannot access D-Bus service directory %s: %s", directory_path,
+                                            strerror(errno));
                                 continue;
                         }
                         str_map_clear(&names);
@@ -428,31 +438,31 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                                 continue;
                         path = path_join(directory_path, entry->d_name);
                         if (!path || !service_file_load(path, &parsed, &local_error)) {
-                                fprintf(stderr, "Ignoring unreadable D-Bus service file %s: %s\n",
-                                        path ? path : entry->d_name,
-                                        local_error ? local_error->message : "out of memory");
+                                log_warning("Ignoring unreadable D-Bus service file %s: %s",
+                                            path ? path : entry->d_name,
+                                            local_error ? local_error->message : "out of memory");
                                 error_free(local_error);
                                 free(path);
                                 continue;
                         }
                         if (!parsed.name || !parsed.exec) {
                                 if (parsed.name && parsed.systemd_service)
-                                        fprintf(stderr, "Ignoring systemd-only D-Bus service %s\n", path);
+                                        log_info("Ignoring systemd-only D-Bus service %s", path);
                                 else
-                                        fprintf(stderr, "Ignoring D-Bus service file %s: missing %s\n", path,
-                                                parsed.name ? "Exec" : "Name");
+                                        log_warning("Ignoring D-Bus service file %s: missing %s", path,
+                                                    parsed.name ? "Exec" : "Name");
                                 goto next;
                         }
                         if (!dbus_name_is_valid(parsed.name)) {
-                                fprintf(stderr, "Ignoring invalid D-Bus service file %s\n", path);
+                                log_warning("Ignoring invalid D-Bus service file %s", path);
                                 goto next;
                         }
                         if (parsed.user) {
                                 identity = nss_cache_lookup_user(nss, parsed.user, &local_error);
                                 if (!identity) {
                                         if (local_error && local_error->code == NSS_ERROR_NOT_FOUND) {
-                                                fprintf(stderr, "Ignoring D-Bus service file %s: %s\n", path,
-                                                        local_error->message);
+                                                log_warning("Ignoring D-Bus service file %s: %s", path,
+                                                            local_error->message);
                                                 error_free(local_error);
                                                 goto next;
                                         }
@@ -471,17 +481,15 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                         if (strlen(entry->d_name) != strlen(parsed.name) + strlen(".service") ||
                             !str_has_prefix(entry->d_name, parsed.name)) {
                                 if (!user_scope) {
-                                        fprintf(stderr,
-                                                "Ignoring system D-Bus service file %s: filename does not match "
-                                                "Name=%s\n",
-                                                path, parsed.name);
+                                        log_warning("Ignoring system D-Bus service file %s: filename does not match "
+                                                    "Name=%s",
+                                                    path, parsed.name);
                                         goto next;
                                 }
-                                fprintf(stderr, "User D-Bus service file %s is not named after %s\n", path,
-                                        parsed.name);
+                                log_info("User D-Bus service file %s is not named after %s", path, parsed.name);
                         }
                         if (str_map_contains(&names, parsed.name)) {
-                                fprintf(stderr, "Ignoring duplicate D-Bus service name %s in %s\n", parsed.name, path);
+                                log_warning("Ignoring duplicate D-Bus service name %s in %s", parsed.name, path);
                                 goto next;
                         }
                         service = calloc(1, sizeof(*service));

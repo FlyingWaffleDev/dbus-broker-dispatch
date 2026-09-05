@@ -13,6 +13,9 @@
 typedef struct WatchEntry {
         char *target;
         char *monitored;
+        /* Set when we watch the parent directory purely to observe one entry.
+         * Events naming anything else in that directory are then irrelevant. */
+        char *filter;
         int descriptor;
 } WatchEntry;
 
@@ -31,22 +34,29 @@ static void entry_free(void *data)
         if (entry) {
                 free(entry->target);
                 free(entry->monitored);
+                free(entry->filter);
                 free(entry);
         }
 }
 
-static char *nearest_existing(const char *path)
+/* Returns the closest path that can carry an inotify watch. When the target is
+ * a file, that is its parent directory; substituted is set so the caller can
+ * filter the directory's events down to that one name. */
+static char *nearest_existing(const char *path, bool *substituted)
 {
         char *candidate = path_canonicalize(path, NULL);
         struct stat st;
+        *substituted = false;
         if (!candidate)
                 return NULL;
-        if (lstat(candidate, &st) == 0 && S_ISREG(st.st_mode)) {
+        if (lstat(candidate, &st) == 0 && !S_ISDIR(st.st_mode)) {
                 char *parent = path_dirname(candidate);
                 free(candidate);
+                *substituted = true;
                 return parent;
         }
         while (lstat(candidate, &st) < 0 && errno == ENOENT) {
+                *substituted = true;
                 char *parent = path_dirname(candidate);
                 if (!parent) {
                         free(candidate);
@@ -62,22 +72,7 @@ static char *nearest_existing(const char *path)
         return candidate;
 }
 
-static void remove_watches(Watch *watch)
-{
-        for (size_t i = 0; i < watch->entries.len; ++i) {
-                WatchEntry *entry = watch->entries.items[i];
-                bool first = true;
-                for (size_t j = 0; j < i; ++j)
-                        if (((WatchEntry *)watch->entries.items[j])->descriptor == entry->descriptor) {
-                                first = false;
-                                break;
-                        }
-                if (first && entry->descriptor >= 0)
-                        inotify_rm_watch(watch->inotify_fd, entry->descriptor);
-        }
-        ptr_vec_clear(&watch->entries);
-}
-
+/* Several targets can share one inotify descriptor, so each is removed once. */
 static void discard_entries(Watch *watch, PtrVec *entries)
 {
         for (size_t i = 0; i < entries->len; ++i) {
@@ -94,6 +89,11 @@ static void discard_entries(Watch *watch, PtrVec *entries)
         ptr_vec_clear(entries);
 }
 
+static void remove_watches(Watch *watch)
+{
+        discard_entries(watch, &watch->entries);
+}
+
 static bool rebuild(Watch *watch, Error **error)
 {
         PtrVec entries;
@@ -101,14 +101,25 @@ static bool rebuild(Watch *watch, Error **error)
         ptr_vec_init(&entries, entry_free);
         for (size_t i = 0; i < watch->targets.len; ++i) {
                 WatchEntry *entry = calloc(1, sizeof(*entry));
+                bool substituted = false;
                 if (!entry)
                         goto memory;
                 entry->descriptor = -1;
                 entry->target = strdup(watch->targets.items[i]);
-                entry->monitored = nearest_existing(entry->target);
+                entry->monitored = entry->target ? nearest_existing(entry->target, &substituted) : NULL;
                 if (!entry->target || !entry->monitored) {
                         entry_free(entry);
                         goto memory;
+                }
+                /* Only a direct child can be recognised by the name inotify
+                 * reports. A target further below the watched ancestor keeps
+                 * the unfiltered behaviour. */
+                if (substituted) {
+                        char *parent = path_dirname(entry->target);
+                        const char *slash = strrchr(entry->target, '/');
+                        if (parent && slash && strcmp(parent, entry->monitored) == 0)
+                                entry->filter = strdup(slash + 1);
+                        free(parent);
                 }
                 entry->descriptor =
                         inotify_add_watch(watch->inotify_fd, entry->monitored,
@@ -224,22 +235,52 @@ int watch_timer_fd(const Watch *watch)
         return watch->timer_fd;
 }
 
+/* True when the event concerns something we actually watch for. Entries that
+ * only watch a parent directory to observe one file ignore its siblings. */
+static bool event_is_relevant(const Watch *watch, const struct inotify_event *event)
+{
+        bool matched_descriptor = false;
+
+        if (event->mask & IN_Q_OVERFLOW)
+                return true;
+        for (size_t i = 0; i < watch->entries.len; ++i) {
+                const WatchEntry *entry = watch->entries.items[i];
+                if (entry->descriptor != event->wd)
+                        continue;
+                matched_descriptor = true;
+                if (!entry->filter)
+                        return true;
+                /* Events on the directory itself carry no name. */
+                if (!event->len || !*event->name)
+                        return true;
+                if (strcmp(event->name, entry->filter) == 0)
+                        return true;
+        }
+        /* A descriptor we no longer track: stay conservative. */
+        return !matched_descriptor;
+}
+
 bool watch_dispatch_inotify(Watch *watch, Error **error)
 {
-        char buffer[16 * (sizeof(struct inotify_event) + NAME_MAX + 1)];
+        /* struct inotify_event needs stricter alignment than a char array. */
+        union {
+                struct inotify_event event;
+                char bytes[16 * (sizeof(struct inotify_event) + NAME_MAX + 1)];
+        } buffer;
         bool changed = false;
         for (;;) {
-                ssize_t n = read(watch->inotify_fd, buffer, sizeof(buffer));
+                ssize_t n = read(watch->inotify_fd, buffer.bytes, sizeof(buffer.bytes));
                 if (n > 0) {
                         for (size_t offset = 0; offset < (size_t)n;) {
-                                struct inotify_event *event = (struct inotify_event *)(buffer + offset);
+                                struct inotify_event *event = (struct inotify_event *)(buffer.bytes + offset);
                                 /* inotify_rm_watch() queues IN_IGNORED. Rebuilds intentionally remove all old
                                  * watches, so treating that notification as a new change creates a permanent
                                  * rebuild/IN_IGNORED feedback loop. Real path removal and movement are already
                                  * reported through IN_DELETE_SELF and IN_MOVE_SELF. */
                                 if (event->mask &
-                                    (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF | IN_MODIFY |
-                                     IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_Q_OVERFLOW))
+                                            (IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
+                                             IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO | IN_Q_OVERFLOW) &&
+                                    event_is_relevant(watch, event))
                                         changed = true;
                                 offset += sizeof(*event) + event->len;
                         }
