@@ -182,24 +182,37 @@ static const char *attribute(const char **attributes, const char *name)
         return NULL;
 }
 
-static bool lookup_uid(LauncherConfig *config, const char *name, uint32_t *uid)
+static void lookup_failed(ParserState *state, const char *kind, const char *name, Error *error)
+{
+        if (error && error->code == NSS_ERROR_NOT_FOUND) {
+                parser_warning(state, "ignoring policy for unknown %s '%s'", kind, name);
+                error_free(error);
+                return;
+        }
+        if (!error)
+                error_set(&error, ENOMEM, "Cannot resolve policy %s '%s'", kind, name);
+        error_prefix(&error, "%s: policy %s '%s': ", state->file, kind, name);
+        parser_fail(state, error);
+}
+
+static bool lookup_uid(ParserState *state, const char *name, uint32_t *uid)
 {
         uid_t resolved;
         Error *error = NULL;
-        if (!nss_cache_lookup_uid(config->nss, name, &resolved, &error)) {
-                error_clear(&error);
+        if (!nss_cache_lookup_uid(state->config->nss, name, &resolved, &error)) {
+                lookup_failed(state, "user", name, error);
                 return false;
         }
         *uid = resolved;
         return true;
 }
 
-static bool lookup_gid(LauncherConfig *config, const char *name, uint32_t *gid)
+static bool lookup_gid(ParserState *state, const char *name, uint32_t *gid)
 {
         gid_t resolved;
         Error *error = NULL;
-        if (!nss_cache_lookup_gid(config->nss, name, &resolved, &error)) {
-                error_clear(&error);
+        if (!nss_cache_lookup_gid(state->config->nss, name, &resolved, &error)) {
+                lookup_failed(state, "group", name, error);
                 return false;
         }
         *gid = resolved;
@@ -364,10 +377,8 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 rule->type = POLICY_RULE_CONNECT;
                 connection_target = true;
                 group_target = group != NULL;
-                if ((user && !str_equal(user, "*") && !lookup_uid(state->config, user, &id)) ||
-                    (group && !str_equal(group, "*") && !lookup_gid(state->config, group, &id))) {
-                        parser_warning(state, "ignoring D-Bus policy rule for unknown %s '%s'", user ? "user" : "group",
-                                       user ? user : group);
+                if ((user && !str_equal(user, "*") && !lookup_uid(state, user, &id)) ||
+                    (group && !str_equal(group, "*") && !lookup_gid(state, group, &id))) {
                         policy_rule_free(rule);
                         return;
                 }
@@ -685,16 +696,12 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         state->context = POLICY_CONTEXT_NONE;
                 } else if (attribute(attributes, "user")) {
                         state->context = POLICY_CONTEXT_USER;
-                        if (!lookup_uid(state->config, attribute(attributes, "user"), &state->uid)) {
-                                parser_warning(state, "ignoring policy for unknown user '%s'",
-                                               attribute(attributes, "user"));
+                        if (!lookup_uid(state, attribute(attributes, "user"), &state->uid)) {
                                 state->context = POLICY_CONTEXT_NONE;
                         }
                 } else if (attribute(attributes, "group")) {
                         state->context = POLICY_CONTEXT_GROUP;
-                        if (!lookup_gid(state->config, attribute(attributes, "group"), &state->gid)) {
-                                parser_warning(state, "ignoring policy for unknown group '%s'",
-                                               attribute(attributes, "group"));
+                        if (!lookup_gid(state, attribute(attributes, "group"), &state->gid)) {
                                 state->context = POLICY_CONTEXT_NONE;
                         }
                 } else if (context && str_equal(context, "mandatory")) {

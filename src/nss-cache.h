@@ -8,8 +8,9 @@ typedef struct NssCache NssCache;
 typedef struct NssUser NssUser;
 
 enum {
-        NSS_ERROR_NOT_FOUND = 1,
-        NSS_ERROR_INVALID_DATA = 2,
+        /* Keep semantic results distinct from positive errno values. */
+        NSS_ERROR_NOT_FOUND = -1,
+        NSS_ERROR_INVALID_DATA = -2,
 };
 
 NssCache *nss_cache_new(void);

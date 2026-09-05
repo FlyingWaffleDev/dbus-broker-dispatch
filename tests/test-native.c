@@ -15,6 +15,7 @@
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -536,8 +537,166 @@ static void test_policy_invalid_xml(void)
         unlink(path);
 }
 
+static void test_policy_nss_failures(void)
+{
+        char directory[] = "/tmp/dbd-nss-errors-XXXXXX";
+        const char *policies[] = {
+                "<policy user='dbd-test-identity'><deny own='org.example.Forbidden'/></policy>",
+                "<policy group='dbd-test-identity'><deny own='org.example.Forbidden'/></policy>",
+                "<policy context='default'><deny user='dbd-test-identity'/></policy>",
+                "<policy context='default'><deny group='dbd-test-identity'/></policy>",
+        };
+        int errors[] = {EIO, ENOMEM, EPERM, ENOENT, EMFILE, NSS_ERROR_INVALID_DATA, INT_MAX, NSS_ERROR_NOT_FOUND, 0};
+        assert(mkdtemp(directory));
+        char *config_path = path_join(directory, "bus.conf"), *fault_path = path_join(directory, "failure");
+        assert(config_path && fault_path && setenv("DBD_TEST_NSS_FAILURE", fault_path, 1) == 0);
+        for (size_t i = 0; i < sizeof(policies) / sizeof(*policies); ++i) {
+                char *xml = str_printf("<busconfig><policy context='default'><allow own='*'/></policy>%s</busconfig>",
+                                       policies[i]);
+                assert(xml);
+                write_contents(config_path, xml);
+                free(xml);
+                for (size_t j = 0; j < sizeof(errors) / sizeof(*errors); ++j) {
+                        char code[32];
+                        snprintf(code, sizeof(code), "%d", errors[j]);
+                        write_contents(fault_path, code);
+                        LauncherConfig *config = launcher_config_new();
+                        Error *error = NULL;
+                        assert(config);
+                        bool accepted = launcher_config_load(config, config_path, &error);
+                        assert(accepted == (errors[j] == 0 || errors[j] == NSS_ERROR_NOT_FOUND));
+                        if (!accepted)
+                                assert(error && error->code == (errors[j] == INT_MAX ? ENOMEM : errors[j]));
+                        else
+                                assert(!error);
+                        error_free(error);
+                        launcher_config_free(config);
+                }
+        }
+        unsetenv("DBD_TEST_NSS_FAILURE");
+        assert(unlink(config_path) == 0 && unlink(fault_path) == 0 && rmdir(directory) == 0);
+        free(config_path);
+        free(fault_path);
+}
+
+static pid_t activate_and_wait(ServiceManager *manager, const char *path, uint64_t serial, int *status)
+{
+        DBusWriter body = {0};
+        DBusPacket packet = {0};
+        Error *error = NULL;
+        assert(dbus_writer_u64(&body, serial));
+        packet.header.type = DBUS_MESSAGE_SIGNAL;
+        packet.header.path = (char *)path;
+        packet.header.interface = "org.bus1.DBus.Name";
+        packet.header.member = "Activate";
+        packet.header.signature = "t";
+        packet.body = (DBusReader){
+                .bytes = (const uint8_t *)body.bytes.data, .length = body.bytes.len, .little_endian = true};
+        assert(service_manager_handle_packet(manager, &packet, &error));
+        dbus_writer_clear(&body);
+        pid_t pid;
+        do {
+                pid = waitpid(-1, status, 0);
+        } while (pid < 0 && errno == EINTR);
+        return pid;
+}
+
+static void release_service_for_test(ServiceManager *manager, Service *service)
+{
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, sockets) == 0);
+        pid_t child = fork();
+        assert(child >= 0);
+        if (child == 0) {
+                DBusTransport peer;
+                DBusPacket request = {0};
+                DBusWriter response = {0};
+                Error *error = NULL;
+                close(sockets[0]);
+                dbus_transport_init(&peer, sockets[1]);
+                assert(dbus_transport_receive(&peer, &request, &error));
+                assert(request.header.member && strcmp(request.header.member, "Release") == 0);
+                assert(dbus_message_build(&response, DBUS_MESSAGE_METHOD_RETURN, 0, 1, request.header.serial, NULL,
+                                          NULL, NULL, NULL, NULL, NULL, 0, NULL, &error));
+                assert(dbus_transport_send(&peer, &response, NULL, 0, &error));
+                dbus_writer_clear(&response);
+                dbus_packet_clear(&request);
+                dbus_transport_clear(&peer);
+                _exit(0);
+        }
+        close(sockets[1]);
+        Controller controller;
+        Error *error = NULL;
+        controller_init(&controller, sockets[0], NULL, NULL);
+        service_manager_set_controller(manager, &controller, "unix:path=/unused", "session");
+        assert(service_release(manager, service, &error));
+        service_manager_set_controller(manager, NULL, "unix:path=/unused", "session");
+        controller_clear(&controller);
+        int status;
+        assert(waitpid(child, &status, 0) == child && WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+
+static void test_activation_generations(void)
+{
+        char directory[] = "/tmp/dbd-generations-XXXXXX";
+        assert(mkdtemp(directory));
+        char *service_path = path_join(directory, "org.example.Generation.service");
+        assert(service_path);
+        PtrVec dirs;
+        ptr_vec_init(&dirs, NULL);
+        assert(ptr_vec_push(&dirs, directory));
+        /* Both successful and failed exits of an older child must be ignored.
+         * Repeat after replacing the service table and reusing serial 1. */
+        for (unsigned int replace = 0; replace < 3; ++replace) {
+                for (unsigned int fail = 0; fail < 2; ++fail) {
+                        ServiceManager *manager = service_manager_new();
+                        NssCache *nss = nss_cache_new();
+                        Error *error = NULL;
+                        int old_status, new_status, unused;
+                        assert(manager && nss);
+                        write_contents(service_path,
+                                       fail ? "[D-BUS Service]\nName=org.example.Generation\nExec=/bin/false\n"
+                                            : "[D-BUS Service]\nName=org.example.Generation\nExec=/bin/true\n");
+                        assert(service_table_scan(&dirs, nss, true, service_manager_table(manager), &error));
+                        service_manager_set_controller(manager, NULL, "unix:path=/unused", "session");
+                        char *path = str_dup(service_manager_table(manager)->entries[0].key);
+                        assert(path);
+                        pid_t old_pid = activate_and_wait(manager, path, 1, &old_status);
+                        assert(old_pid > 0);
+                        if (replace == 1) {
+                                ServiceTable *replacement = service_table_new();
+                                assert(replacement && service_table_scan(&dirs, nss, true, replacement, &error));
+                                service_manager_take_table(manager, replacement);
+                        }
+                        if (replace == 2)
+                                release_service_for_test(manager, service_manager_table(manager)->entries[0].value);
+                        uint64_t serial = replace ? 1 : 2;
+                        pid_t new_pid = activate_and_wait(manager, path, serial, &new_status);
+                        assert(new_pid > 0);
+                        assert(service_manager_reap(manager, old_pid, old_status));
+                        assert(service_manager_timeout_ms(manager) == -1);
+                        /* A stale failure must not make the current serial start twice. */
+                        errno = 0;
+                        assert(activate_and_wait(manager, path, serial, &unused) == -1 && errno == ECHILD);
+                        assert(service_manager_reap(manager, new_pid, new_status));
+                        if (fail)
+                                assert(service_manager_timeout_ms(manager) == -1);
+                        else
+                                assert(service_manager_timeout_ms(manager) > 0);
+                        service_manager_free(manager);
+                        nss_cache_free(nss);
+                        free(path);
+                }
+        }
+        ptr_vec_clear(&dirs);
+        assert(unlink(service_path) == 0 && rmdir(directory) == 0);
+        free(service_path);
+}
+
 int main(void)
 {
+        test_policy_nss_failures();
+        test_activation_generations();
         test_collections();
         test_watch();
         test_config_nss_and_services();

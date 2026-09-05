@@ -1,7 +1,10 @@
+nss_wrap_args = ['-Wl,--wrap=nss_cache_lookup_uid', '-Wl,--wrap=nss_cache_lookup_gid']
+
 test_native = executable(
   'test-native',
   [
     'test-native.c',
+    'nss-failure-inject.c',
     '../src/util.c',
     '../src/log.c',
     '../src/address.c',
@@ -19,6 +22,7 @@ test_native = executable(
   ],
   dependencies: deps,
   include_directories: [src_inc, root_inc],
+  link_args: nss_wrap_args,
 )
 test('native', test_native)
 
@@ -52,3 +56,24 @@ if pam.found()
     timeout: 30,
   )
 endif
+
+# Fault injection is linked only into this test dispatcher, never the installed one.
+test_nss_dispatcher = executable(
+  'test-nss-dispatcher',
+  dispatcher_sources + files('nss-failure-inject.c'),
+  dependencies: deps,
+  include_directories: [src_inc, root_inc],
+  link_args: nss_wrap_args,
+)
+test_policy_reload = executable(
+  'test-policy-reload',
+  ['test-policy-reload.c', '../src/util.c', '../src/log.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
+  include_directories: src_inc,
+)
+test(
+  'policy-reload',
+  test_policy_reload,
+  args: [test_nss_dispatcher.full_path()],
+  depends: [test_nss_dispatcher],
+  timeout: 30,
+)

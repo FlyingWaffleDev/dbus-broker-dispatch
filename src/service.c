@@ -31,6 +31,7 @@ struct Service {
         uid_t uid;
         gid_t gid;
         uint64_t serial;
+        uint64_t generation;
         bool starting;
         uint64_t activation_deadline_ms;
 };
@@ -38,6 +39,8 @@ struct Service {
 typedef struct Activation {
         ServiceManager *manager;
         Service *service;
+        uint64_t serial;
+        uint64_t generation;
         char *user;
         uid_t uid;
         gid_t gid;
@@ -185,6 +188,8 @@ bool service_register(ServiceManager *manager, Service *service, Error **error)
 
 bool service_release(ServiceManager *manager, Service *service, Error **error)
 {
+        /* Re-registration may reuse the broker serial, including on rollback. */
+        ++service->generation;
         service->activation_deadline_ms = 0;
         service->starting = false;
         return controller_release(manager->controller, service->path, error);
@@ -293,6 +298,7 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
                 return;
         service->starting = true;
         service->serial = serial;
+        ++service->generation;
         service->activation_deadline_ms = 0;
         if (!environment_current(&environment))
                 goto memory;
@@ -308,6 +314,8 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
                 goto memory_environment;
         activation->manager = manager;
         activation->service = service_reference(service);
+        activation->serial = serial;
+        activation->generation = service->generation;
         if (identity) {
                 const gid_t *groups = nss_user_groups(identity, &activation->n_groups);
                 activation->user = str_dup(nss_user_name(identity));
@@ -380,12 +388,24 @@ bool service_manager_reap(ServiceManager *manager, pid_t pid, int status)
         Activation *activation = u32_map_remove(&manager->activations, (uint32_t)pid);
         if (!activation)
                 return false;
+        Service *service = activation->service;
+        /* Child lifetime can extend past name release, another activation, or
+         * replacement of the service definition. Only the matching attempt
+         * may reset the name or install a successful-exit deadline. */
+        if (!service->starting || activation->serial != service->serial ||
+            activation->generation != service->generation || str_map_get(manager->services, service->path) != service) {
+                activation_free(activation);
+                return true;
+        }
         if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
-                reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.UnitFailure");
+                reset_service(manager, service, "org.bus1.DBus.Name.Error.UnitFailure");
         } else {
-                activation->service->activation_deadline_ms = now_monotonic_ms() + 25000;
-                if (!ptr_vec_push(&manager->pending_deadlines, service_reference(activation->service)))
-                        reset_service(manager, activation->service, "org.bus1.DBus.Name.Error.StartupFailure");
+                service->activation_deadline_ms = now_monotonic_ms() + 25000;
+                Service *ref = service_reference(service);
+                if (!ptr_vec_push(&manager->pending_deadlines, ref)) {
+                        service_unref(ref);
+                        reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
+                }
         }
         activation_free(activation);
         return true;

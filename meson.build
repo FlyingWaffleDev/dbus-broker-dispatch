@@ -28,9 +28,7 @@ if get_option('elogind')
 endif
 src_inc = include_directories('src')
 root_inc = include_directories('.')
-dbus_broker_dispatch = executable(
-  'dbus-broker-dispatch',
-  [
+dispatcher_sources = files(
     'src/util.c',
     'src/log.c',
     'src/address.c',
@@ -46,7 +44,10 @@ dbus_broker_dispatch = executable(
     'src/policy-wire.c',
     'src/nss-cache.c',
     'src/service.c',
-  ],
+)
+dbus_broker_dispatch = executable(
+  'dbus-broker-dispatch',
+  dispatcher_sources,
   dependencies: deps,
   include_directories: src_inc,
   install: true,
