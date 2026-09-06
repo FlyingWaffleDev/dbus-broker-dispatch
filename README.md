@@ -9,8 +9,17 @@ manager.
 Service definitions for OpenRC, s6, Dinit, and runit are in [`init`](init/).
 Packagers can install the definitions for their target init system.
 
-This is pre-release software. Test it on a disposable system before replacing
-the system bus or your main desktop session bus.
+This project was developed with substantial AI assistance and is experimental.
+What started as "Hey, I heard AI has gotten good. I wonder if that's actually true.",
+quickly became this fully working product. I have worked to ensure that everything
+is functional even if it is "vibecoded". OpenRC has been tested in a QEMU VM through
+SDDM into KDE. The runit, dinit, and s6 integrations are untested, and have not been
+run through full desktop sessions, but follow upstream documentation and have
+simulated tests. Further testing and security review are welcome; I want to make
+this software actually useful and usable.
+
+For those who want to give it a go, I have made a Gentoo ebuild available in my
+`waffle-builds` overlay, along with a compatibility patched `at-spi2-core`.
 
 ## What it supports
 
@@ -89,6 +98,15 @@ In the foreground the dispatcher writes diagnostics to standard error. In the
 background it writes them to syslog, because standard error is `/dev/null`
 there. Check the system log when a backgrounded dispatcher misbehaves.
 
+Supervisors can pass `--foreground --ready-fd=FD`, where FD is an inherited,
+connected Unix stream socket numbered 3 or higher. The dispatcher sends one
+byte, `R`, after configuring the broker and listener, or `F` on startup failure,
+then closes the descriptor. EOF without `R` also means startup failed.
+The descriptor is not inherited by executed brokers or activated services.
+This private handshake distinguishes the new dispatcher from an existing bus
+at the same public address. The supervisor should enforce its own startup
+deadline.
+
 Starting a second dispatcher on a socket that is already served fails without
 disturbing the running one. The dispatcher removes only the socket and PID file
 it created itself.
@@ -155,5 +173,6 @@ already-configured user supervisor.
   expected replies itself, so there is nothing left for such a rule to match
   narrowly.
 
-The companion overlay still contains placeholder repository URLs. Replace them
-before publishing a release.
+## License
+
+Licensed GPLv3 to match dbus-broker.

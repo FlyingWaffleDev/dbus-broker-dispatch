@@ -73,7 +73,7 @@ int main(int argc, char **argv)
         DBusReader names;
         Error *error = NULL;
         pid_t child;
-        int fd, status;
+        int fd, status, ready_pair[2];
         bool found = false;
 
         assert(argc == 2 && password && mkdtemp(runtime));
@@ -99,13 +99,29 @@ int main(int argc, char **argv)
                         "<allow receive_sender='*'/></policy><policy user='%s'><allow own='*'/></policy></busconfig>",
                         socket_path, runtime, username) >= 0);
         write_contents(config, contents);
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ready_pair) == 0);
         child = fork();
         assert(child >= 0);
         if (child == 0) {
+                close(ready_pair[0]);
+                assert(dup2(ready_pair[1], 3) == 3);
+                assert(fcntl(3, F_SETFD, 0) == 0);
+                if (ready_pair[1] != 3)
+                        close(ready_pair[1]);
                 setenv("XDG_RUNTIME_DIR", runtime, 1);
-                execl(argv[1], argv[1], "--scope=user", "--foreground", "--config-file", config, (char *)NULL);
+                execl(argv[1], argv[1], "--scope=user", "--foreground", "--ready-fd=3", "--config-file", config,
+                      (char *)NULL);
                 _exit(127);
         }
+        close(ready_pair[1]);
+        struct pollfd ready_poll = {.fd = ready_pair[0], .events = POLLIN};
+        char notification;
+        assert(poll(&ready_poll, 1, 5000) > 0);
+        assert(read(ready_pair[0], &notification, 1) == 1 && notification == 'R');
+        /* No broker or activated service may keep this private channel open. */
+        assert(poll(&ready_poll, 1, 1000) > 0);
+        assert(read(ready_pair[0], &notification, 1) == 0);
+        close(ready_pair[0]);
         fd = connect_bus(socket_path);
         assert(fd >= 0);
         dbus_transport_init(&transport, fd);

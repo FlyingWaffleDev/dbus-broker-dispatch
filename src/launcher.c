@@ -534,7 +534,7 @@ static bool bind_listener(Launcher *launcher, Error **error)
                 if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid())
                         return error_set(error, EEXIST, "Refusing to replace non-socket or foreign-owned path %s",
                                          launcher->socket_path);
-                probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+                probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
                 if (probe < 0)
                         return error_set_errno(error, errno, "Cannot create stale-socket probe");
                 if (connect(probe, (struct sockaddr *)&address, sizeof(address)) == 0) {
@@ -790,7 +790,7 @@ static void notify_startup(Launcher *launcher, bool ready)
         char status = ready ? 'R' : 'F';
         if (launcher->startup_fd < 0)
                 return;
-        while (send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL) < 0 && errno == EINTR)
+        while (send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 && errno == EINTR)
                 ;
         close(launcher->startup_fd);
         launcher->startup_fd = -1;
@@ -918,12 +918,14 @@ static void usage(void)
              "  --system-uid-max=N    Highest UID treated as a system user.\n"
              "  --audit               Pass audit capability to dbus-broker.\n"
              "  --foreground          Stay in the foreground.\n"
+             "  --ready-fd=FD         Report R/F on a connected Unix stream socket; requires --foreground.\n"
              "  --help                Show this help text.\n"
              "  --version             Show the version.");
 }
 
 static void launcher_clear(Launcher *launcher)
 {
+        notify_startup(launcher, false);
 #ifdef HAVE_ELOGIND
         event_source_remove(&launcher->console_source);
         if (launcher->console_monitor)
@@ -982,6 +984,7 @@ int main(int argc, char **argv)
                 {"system-uid-max", required_argument, NULL, 'm'},
                 {"audit", no_argument, NULL, 'A'},
                 {"foreground", no_argument, NULL, 'f'},
+                {"ready-fd", required_argument, NULL, 'r'},
                 {"help", no_argument, NULL, 'h'},
                 {"version", no_argument, NULL, 'V'},
                 {NULL, 0, NULL, 0},
@@ -1025,6 +1028,13 @@ int main(int argc, char **argv)
                 case 'f':
                         launcher.daemonize = false;
                         break;
+                case 'r':
+                        if (launcher.startup_fd >= 0 || !parse_u64(optarg, INT_MAX, &parsed) || parsed < 3) {
+                                fputs("Invalid or repeated --ready-fd\n", stderr);
+                                return 2;
+                        }
+                        launcher.startup_fd = (int)parsed;
+                        break;
                 case 'V':
                         printf("dbus-broker-dispatch %s\n", PROJECT_VERSION);
                         return 0;
@@ -1036,6 +1046,20 @@ int main(int argc, char **argv)
         if (!scope_set || optind != argc) {
                 usage();
                 return 2;
+        }
+        if (launcher.startup_fd >= 0) {
+                struct sockaddr_storage peer;
+                socklen_t peer_length = sizeof(peer), type_length = sizeof(int);
+                int type, flags = fcntl(launcher.startup_fd, F_GETFD);
+                if (launcher.daemonize || flags < 0 ||
+                    getsockopt(launcher.startup_fd, SOL_SOCKET, SO_TYPE, &type, &type_length) < 0 ||
+                    type != SOCK_STREAM ||
+                    getpeername(launcher.startup_fd, (struct sockaddr *)&peer, &peer_length) < 0 ||
+                    peer.ss_family != AF_UNIX || fcntl(launcher.startup_fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+                        fputs("--ready-fd requires --foreground and a connected Unix stream socket on fd >= 3\n",
+                              stderr);
+                        return 2;
+                }
         }
         launcher.service_manager = service_manager_new();
         if (!launcher.service_manager) {

@@ -33,6 +33,9 @@ test_session_bus = executable(
 )
 test('session-bus', test_session_bus, args: [dbus_broker_dispatch.full_path()], depends: [dbus_broker_dispatch], timeout: 30)
 
+test_startup = executable('test-startup', 'test-startup.c')
+test('startup', test_startup, args: [dbus_broker_dispatch.full_path()], depends: [dbus_broker_dispatch], timeout: 15)
+
 test_run_session = executable(
   'test-run-session',
   ['test-run-session.c', '../src/address.c', '../src/util.c', '../src/log.c', '../src/dbus-wire.c', '../src/dbus-transport.c'],
@@ -77,3 +80,10 @@ test(
   depends: [test_nss_dispatcher],
   timeout: 30,
 )
+
+# The login profile hooks are shell, not compiled. Exercise them against mock
+# service managers so they never touch the host's buses or init system.
+python = find_program('python3', required: false)
+if python.found()
+  test('init-profile', python, args: [files('test-init-profile.py')], timeout: 120)
+endif
