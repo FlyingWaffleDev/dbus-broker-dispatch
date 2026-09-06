@@ -26,8 +26,8 @@ static void expect_startup_failure(const char *dispatcher, const char *runtime, 
                 if (pair[1] != 3)
                         close(pair[1]);
                 assert(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
-                execl(dispatcher, dispatcher, "--scope=user", "--foreground", "--ready-fd=3", "--config-file",
-                      config, (char *)NULL);
+                execl(dispatcher, dispatcher, "--scope=user", "--foreground", "--ready-fd=3", "--config-file", config,
+                      (char *)NULL);
                 _exit(127);
         }
         close(pair[1]);
@@ -68,9 +68,11 @@ int main(int argc, char **argv)
         expect_startup_failure(argv[1], runtime, config);
         FILE *file = fopen(config, "w");
         assert(file);
-        assert(fprintf(file, "<busconfig><type>session</type><listen>unix:path=%s</listen>"
-                             "<policy context='default'><allow user='*'/><allow own='*'/>"
-                             "<allow send_destination='*'/></policy></busconfig>", address.sun_path) > 0);
+        assert(fprintf(file,
+                       "<busconfig><type>session</type><listen>unix:path=%s</listen>"
+                       "<policy context='default'><allow user='*'/><allow own='*'/>"
+                       "<allow send_destination='*'/></policy></busconfig>",
+                       address.sun_path) > 0);
         assert(fclose(file) == 0);
 
         int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);

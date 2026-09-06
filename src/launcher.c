@@ -976,18 +976,12 @@ int main(int argc, char **argv)
         int option;
         const char *runtime, *configured_address;
         static const struct option options[] = {
-                {"scope", required_argument, NULL, 's'},
-                {"config-file", required_argument, NULL, 'c'},
-                {"address", required_argument, NULL, 'a'},
-                {"broker", required_argument, NULL, 'b'},
-                {"pid-file", required_argument, NULL, 'p'},
-                {"system-uid-max", required_argument, NULL, 'm'},
-                {"audit", no_argument, NULL, 'A'},
-                {"foreground", no_argument, NULL, 'f'},
-                {"ready-fd", required_argument, NULL, 'r'},
-                {"help", no_argument, NULL, 'h'},
-                {"version", no_argument, NULL, 'V'},
-                {NULL, 0, NULL, 0},
+                {"scope", required_argument, NULL, 's'},    {"config-file", required_argument, NULL, 'c'},
+                {"address", required_argument, NULL, 'a'},  {"broker", required_argument, NULL, 'b'},
+                {"pid-file", required_argument, NULL, 'p'}, {"system-uid-max", required_argument, NULL, 'm'},
+                {"audit", no_argument, NULL, 'A'},          {"foreground", no_argument, NULL, 'f'},
+                {"ready-fd", required_argument, NULL, 'r'}, {"help", no_argument, NULL, 'h'},
+                {"version", no_argument, NULL, 'V'},        {NULL, 0, NULL, 0},
         };
         launcher.system_uid_max = 999;
         launcher.daemonize = true;

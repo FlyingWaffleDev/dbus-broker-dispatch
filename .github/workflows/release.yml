@@ -1,0 +1,68 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  dist:
+    name: source tarball
+    runs-on: ubuntu-latest
+    container: docker.io/artixlinux/artixlinux:base
+    permissions:
+      contents: write
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel meson ninja gcc \
+            expat pam elogind dbus dbus-broker python git github-cli
+
+      - name: Provision machine-id
+        run: dbus-uuidgen > /etc/machine-id
+
+      # meson dist archives from git, so it needs the full history rather than
+      # a shallow clone.
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Trust the checkout
+        run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
+
+      - name: Configure
+        run: meson setup build --buildtype=release -Dpam=enabled -Delogind=true
+
+      - name: Check tag against project version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(meson introspect build --projectinfo | python -c 'import json,sys; print(json.load(sys.stdin)["version"])')
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "tag $GITHUB_REF_NAME does not match meson.build version $version" >&2
+            exit 1
+          fi
+
+      # Builds and runs the test suite inside the unpacked tarball, so a release
+      # cannot ship a tree that fails to build from the archive. The tarball is
+      # a git archive: init/ and the PAM module are included, and the s6 and
+      # runit run files keep their executable bit.
+      - name: Build and test the tarball
+        run: meson dist -C build
+
+      - name: Upload tarball artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: build/meson-dist/
+
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            --title "$GITHUB_REF_NAME" \
+            --generate-notes \
+            build/meson-dist/*

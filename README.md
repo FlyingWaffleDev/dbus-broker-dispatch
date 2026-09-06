@@ -1,5 +1,7 @@
 # dbus-broker-dispatch
 
+[![CI](https://github.com/FlyingWaffleDev/dbus-broker-dispatch/actions/workflows/ci.yml/badge.svg)](https://github.com/FlyingWaffleDev/dbus-broker-dispatch/actions/workflows/ci.yml)
+
 `dbus-broker-dispatch` runs [`dbus-broker`](https://github.com/bus1/dbus-broker)
 without systemd. It opens the public Unix socket, starts an unprivileged broker,
 loads standard D-Bus XML policy, activates services, and reloads configuration.
@@ -9,14 +11,17 @@ manager.
 Service definitions for OpenRC, s6, Dinit, and runit are in [`init`](init/).
 Packagers can install the definitions for their target init system.
 
-This project was developed with substantial AI assistance and is experimental.
-What started as "Hey, I heard AI has gotten good. I wonder if that's actually true.",
-quickly became this fully working product. I have worked to ensure that everything
-is functional even if it is "vibecoded". OpenRC has been tested in a QEMU VM through
-SDDM into KDE. The runit, dinit, and s6 integrations are untested, and have not been
-run through full desktop sessions, but follow upstream documentation and have
-simulated tests. Further testing and security review are welcome; I want to make
-this software actually useful and usable.
+This project is experimental and was developed with substantial assistance from 
+AI coding agents. The implementation has been manually reviewed, tested under 
+sanitizers, exercised through automated tests, and is now running as the system 
+and session D-Bus controller on a Gentoo/OpenRC KDE workstation (my desktop PC).
+Independent review, particularly of security-sensitive and compatibility-sensitive 
+behavior, is strongly encouraged. What started as "Hey, I heard AI has gotten good. 
+I wonder if that's actually true.", quickly became this fully working product. 
+From the beginning I have worked to ensure that everything is functional, starting 
+with testing in a QEMU VM from boot, through SDDM, into KDE. The runit, dinit, and 
+s6 integrations are untested, but follow upstream documentation and have simulated 
+tests. I want to make this software actually useful and usable, so please try it out.
 
 For those who want to give it a go, I have made a Gentoo ebuild available in my
 `waffle-builds` overlay, along with a compatibility patched `at-spi2-core`.

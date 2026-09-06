@@ -1,7 +1,7 @@
 #define _GNU_SOURCE
 #include "address.h"
-#include "config-policy.h"
 #include "config-policy-internal.h"
+#include "config-policy.h"
 #include "controller.h"
 #include "dbus-transport.h"
 #include "dbus-wire.h"
@@ -473,11 +473,10 @@ static void test_policy_dedup_and_mandatory(void)
         close(fd);
 
         /* Order 1: Mandatory deny first, Default deny second */
-        const char xml1[] =
-                "<busconfig>"
-                "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
-                "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
-                "</busconfig>";
+        const char xml1[] = "<busconfig>"
+                            "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
+                            "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
+                            "</busconfig>";
         write_contents(path, xml1);
         LauncherConfig *config1 = launcher_config_new();
         Error *error = NULL;
@@ -490,11 +489,10 @@ static void test_policy_dedup_and_mandatory(void)
         launcher_config_free(config1);
 
         /* Order 2: Default deny first, Mandatory deny second */
-        const char xml2[] =
-                "<busconfig>"
-                "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
-                "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
-                "</busconfig>";
+        const char xml2[] = "<busconfig>"
+                            "<policy context='default'><deny own='org.example.Forbidden'/></policy>"
+                            "<policy context='mandatory'><deny own='org.example.Forbidden'/></policy>"
+                            "</busconfig>";
         write_contents(path, xml2);
         LauncherConfig *config2 = launcher_config_new();
         assert(config2 && launcher_config_load(config2, path, &error));

@@ -74,10 +74,9 @@ LauncherConfig *launcher_config_new(void)
         config->active_files = str_map_new(NULL);
         config->selinux_associations = str_map_new(free);
         config->nss = nss_cache_new();
-        if (!config->default_rules || !config->user_rules || !config->group_rules ||
-            !config->at_console_rules || !config->no_console_rules || !config->service_dirs ||
-            !config->watch_paths || !config->active_files || !config->selinux_associations ||
-            !config->nss) {
+        if (!config->default_rules || !config->user_rules || !config->group_rules || !config->at_console_rules ||
+            !config->no_console_rules || !config->service_dirs || !config->watch_paths || !config->active_files ||
+            !config->selinux_associations || !config->nss) {
                 launcher_config_free(config);
                 return NULL;
         }

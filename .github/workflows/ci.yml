@@ -1,0 +1,171 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Artix is Arch without systemd, and it ships the four init systems this
+  # project targets, elogind, and dbus-broker. Running here rather than on a
+  # systemd host is what makes the elogind build testable at all.
+  artix:
+    name: artix (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    container: docker.io/artixlinux/artixlinux:base
+    strategy:
+      fail-fast: false
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      # Must precede checkout: without git in the container, actions/checkout
+      # falls back to a tarball download and leaves no usable repository.
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel meson ninja gcc clang \
+            expat pam elogind dbus dbus-broker python git
+
+      # The dispatcher and dbus-broker both require a machine ID; container
+      # images ship without one.
+      - name: Provision machine-id
+        run: dbus-uuidgen > /etc/machine-id
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: meson setup build --buildtype=debugoptimized --werror -Dpam=enabled -Delogind=true
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Install
+        run: DESTDIR="${PWD}/destdir" meson install -C build
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-artix-${{ matrix.cc }}
+          path: build/meson-logs/
+
+  # Void is non-systemd (runit) and the only such distro packaging libselinux,
+  # so the SELinux path is built and tested here rather than on a systemd host.
+  void:
+    name: selinux + elogind (void)
+    runs-on: ubuntu-latest
+    container: ghcr.io/void-linux/void-glibc:latest
+    # The base image ships no bash, which is the default shell for run steps.
+    defaults:
+      run:
+        shell: sh -e {0}
+    steps:
+      # Must precede checkout: without git in the container, actions/checkout
+      # falls back to a tarball download and leaves no usable repository.
+      # libselinux.pc pulls in libsepol and libpcre2-8, and the init-profile
+      # test needs a real bash, awk, od, and timeout on PATH.
+      - name: Install dependencies
+        run: |
+          xbps-install -Suy xbps
+          xbps-install -Sy \
+            base-devel meson ninja gcc pkg-config \
+            expat-devel pam-devel elogind-devel \
+            libselinux-devel libsepol-devel pcre2-devel \
+            dbus python3 git bash coreutils gawk tar
+
+      # Void packages no dbus-broker, and four tests spawn a real broker.
+      # Pinned to v36 because v37 requires a Rust toolchain to build. Upstream
+      # installs into libexecdir, which is not on PATH, so place the binary
+      # where the dispatcher will find it.
+      - name: Build dbus-broker
+        run: |
+          git clone --depth 1 --branch v36 https://github.com/bus1/dbus-broker.git /tmp/dbus-broker
+          cd /tmp/dbus-broker
+          meson setup build --buildtype=release -Dlauncher=false
+          meson compile -C build
+          install -Dm755 build/src/dbus-broker /usr/bin/dbus-broker
+
+      - name: Provision machine-id
+        run: dbus-uuidgen > /etc/machine-id
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: meson setup build --buildtype=debugoptimized --werror -Dpam=enabled -Dselinux=enabled -Delogind=true
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-void
+          path: build/meson-logs/
+
+  sanitizers:
+    name: asan + ubsan (artix)
+    runs-on: ubuntu-latest
+    container: docker.io/artixlinux/artixlinux:base
+    env:
+      CC: clang
+      # UBSan only warns by default; without halt_on_error a finding would not
+      # fail the job.
+      UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+      ASAN_OPTIONS: detect_leaks=1:abort_on_error=1
+    steps:
+      - name: Install dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            base-devel meson ninja clang compiler-rt \
+            expat pam elogind dbus dbus-broker python git
+
+      - name: Provision machine-id
+        run: dbus-uuidgen > /etc/machine-id
+
+      - uses: actions/checkout@v4
+
+      - name: Configure
+        run: |
+          meson setup build --buildtype=debugoptimized \
+            -Db_sanitize=address,undefined -Db_lundef=false \
+            -Dpam=enabled -Delogind=true
+
+      - name: Compile
+        run: meson compile -C build
+
+      - name: Test
+        run: meson test -C build --print-errorlogs
+
+      - name: Upload test logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: testlog-sanitizers
+          path: build/meson-logs/
+
+  format:
+    name: clang-format
+    runs-on: ubuntu-latest
+    container: docker.io/artixlinux/artixlinux:base
+    steps:
+      - name: Install dependencies
+        run: pacman -Syu --noconfirm --needed clang git
+
+      - uses: actions/checkout@v4
+
+      - name: Check formatting
+        run: clang-format --dry-run -Werror src/*.c src/*.h tests/*.c
