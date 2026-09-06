@@ -11,6 +11,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/un.h>
@@ -62,10 +63,10 @@ static void call_bus(DBusTransport *transport, const char *member, DBusPacket *r
         assert(reply->header.type == DBUS_MESSAGE_METHOD_RETURN);
 }
 
-int main(int argc, char **argv)
+static void test_session_bus(const char *dispatcher, bool foreground, bool keep_umask)
 {
         char runtime[] = "/tmp/dbd-session-XXXXXX";
-        char *config, *socket_path, *contents, *service_path, *command_path, *marker;
+        char *config, *socket_path, *contents, *service_path, *command_path, *marker, *pid_path;
         const char *username;
         struct passwd *password = getpwuid(getuid());
         DBusTransport transport;
@@ -74,9 +75,10 @@ int main(int argc, char **argv)
         Error *error = NULL;
         pid_t child;
         int fd, status, ready_pair[2];
+        unsigned int service_umask;
         bool found = false;
 
-        assert(argc == 2 && password && mkdtemp(runtime));
+        assert(password && mkdtemp(runtime));
         assert(chmod(runtime, 0700) == 0);
         username = password->pw_name;
         assert(asprintf(&config, "%s/session.conf", runtime) >= 0);
@@ -84,8 +86,11 @@ int main(int argc, char **argv)
         assert(asprintf(&service_path, "%s/org.example.NativeActivation.service", runtime) >= 0);
         assert(asprintf(&command_path, "%s/activate", runtime) >= 0);
         assert(asprintf(&marker, "%s/activated", runtime) >= 0);
+        assert(asprintf(&pid_path, "%s/dispatcher.pid", runtime) >= 0);
         char *command_contents;
-        assert(asprintf(&command_contents, "#!/bin/sh\nprintf activated > '%s'\nexit 1\n", marker) >= 0);
+        /* Publish the result only after the service has finished writing it. */
+        assert(asprintf(&command_contents, "#!/bin/sh\numask > '%s.tmp'\nmv '%s.tmp' '%s'\nexit 1\n", marker, marker,
+                        marker) >= 0);
         write_contents(command_path, command_contents);
         assert(chmod(command_path, 0700) == 0);
         char *service_contents;
@@ -94,33 +99,54 @@ int main(int argc, char **argv)
         write_contents(service_path, service_contents);
         assert(asprintf(&contents,
                         "<busconfig><listen>unix:path=%s</listen><type>session</type>"
-                        "<servicedir>%s</servicedir>"
+                        "<servicedir>%s</servicedir>%s%s"
                         "<policy context='default'><allow user='*'/><allow send_destination='org.freedesktop.DBus'/>"
                         "<allow receive_sender='*'/></policy><policy user='%s'><allow own='*'/></policy></busconfig>",
-                        socket_path, runtime, username) >= 0);
+                        socket_path, runtime, keep_umask ? "<keep_umask/>" : "", foreground ? "" : "<fork/>",
+                        username) >= 0);
         write_contents(config, contents);
         assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, ready_pair) == 0);
         child = fork();
         assert(child >= 0);
         if (child == 0) {
+                setenv("XDG_RUNTIME_DIR", runtime, 1);
+                umask(0077);
                 close(ready_pair[0]);
+                if (!foreground) {
+                        close(ready_pair[1]);
+                        execl(dispatcher, dispatcher, "--scope=user", "--pid-file", pid_path, "--config-file", config,
+                              (char *)NULL);
+                        _exit(127);
+                }
                 assert(dup2(ready_pair[1], 3) == 3);
                 assert(fcntl(3, F_SETFD, 0) == 0);
                 if (ready_pair[1] != 3)
                         close(ready_pair[1]);
-                setenv("XDG_RUNTIME_DIR", runtime, 1);
-                execl(argv[1], argv[1], "--scope=user", "--foreground", "--ready-fd=3", "--config-file", config,
+                execl(dispatcher, dispatcher, "--scope=user", "--foreground", "--ready-fd=3", "--config-file", config,
                       (char *)NULL);
                 _exit(127);
         }
         close(ready_pair[1]);
-        struct pollfd ready_poll = {.fd = ready_pair[0], .events = POLLIN};
-        char notification;
-        assert(poll(&ready_poll, 1, 5000) > 0);
-        assert(read(ready_pair[0], &notification, 1) == 1 && notification == 'R');
-        /* No broker or activated service may keep this private channel open. */
-        assert(poll(&ready_poll, 1, 1000) > 0);
-        assert(read(ready_pair[0], &notification, 1) == 0);
+        if (foreground) {
+                struct pollfd ready_poll = {.fd = ready_pair[0], .events = POLLIN};
+                char notification;
+                assert(poll(&ready_poll, 1, 5000) > 0);
+                assert(read(ready_pair[0], &notification, 1) == 1 && notification == 'R');
+                /* No broker or activated service may keep this private channel open. */
+                assert(poll(&ready_poll, 1, 1000) > 0);
+                assert(read(ready_pair[0], &notification, 1) == 0);
+        } else {
+                /* The daemonizing parent exits only once the bus is ready.
+                 * As a subreaper, we can also wait for the daemon at teardown. */
+                while (waitpid(child, &status, 0) < 0 && errno == EINTR)
+                        ;
+                assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+                FILE *pid_file = fopen(pid_path, "r");
+                long pid;
+                assert(pid_file && fscanf(pid_file, "%ld", &pid) == 1 && pid > 0);
+                assert(fclose(pid_file) == 0);
+                child = (pid_t)pid;
+        }
         close(ready_pair[0]);
         fd = connect_bus(socket_path);
         assert(fd >= 0);
@@ -161,6 +187,9 @@ int main(int argc, char **argv)
         while (waitpid(child, &status, 0) < 0 && errno == EINTR)
                 ;
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+        FILE *result = fopen(marker, "r");
+        assert(result && fscanf(result, "%o", &service_umask) == 1);
+        assert(fclose(result) == 0);
         assert(unlink(marker) == 0 && unlink(service_path) == 0 && unlink(command_path) == 0 && unlink(config) == 0);
         assert(rmdir(runtime) == 0);
         free(service_contents);
@@ -171,5 +200,17 @@ int main(int argc, char **argv)
         free(contents);
         free(socket_path);
         free(config);
+        free(pid_path);
+        assert(service_umask == (foreground || keep_umask ? 0077 : 0022));
+}
+
+int main(int argc, char **argv)
+{
+        assert(argc == 2);
+        assert(prctl(PR_SET_CHILD_SUBREAPER, 1) == 0);
+        test_session_bus(argv[1], true, false);
+        test_session_bus(argv[1], true, true);
+        test_session_bus(argv[1], false, false);
+        test_session_bus(argv[1], false, true);
         return 0;
 }

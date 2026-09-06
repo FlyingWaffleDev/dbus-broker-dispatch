@@ -3,7 +3,7 @@
 description="D-Bus system message bus (dbus-broker-dispatch)"
 command="/usr/bin/dbus-broker-dispatch"
 pidfile="/run/dbus/dbus-broker-dispatch.pid"
-command_args="--scope=system --pid-file=${pidfile} ${dbus_dispatch_args}"
+command_args="--scope=system --fork --pid-file=${pidfile} ${dbus_dispatch_args}"
 
 extra_started_commands="reload"
 

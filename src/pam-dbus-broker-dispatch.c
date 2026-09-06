@@ -426,13 +426,14 @@ static void free_environment(char **environment)
 static void child_exec(const Options *options, const struct passwd *entry, const char *pid_path, gid_t *groups,
                        int group_count, char **environment)
 {
-        char *arguments[8];
+        char *arguments[9];
         size_t n = 0;
         sigset_t empty;
         struct sigaction action = {.sa_handler = SIG_DFL};
 
         arguments[n++] = (char *)options->dispatcher;
         arguments[n++] = "--scope=user";
+        arguments[n++] = "--fork";
         arguments[n++] = "--pid-file";
         arguments[n++] = (char *)pid_path;
         if (options->config) {
@@ -449,7 +450,6 @@ static void child_exec(const Options *options, const struct passwd *entry, const
         sigaction(SIGTERM, &action, NULL);
         sigaction(SIGCHLD, &action, NULL);
         sigaction(SIGPIPE, &action, NULL);
-        umask(077);
         if (geteuid() == 0 && (syscall(SYS_setgroups, group_count, groups) < 0 ||
                                syscall(SYS_setresgid, entry->pw_gid, entry->pw_gid, entry->pw_gid) < 0 ||
                                syscall(SYS_setresuid, entry->pw_uid, entry->pw_uid, entry->pw_uid) < 0))

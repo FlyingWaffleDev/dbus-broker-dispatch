@@ -42,16 +42,18 @@ static pam_handle_t *start_pam(const char *directory, const char *runtime)
 int main(int argc, char **argv)
 {
         char runtime[] = "/tmp/dbd-pam-XXXXXX";
-        char *config, *pam_config, *socket_path, *state_path, *contents, *pam_contents, *expected;
+        char *config, *pam_config, *socket_path, *state_path, *contents, *pam_contents, *expected, *pid_path;
         pam_handle_t *first, *second;
+        struct stat pid_stat, state_stat;
         assert(argc == 3 && mkdtemp(runtime));
         assert(chmod(runtime, 0700) == 0);
         assert(asprintf(&config, "%s/session.conf", runtime) >= 0);
         assert(asprintf(&pam_config, "%s/dispatch-test", runtime) >= 0);
         assert(asprintf(&socket_path, "%s/bus", runtime) >= 0);
         assert(asprintf(&state_path, "%s/.dbus-broker-dispatch.pam", runtime) >= 0);
+        assert(asprintf(&pid_path, "%s/dbus-broker-dispatch.pid", runtime) >= 0);
         assert(asprintf(&contents,
-                        "<busconfig><listen>unix:path=%s</listen><policy context='default'>"
+                        "<busconfig><keep_umask/><listen>unix:path=%s</listen><policy context='default'>"
                         "<allow user='*'/><allow send_destination='org.freedesktop.DBus'/>"
                         "<allow receive_sender='*'/></policy></busconfig>",
                         socket_path) >= 0);
@@ -60,7 +62,12 @@ int main(int argc, char **argv)
         write_contents(config, contents);
         write_contents(pam_config, pam_contents);
         first = start_pam(runtime, runtime);
+        mode_t previous_umask = umask(0027);
         assert(pam_open_session(first, 0) == PAM_SUCCESS);
+        assert(umask(previous_umask) == 0027);
+        /* keep_umask must preserve the caller's mask through the PAM child.
+         * PID files request 0644; PAM state files have explicit 0600 modes. */
+        assert(stat(pid_path, &pid_stat) == 0 && stat(state_path, &state_stat) == 0);
         assert(asprintf(&expected, "unix:path=%s", socket_path) >= 0);
         assert(pam_getenv(first, "DBUS_SESSION_BUS_ADDRESS") &&
                strcmp(pam_getenv(first, "DBUS_SESSION_BUS_ADDRESS"), expected) == 0);
@@ -84,5 +91,8 @@ int main(int argc, char **argv)
         free(socket_path);
         free(pam_config);
         free(config);
+        free(pid_path);
+        assert((pid_stat.st_mode & 0777) == 0640);
+        assert((state_stat.st_mode & 0777) == 0600);
         return 0;
 }

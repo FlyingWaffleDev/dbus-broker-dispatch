@@ -53,8 +53,11 @@ struct LauncherConfig {
         char *address;
         char *user;
         char *bus_type;
+        char *pid_file;
         uint64_t priority;
         bool uses_console_policy;
+        bool keep_umask;
+        bool fork;
         uint32_t apparmor_mode;
         uint64_t max_outgoing_bytes;
         uint64_t max_outgoing_fds;

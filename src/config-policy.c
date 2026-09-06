@@ -105,6 +105,7 @@ void launcher_config_free(LauncherConfig *config)
         free(config->address);
         free(config->user);
         free(config->bus_type);
+        free(config->pid_file);
         free(config);
 }
 
@@ -141,6 +142,21 @@ const char *launcher_config_bus_type(LauncherConfig *config)
 bool launcher_config_uses_console_policy(LauncherConfig *config)
 {
         return config->uses_console_policy;
+}
+
+bool launcher_config_keep_umask(LauncherConfig *config)
+{
+        return config->keep_umask;
+}
+
+bool launcher_config_fork(LauncherConfig *config)
+{
+        return config->fork;
+}
+
+const char *launcher_config_pid_file(LauncherConfig *config)
+{
+        return config->pid_file;
 }
 
 uint32_t launcher_config_apparmor_mode(LauncherConfig *config)
@@ -715,6 +731,10 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         parser_warning(state, "ignoring D-Bus policy with unknown context '%s'", context);
                         state->context = POLICY_CONTEXT_NONE;
                 }
+        } else if (str_equal(element, "keep_umask")) {
+                state->config->keep_umask = true;
+        } else if (str_equal(element, "fork")) {
+                state->config->fork = true;
         } else if (str_equal(element, "apparmor")) {
                 const char *mode = attribute(attributes, "mode");
                 if (!mode || str_equal(mode, "enabled"))
@@ -742,7 +762,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 }
         } else if (str_equal(element, "include") || str_equal(element, "includedir") ||
                    str_equal(element, "servicedir") || str_equal(element, "listen") || str_equal(element, "user") ||
-                   str_equal(element, "type")) {
+                   str_equal(element, "type") || str_equal(element, "pidfile")) {
                 state->text_element = element;
                 state->include_ignore_missing = str_equal(attribute(attributes, "ignore_missing"), "yes");
                 state->include_if_selinux = str_equal(attribute(attributes, "if_selinux_enabled"), "yes");
@@ -1012,6 +1032,14 @@ static void parser_end(void *data, const XML_Char *element)
                         if (!state->config->user) {
                                 Error *nomem = NULL;
                                 error_set(&nomem, ENOMEM, "Out of memory setting user");
+                                parser_fail(state, nomem);
+                        }
+                } else if (str_equal(element, "pidfile")) {
+                        free(state->config->pid_file);
+                        state->config->pid_file = str_dup(value);
+                        if (!state->config->pid_file) {
+                                Error *nomem = NULL;
+                                error_set(&nomem, ENOMEM, "Out of memory setting PID file");
                                 parser_fail(state, nomem);
                         }
                 } else if (str_equal(element, "type")) {

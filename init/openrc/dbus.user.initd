@@ -7,7 +7,7 @@ pidfile="${XDG_RUNTIME_DIR}/dbus-broker-dispatch.pid"
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${dbus_socket}"
 
 command="/usr/bin/dbus-broker-dispatch"
-command_args="--scope=user --pid-file=${pidfile}"
+command_args="--scope=user --fork --pid-file=${pidfile}"
 
 extra_started_commands="reload"
 

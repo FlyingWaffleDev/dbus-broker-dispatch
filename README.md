@@ -96,8 +96,10 @@ dbus-broker-dispatch --scope=system --foreground
 dbus-broker-dispatch --scope=user --foreground
 ```
 
-`--scope` is required. Without `--foreground`, the dispatcher forks into the
-background. Use `dbus-broker-dispatch --help` for the full option list.
+`--scope` is required. Backgrounding follows `dbus-daemon`: the dispatcher stays
+in the foreground unless the configuration carries `<fork/>` or `--fork` is
+given, and `--foreground` overrides both. Use `dbus-broker-dispatch --help` for
+the full option list.
 
 In the foreground the dispatcher writes diagnostics to standard error. In the
 background it writes them to syslog, because standard error is `/dev/null`

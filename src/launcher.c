@@ -557,8 +557,8 @@ static bool bind_listener(Launcher *launcher, Error **error)
             listen(launcher->listener_fd, SOMAXCONN) < 0)
                 return error_set_errno(error, errno, "Cannot bind D-Bus listener %s", launcher->socket_path);
         launcher->listener_bound = true;
-        if (!launcher->user && chmod(launcher->socket_path, 0666) < 0)
-                return error_set_errno(error, errno, "Cannot chmod %s", launcher->socket_path);
+        if (chmod(launcher->socket_path, 0777) < 0)
+                log_warning("Cannot set mode 0777 on socket %s: %s", launcher->socket_path, strerror(errno));
         return true;
 }
 
@@ -774,6 +774,8 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
         }
         close(pair[0]);
         launcher->startup_fd = pair[1];
+        if (!launcher_config_keep_umask(launcher->config_state))
+                umask(0022);
         null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (setsid() < 0 || chdir("/") < 0 || null_fd < 0 || dup2(null_fd, 0) < 0 || dup2(null_fd, 1) < 0 ||
             dup2(null_fd, 2) < 0)
@@ -914,10 +916,11 @@ static void usage(void)
              "  --config-file=PATH    D-Bus XML configuration file.\n"
              "  --address=ADDRESS     Public address. Only unix:path= is accepted.\n"
              "  --broker=PATH         dbus-broker executable.\n"
-             "  --pid-file=PATH       Write the dispatcher PID to PATH.\n"
+             "  --pid-file=PATH       Write the dispatcher PID to PATH, overriding <pidfile>.\n"
              "  --system-uid-max=N    Highest UID treated as a system user.\n"
              "  --audit               Pass audit capability to dbus-broker.\n"
-             "  --foreground          Stay in the foreground.\n"
+             "  --foreground          Never daemonize, whatever <fork/> says.\n"
+             "  --fork                Daemonize even without <fork/> in the configuration.\n"
              "  --ready-fd=FD         Report R/F on a connected Unix stream socket; requires --foreground.\n"
              "  --help                Show this help text.\n"
              "  --version             Show the version.");
@@ -971,7 +974,7 @@ int main(int argc, char **argv)
                              .controller.transport.fd = -1,
                              .loop.epoll_fd = -1};
         Error *error = NULL;
-        bool scope_set = false, broker_explicit = false;
+        bool scope_set = false, broker_explicit = false, foreground_flag = false, fork_flag = false;
         uint64_t parsed;
         int option;
         const char *runtime, *configured_address;
@@ -980,11 +983,11 @@ int main(int argc, char **argv)
                 {"address", required_argument, NULL, 'a'},  {"broker", required_argument, NULL, 'b'},
                 {"pid-file", required_argument, NULL, 'p'}, {"system-uid-max", required_argument, NULL, 'm'},
                 {"audit", no_argument, NULL, 'A'},          {"foreground", no_argument, NULL, 'f'},
-                {"ready-fd", required_argument, NULL, 'r'}, {"help", no_argument, NULL, 'h'},
-                {"version", no_argument, NULL, 'V'},        {NULL, 0, NULL, 0},
+                {"fork", no_argument, NULL, 'F'},           {"ready-fd", required_argument, NULL, 'r'},
+                {"help", no_argument, NULL, 'h'},           {"version", no_argument, NULL, 'V'},
+                {NULL, 0, NULL, 0},
         };
         launcher.system_uid_max = 999;
-        launcher.daemonize = true;
         while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
                 switch (option) {
                 case 's':
@@ -1020,7 +1023,10 @@ int main(int argc, char **argv)
                         launcher.audit = true;
                         break;
                 case 'f':
-                        launcher.daemonize = false;
+                        foreground_flag = true;
+                        break;
+                case 'F':
+                        fork_flag = true;
                         break;
                 case 'r':
                         if (launcher.startup_fd >= 0 || !parse_u64(optarg, INT_MAX, &parsed) || parsed < 3) {
@@ -1037,7 +1043,7 @@ int main(int argc, char **argv)
                         return option == 'h' ? 0 : 2;
                 }
         }
-        if (!scope_set || optind != argc) {
+        if (!scope_set || optind != argc || (foreground_flag && fork_flag)) {
                 usage();
                 return 2;
         }
@@ -1045,7 +1051,7 @@ int main(int argc, char **argv)
                 struct sockaddr_storage peer;
                 socklen_t peer_length = sizeof(peer), type_length = sizeof(int);
                 int type, flags = fcntl(launcher.startup_fd, F_GETFD);
-                if (launcher.daemonize || flags < 0 ||
+                if (!foreground_flag || flags < 0 ||
                     getsockopt(launcher.startup_fd, SOL_SOCKET, SO_TYPE, &type, &type_length) < 0 ||
                     type != SOCK_STREAM ||
                     getpeername(launcher.startup_fd, (struct sockaddr *)&peer, &peer_length) < 0 ||
@@ -1092,6 +1098,14 @@ int main(int argc, char **argv)
             !configure_apparmor(launcher.config_state, &error) || !configure_broker_user(&launcher, &error)) {
                 print_error("Invalid D-Bus configuration", error);
                 goto fail;
+        }
+        launcher.daemonize = !foreground_flag && (fork_flag || launcher_config_fork(launcher.config_state));
+        if (!launcher.pid_file && launcher_config_pid_file(launcher.config_state)) {
+                launcher.pid_file = str_dup(launcher_config_pid_file(launcher.config_state));
+                if (!launcher.pid_file) {
+                        fputs("Cannot allocate the configured PID file path\n", stderr);
+                        goto fail;
+                }
         }
         launcher.max_bytes = launcher_config_max_bytes(launcher.config_state);
         launcher.max_fds = launcher_config_max_fds(launcher.config_state);
