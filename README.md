@@ -24,7 +24,7 @@ s6 integrations are untested, but follow upstream documentation and have simulat
 tests. I want to make this software actually useful and usable, so please try it out.
 
 For those who want to give it a go, I have made a Gentoo ebuild available in my
-`waffle-builds` overlay, along with a compatibility patched `at-spi2-core`.
+[`waffle-builds`](https://github.com/FlyingWaffleDev/waffle-builds) overlay, along with a compatibility patched `at-spi2-core`.
 
 ## What it supports
 
