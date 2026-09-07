@@ -109,6 +109,7 @@ bool str_has_prefix(const char *text, const char *prefix);
 bool str_has_suffix(const char *text, const char *suffix);
 char *path_join(const char *left, const char *right);
 char *path_dirname(const char *path);
+/* Lexical normalization only: removes dot components without resolving symlinks. */
 char *path_canonicalize(const char *path, const char *base);
 bool path_is_absolute(const char *path);
 bool read_file(const char *path, char **contents, size_t *length, Error **error);

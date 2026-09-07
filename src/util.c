@@ -627,8 +627,9 @@ char *path_dirname(const char *path)
         char *copy = strdup(path), *slash;
         if (!copy)
                 return NULL;
-        while (*copy && copy[1] && copy[strlen(copy) - 1] == '/')
-                copy[strlen(copy) - 1] = '\0';
+        size_t length = strlen(copy);
+        while (length > 1 && copy[length - 1] == '/')
+                copy[--length] = '\0';
         slash = strrchr(copy, '/');
         if (!slash) {
                 free(copy);
@@ -649,7 +650,7 @@ bool path_is_absolute(const char *path)
 char *path_canonicalize(const char *path, const char *base)
 {
         PtrVec parts;
-        char *absolute, *copy, *save = NULL, *part;
+        char *absolute, *save = NULL, *part;
         StrBuf out = {0};
 
         if (path_is_absolute(path))
@@ -663,23 +664,18 @@ char *path_canonicalize(const char *path, const char *base)
         }
         if (!absolute)
                 return NULL;
-        copy = absolute;
-        ptr_vec_init(&parts, free);
-        for (part = strtok_r(copy, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
+        /* Components borrow storage from absolute until the result is built. */
+        ptr_vec_init(&parts, NULL);
+        for (part = strtok_r(absolute, "/", &save); part; part = strtok_r(NULL, "/", &save)) {
                 if (strcmp(part, ".") == 0 || !*part)
                         continue;
                 if (strcmp(part, "..") == 0) {
                         if (parts.len)
-                                free(ptr_vec_remove(&parts, parts.len - 1));
+                                --parts.len;
                         continue;
                 }
-                char *copy_part = strdup(part);
-                if (!copy_part || !ptr_vec_push(&parts, copy_part)) {
-                        free(copy_part);
-                        ptr_vec_clear(&parts);
-                        free(absolute);
-                        return NULL;
-                }
+                if (!ptr_vec_push(&parts, part))
+                        goto memory;
         }
         if (!str_buf_append(&out, "/"))
                 goto memory;

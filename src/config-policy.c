@@ -6,7 +6,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <expat.h>
-#include <inttypes.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -1222,61 +1221,73 @@ bool launcher_config_load(LauncherConfig *config, const char *path, Error **erro
         return true;
 }
 
-static char *rule_signature(const PolicyRule *rule)
+/* Compare the match and action directly, without allocating a serialized key.
+ * Priority is deliberately separate: equivalent rules can have different
+ * priorities, and only the highest-priority instance should survive. */
+static int compare_rules(const PolicyRule *a, const PolicyRule *b)
 {
-        return str_printf("%u:%u:%u:%s:%s:%s:%s:%u:%u:%" PRIu64 ":%" PRIu64, rule->type, rule->allow, rule->own_prefix,
-                          rule->name ? rule->name : "", rule->path ? rule->path : "",
-                          rule->interface ? rule->interface : "", rule->member ? rule->member : "", rule->message_type,
-                          rule->broadcast, rule->min_fds, rule->max_fds);
+#define COMPARE_FIELD(field)                                                                                           \
+        do {                                                                                                           \
+                if (a->field != b->field)                                                                              \
+                        return (a->field > b->field) - (a->field < b->field);                                          \
+        } while (0)
+        COMPARE_FIELD(type);
+        COMPARE_FIELD(allow);
+        COMPARE_FIELD(own_prefix);
+        COMPARE_FIELD(message_type);
+        COMPARE_FIELD(broadcast);
+        COMPARE_FIELD(min_fds);
+        COMPARE_FIELD(max_fds);
+#undef COMPARE_FIELD
+        const char *left[] = {a->name, a->path, a->interface, a->member};
+        const char *right[] = {b->name, b->path, b->interface, b->member};
+        for (size_t i = 0; i < sizeof(left) / sizeof(left[0]); ++i) {
+                int order = strcmp(left[i] ? left[i] : "", right[i] ? right[i] : "");
+                if (order)
+                        return order;
+        }
+        return 0;
 }
 
 typedef struct {
-        char *signature;
+        const PolicyRule *rule;
         size_t index;
-        uint64_t priority;
-} RuleSignature;
+} RuleEntry;
 
-static int compare_rule_signatures(const void *left, const void *right)
+static int compare_rule_entries(const void *left, const void *right)
 {
-        const RuleSignature *a = left, *b = right;
-        int order = strcmp(a->signature, b->signature);
+        const RuleEntry *a = left, *b = right;
+        int order = compare_rules(a->rule, b->rule);
         if (order)
                 return order;
-        if (a->priority != b->priority)
-                return (a->priority > b->priority) - (a->priority < b->priority);
+        if (a->rule->priority != b->rule->priority)
+                return (a->rule->priority > b->rule->priority) - (a->rule->priority < b->rule->priority);
         return (a->index > b->index) - (a->index < b->index);
 }
 
-/* Keep the highest-priority equivalent rule. Mandatory and default rules share
- * an array, so file order alone does not determine priority.
- *
- * Sorting rather than scanning a linear-probe map keeps this O(n log n); large
- * generated policies made the previous form quadratic. */
+/* Sort references to find duplicates in O(n log n), then compact the original
+ * array without changing the order of surviving rules. Mandatory and default
+ * rules share an array, so file order alone does not determine priority. */
 static void optimize_rule_array(PtrVec *rules)
 {
-        size_t total = rules->len, kept = 0, built = 0;
-        RuleSignature *signatures;
+        size_t total = rules->len, kept = 0;
+        RuleEntry *entries;
         bool *drop;
 
         if (total < 2)
                 return;
-        signatures = calloc(total, sizeof(*signatures));
+        entries = calloc(total, sizeof(*entries));
         drop = calloc(total, sizeof(*drop));
-        if (!signatures || !drop)
-                goto out;
-        for (; built < total; ++built) {
-                signatures[built].signature = rule_signature(rules->items[built]);
-                signatures[built].index = built;
-                signatures[built].priority = ((PolicyRule *)rules->items[built])->priority;
-                if (!signatures[built].signature)
-                        goto out; /* Leave the rules untouched; dedup is optional. */
-        }
-        qsort(signatures, total, sizeof(*signatures), compare_rule_signatures);
-        /* Equal signatures are now adjacent and ordered by priority, so every
-         * entry but the last of each run is redundant. */
+        if (!entries || !drop)
+                goto out; /* Leave the rules untouched; dedup is optional. */
+        for (size_t i = 0; i < total; ++i)
+                entries[i] = (RuleEntry){.rule = rules->items[i], .index = i};
+        qsort(entries, total, sizeof(*entries), compare_rule_entries);
+        /* Equal rules are adjacent and ordered by priority, so every entry
+         * but the last of each run is redundant. */
         for (size_t i = 0; i + 1 < total; ++i)
-                if (strcmp(signatures[i].signature, signatures[i + 1].signature) == 0)
-                        drop[signatures[i].index] = true;
+                if (compare_rules(entries[i].rule, entries[i + 1].rule) == 0)
+                        drop[entries[i].index] = true;
         for (size_t i = 0; i < total; ++i) {
                 if (drop[i])
                         policy_rule_free(rules->items[i]);
@@ -1285,9 +1296,7 @@ static void optimize_rule_array(PtrVec *rules)
         }
         rules->len = kept;
 out:
-        for (size_t i = 0; i < built; ++i)
-                free(signatures[i].signature);
-        free(signatures);
+        free(entries);
         free(drop);
 }
 
@@ -1300,15 +1309,17 @@ static void optimize_rule_table(U32Map *table)
 static void optimize_strings(PtrVec *strings)
 {
         StrMap seen;
+        size_t kept = 0;
         str_map_init(&seen, NULL);
-        for (size_t index = 0; index < strings->len;) {
-                const char *value = strings->items[index];
+        for (size_t i = 0; i < strings->len; ++i) {
+                char *value = strings->items[i];
                 if (str_map_contains(&seen, value))
-                        ptr_vec_delete(strings, index);
+                        free(value);
                 else {
                         str_map_set(&seen, value, NULL);
-                        ++index;
+                        strings->items[kept++] = value;
                 }
         }
+        strings->len = kept;
         str_map_clear(&seen);
 }
