@@ -58,6 +58,7 @@ struct LauncherConfig {
         bool uses_console_policy;
         bool keep_umask;
         bool fork;
+        bool syslog;
         uint32_t apparmor_mode;
         uint64_t max_outgoing_bytes;
         uint64_t max_outgoing_fds;

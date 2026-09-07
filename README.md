@@ -103,7 +103,11 @@ the full option list.
 
 In the foreground the dispatcher writes diagnostics to standard error. In the
 background it writes them to syslog, because standard error is `/dev/null`
-there. Check the system log when a backgrounded dispatcher misbehaves.
+there; `<syslog/>` selects syslog in the foreground too. Check the system log
+when a backgrounded dispatcher misbehaves.
+
+dbus-broker's own messages, including policy denials, are re-emitted through the
+same logging, prefixed with `dbus-broker:`.
 
 Supervisors can pass `--foreground --ready-fd=FD`, where FD is an inherited,
 connected Unix stream socket numbered 3 or higher. The dispatcher sends one

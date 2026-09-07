@@ -18,6 +18,7 @@ const char *launcher_config_bus_type(LauncherConfig *config);
 bool launcher_config_uses_console_policy(LauncherConfig *config);
 bool launcher_config_keep_umask(LauncherConfig *config);
 bool launcher_config_fork(LauncherConfig *config);
+bool launcher_config_syslog(LauncherConfig *config);
 const char *launcher_config_pid_file(LauncherConfig *config);
 uint32_t launcher_config_apparmor_mode(LauncherConfig *config);
 void launcher_config_set_apparmor_mode(LauncherConfig *config, uint32_t mode);

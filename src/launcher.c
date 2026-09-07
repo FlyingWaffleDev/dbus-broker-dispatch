@@ -38,8 +38,11 @@
 
 typedef struct Launcher Launcher;
 
+#define BROKER_LOG_LINE_MAX 4096
+
 typedef struct BrokerChild {
         int fd;
+        int log_fd;
         uid_t uid;
         gid_t gid;
         bool drop_privileges;
@@ -65,7 +68,11 @@ struct Launcher {
          * the blocking controller calls it makes. */
         bool reload_pending, reloading;
         U32Vec reload_serials;
-        EventSource signal_source, controller_source, watch_source, watch_timer_source;
+        EventSource signal_source, controller_source, watch_source, watch_timer_source, broker_log_source;
+        /* dbus-broker writes "<priority>message\n" to this socket. Partial
+         * reads are normal, so completed lines are cut out of this buffer. */
+        int broker_log_fd;
+        StrBuf broker_log;
         Controller controller;
         ServiceManager *service_manager;
         PtrVec *service_dirs;
@@ -562,6 +569,124 @@ static bool bind_listener(Launcher *launcher, Error **error)
         return true;
 }
 
+/* Move @fd out of the 3..4 range the broker expects its own descriptors on. */
+static bool vacate_fd(int *fd)
+{
+        int moved;
+        if (*fd < 3 || *fd > 4)
+                return true;
+        moved = fcntl(*fd, F_DUPFD_CLOEXEC, 5);
+        if (moved < 0)
+                return false;
+        close(*fd);
+        *fd = moved;
+        return true;
+}
+
+static void broker_log_close(Launcher *launcher)
+{
+        if (launcher->broker_log_fd < 0)
+                return;
+        event_source_remove(&launcher->broker_log_source);
+        close(launcher->broker_log_fd);
+        launcher->broker_log_fd = -1;
+}
+
+/* dbus-broker prefixes each line with a full syslog priority in angle brackets,
+ * the same convention as kmsg: LOG_MAKEPRI(facility, severity), defaulting the
+ * facility to LOG_DAEMON. Only the severity is forwarded, because our own
+ * openlog() already selected the facility. Unprefixed output goes out at
+ * LOG_INFO unchanged. */
+static void emit_broker_line(char *line)
+{
+        int priority = LOG_INFO;
+        char *message = line, *end;
+        if (*line == '<') {
+                long parsed = strtol(line + 1, &end, 10);
+                if (end != line + 1 && *end == '>' && parsed >= 0 && parsed <= (LOG_FACMASK | LOG_PRIMASK)) {
+                        priority = LOG_PRI(parsed);
+                        message = end + 1;
+                }
+        }
+        if (*message)
+                log_message(priority, "dbus-broker: %s", message);
+}
+
+/* Emit every complete line held in the buffer, keeping any partial tail. */
+static void emit_broker_lines(Launcher *launcher)
+{
+        for (;;) {
+                char *newline = memchr(launcher->broker_log.data, '\n', launcher->broker_log.len);
+                size_t consumed;
+                if (!newline) {
+                        /* Never let a broker that emits no newline grow this
+                         * buffer without bound. */
+                        if (launcher->broker_log.len >= BROKER_LOG_LINE_MAX) {
+                                launcher->broker_log.data[launcher->broker_log.len] = 0;
+                                emit_broker_line(launcher->broker_log.data);
+                                launcher->broker_log.len = 0;
+                        }
+                        return;
+                }
+                *newline = 0;
+                emit_broker_line(launcher->broker_log.data);
+                consumed = (size_t)(newline - launcher->broker_log.data) + 1;
+                launcher->broker_log.len -= consumed;
+                memmove(launcher->broker_log.data, newline + 1, launcher->broker_log.len);
+                launcher->broker_log.data[launcher->broker_log.len] = 0;
+        }
+}
+
+/* Read whatever the broker has queued. Returns false once its end is gone. */
+static bool broker_log_consume(Launcher *launcher)
+{
+        char chunk[1024];
+        ssize_t n;
+
+        for (;;) {
+                n = read(launcher->broker_log_fd, chunk, sizeof(chunk));
+                if (n < 0 && errno == EINTR)
+                        continue;
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+                        return true;
+                if (n <= 0)
+                        return false;
+                if (!str_buf_append_n(&launcher->broker_log, chunk, (size_t)n)) {
+                        launcher->broker_log.len = 0;
+                        log_warning("Dropped dbus-broker log output: out of memory");
+                        continue;
+                }
+                emit_broker_lines(launcher);
+        }
+}
+
+static bool broker_log_event(EventSource *source, uint32_t events, void *data, Error **error)
+{
+        Launcher *launcher = data;
+
+        (void)source;
+        (void)events;
+        (void)error;
+        /* The broker closed its end or the socket failed; the SIGCHLD handler
+         * reports the exit itself. */
+        if (!broker_log_consume(launcher))
+                broker_log_close(launcher);
+        return true;
+}
+
+static void broker_log_finish(Launcher *launcher)
+{
+        if (launcher->broker_log_fd < 0)
+                return;
+        broker_log_consume(launcher);
+        if (launcher->broker_log.len) {
+                launcher->broker_log.data[launcher->broker_log.len] = 0;
+                emit_broker_line(launcher->broker_log.data);
+                launcher->broker_log.len = 0;
+        }
+        broker_log_close(launcher);
+}
+
 static bool broker_child_setup(void *data, int *error_number)
 {
         BrokerChild *child = data;
@@ -574,11 +699,17 @@ static bool broker_child_setup(void *data, int *error_number)
         sigemptyset(&empty);
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
                 goto fail;
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || (child->fd != 3 && dup2(child->fd, 3) < 0) ||
-            (child->fd == 3 && fcntl(3, F_SETFD, 0) < 0) || getppid() != parent)
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent)
                 goto fail;
-        if (child->fd != 3)
-                close(child->fd);
+        /* The controller and log descriptors both have to land on fixed
+         * numbers, so vacate that range before either dup2() runs; otherwise
+         * one of them could clobber the other's source. */
+        if (!vacate_fd(&child->fd) || !vacate_fd(&child->log_fd))
+                goto fail;
+        if (dup2(child->fd, 3) < 0 || dup2(child->log_fd, 4) < 0)
+                goto fail;
+        close(child->fd);
+        close(child->log_fd);
         if (child->drop_privileges) {
                 struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
                 struct __user_cap_data_struct capabilities[_LINUX_CAPABILITY_U32S_3] = {0};
@@ -631,13 +762,30 @@ static char *read_machine_id(Error **error)
 
 static bool start_broker(Launcher *launcher, Error **error)
 {
-        int pair[2];
+        int pair[2], log_pair[2];
         char *machine = NULL, *machine_arg = NULL, *bytes = NULL, *fds = NULL, *matches = NULL;
-        char *arguments[8];
+        char *arguments[9];
         BrokerChild child;
         ProcessSpec spec;
         if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
                 return error_set_errno(error, errno, "Cannot create controller socketpair");
+        /* A stream socket puts dbus-broker in its stderr log mode, which emits
+         * plain lines. Without a --log argument it discards its diagnostics,
+         * including policy denials. */
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, log_pair) < 0) {
+                int saved = errno;
+                close(pair[0]);
+                close(pair[1]);
+                return error_set_errno(error, saved, "Cannot create broker log socketpair");
+        }
+        if (fcntl(log_pair[0], F_SETFL, fcntl(log_pair[0], F_GETFL, 0) | O_NONBLOCK) < 0) {
+                int saved = errno;
+                close(pair[0]);
+                close(pair[1]);
+                close(log_pair[0]);
+                close(log_pair[1]);
+                return error_set_errno(error, saved, "Cannot configure broker log socket");
+        }
         /* Only our end becomes non-blocking; the broker inherits pair[1] as-is.
          * Without this the transport's poll timeouts can never fire and any
          * stalled controller exchange would hang the dispatcher forever. */
@@ -664,9 +812,11 @@ static bool start_broker(Launcher *launcher, Error **error)
         arguments[3] = bytes;
         arguments[4] = fds;
         arguments[5] = matches;
-        arguments[6] = launcher->audit ? "--audit" : NULL;
-        arguments[7] = NULL;
+        arguments[6] = "--log=4";
+        arguments[7] = launcher->audit ? "--audit" : NULL;
+        arguments[8] = NULL;
         child = (BrokerChild){.fd = pair[1],
+                              .log_fd = log_pair[1],
                               .uid = launcher->broker_uid,
                               .gid = launcher->broker_gid,
                               .drop_privileges = launcher->drop_broker_privileges,
@@ -675,6 +825,14 @@ static bool start_broker(Launcher *launcher, Error **error)
         if (!process_spawn(&spec, &launcher->broker_pid, error))
                 goto fail;
         close(pair[1]);
+        close(log_pair[1]);
+        launcher->broker_log_fd = log_pair[0];
+        if (!event_source_add(&launcher->loop, &launcher->broker_log_source, launcher->broker_log_fd, EPOLLIN,
+                              broker_log_event, launcher, error)) {
+                close(launcher->broker_log_fd);
+                launcher->broker_log_fd = -1;
+                goto fail_spawned;
+        }
         controller_init(&launcher->controller, pair[0], controller_packet, launcher);
         if (!controller_authenticate(&launcher->controller, geteuid(), error)) {
                 kill(launcher->broker_pid, SIGTERM);
@@ -682,6 +840,7 @@ static bool start_broker(Launcher *launcher, Error **error)
                         ;
                 launcher->broker_pid = 0;
                 controller_clear(&launcher->controller);
+                broker_log_close(launcher);
                 goto fail_controller;
         }
         free(machine);
@@ -690,9 +849,18 @@ static bool start_broker(Launcher *launcher, Error **error)
         free(fds);
         free(matches);
         return true;
+fail_spawned:
+        kill(launcher->broker_pid, SIGTERM);
+        while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
+                ;
+        launcher->broker_pid = 0;
+        close(pair[0]);
+        goto fail_controller;
 fail:
         close(pair[0]);
         close(pair[1]);
+        close(log_pair[0]);
+        close(log_pair[1]);
 fail_controller:
         free(machine);
         free(machine_arg);
@@ -949,6 +1117,9 @@ static void launcher_clear(Launcher *launcher)
                 while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
                         ;
         }
+        /* Only now, so the broker's own exit diagnostics are not cut off. */
+        broker_log_finish(launcher);
+        str_buf_clear(&launcher->broker_log);
         if (launcher->listener_bound && launcher->socket_path)
                 unlink(launcher->socket_path);
         if (launcher->pid_file_written && launcher->pid_file)
@@ -971,6 +1142,7 @@ int main(int argc, char **argv)
         Launcher launcher = {.startup_fd = -1,
                              .listener_fd = -1,
                              .signal_fd = -1,
+                             .broker_log_fd = -1,
                              .controller.transport.fd = -1,
                              .loop.epoll_fd = -1};
         Error *error = NULL;
@@ -1106,6 +1278,10 @@ int main(int argc, char **argv)
                 goto fail;
         }
         launcher.daemonize = !foreground_flag && (fork_flag || launcher_config_fork(launcher.config_state));
+        /* <syslog/> asks for syslog even in the foreground; daemonizing forces
+         * it regardless, because stderr becomes /dev/null there. */
+        if (launcher_config_syslog(launcher.config_state))
+                log_use_syslog("dbus-broker-dispatch");
         if (!launcher.pid_file && launcher_config_pid_file(launcher.config_state)) {
                 launcher.pid_file = str_dup(launcher_config_pid_file(launcher.config_state));
                 if (!launcher.pid_file) {

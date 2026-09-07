@@ -23,10 +23,28 @@ configuration ships `<fork/>` and the stock session configuration does not, so
 launchers that need a background session bus pass `--fork` explicitly; the PAM
 module and the OpenRC services do.
 
-`<syslog/>` is ignored: the dispatcher switches to syslog whenever it
-daemonizes, since standard error is `/dev/null` from that point. `<auth>` and
-`<servicehelper>` are also ignored, matching dbus-broker-launch; dbus-broker
-only speaks EXTERNAL, and activation drops privileges in-process.
+`<syslog/>` sends diagnostics to syslog even in the foreground. Daemonizing
+implies it, because standard error is `/dev/null` from that point. Warnings
+raised while the configuration is still being parsed necessarily predate the
+switch and go to standard error, as they do for `dbus-daemon`.
+
+`<auth>` and `<servicehelper>` cannot be honoured, so each one now warns instead
+of being silently dropped. dbus-broker implements only the EXTERNAL mechanism
+and rejects the rest during SASL, and activation changes user in the forked
+child rather than execing a setuid helper.
+
+## Broker diagnostics
+
+dbus-broker is started with `--log` on a stream socket, which selects its
+plain-line log mode; the dispatcher reads that socket and re-emits each line
+through its own logging, so policy denials and SASL violations reach standard
+error or syslog with everything else. Without this the broker gets no log
+descriptor at all and discards its diagnostics.
+
+dbus-broker-launch instead connects the broker to `/run/systemd/journal/socket`
+and fails to start when that socket is absent, so it offers no usable model
+here. The broker prefixes each line with `LOG_MAKEPRI(facility, severity)`; the
+dispatcher forwards the severity and applies its own facility.
 
 ## Activation umask
 

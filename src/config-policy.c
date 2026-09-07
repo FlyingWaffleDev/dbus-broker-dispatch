@@ -154,6 +154,11 @@ bool launcher_config_fork(LauncherConfig *config)
         return config->fork;
 }
 
+bool launcher_config_syslog(LauncherConfig *config)
+{
+        return config->syslog;
+}
+
 const char *launcher_config_pid_file(LauncherConfig *config)
 {
         return config->pid_file;
@@ -735,6 +740,8 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 state->config->keep_umask = true;
         } else if (str_equal(element, "fork")) {
                 state->config->fork = true;
+        } else if (str_equal(element, "syslog")) {
+                state->config->syslog = true;
         } else if (str_equal(element, "apparmor")) {
                 const char *mode = attribute(attributes, "mode");
                 if (!mode || str_equal(mode, "enabled"))
@@ -762,7 +769,8 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 }
         } else if (str_equal(element, "include") || str_equal(element, "includedir") ||
                    str_equal(element, "servicedir") || str_equal(element, "listen") || str_equal(element, "user") ||
-                   str_equal(element, "type") || str_equal(element, "pidfile")) {
+                   str_equal(element, "type") || str_equal(element, "pidfile") || str_equal(element, "auth") ||
+                   str_equal(element, "servicehelper")) {
                 state->text_element = element;
                 state->include_ignore_missing = str_equal(attribute(attributes, "ignore_missing"), "yes");
                 state->include_if_selinux = str_equal(attribute(attributes, "if_selinux_enabled"), "yes");
@@ -1034,6 +1042,20 @@ static void parser_end(void *data, const XML_Char *element)
                                 error_set(&nomem, ENOMEM, "Out of memory setting user");
                                 parser_fail(state, nomem);
                         }
+                } else if (str_equal(element, "auth")) {
+                        /* dbus-broker only implements EXTERNAL and rejects
+                         * every other mechanism during SASL. A config naming
+                         * something else does not get what it asked for. */
+                        if (!str_equal(value, "EXTERNAL"))
+                                parser_warning(state, "ignoring <auth>%s</auth>; dbus-broker only implements EXTERNAL",
+                                               value);
+                } else if (str_equal(element, "servicehelper")) {
+                        /* Activation switches user in the forked child rather
+                         * than execing a setuid helper, so the path is unused. */
+                        parser_warning(state,
+                                       "ignoring <servicehelper>%s</servicehelper>; the dispatcher changes user "
+                                       "in-process when activating services",
+                                       value);
                 } else if (str_equal(element, "pidfile")) {
                         free(state->config->pid_file);
                         state->config->pid_file = str_dup(value);
