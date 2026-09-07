@@ -121,6 +121,10 @@ static bool rebuild(Watch *watch, Error **error)
                                 entry->filter = strdup(slash + 1);
                         free(parent);
                 }
+                if (!ptr_vec_push(&entries, entry)) {
+                        entry_free(entry);
+                        goto memory;
+                }
                 entry->descriptor =
                         inotify_add_watch(watch->inotify_fd, entry->monitored,
                                           IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
@@ -128,13 +132,8 @@ static bool rebuild(Watch *watch, Error **error)
                 if (entry->descriptor < 0) {
                         int saved = errno;
                         error_set_errno(error, saved, "Cannot monitor %s", entry->target);
-                        entry_free(entry);
                         discard_entries(watch, &entries);
                         return false;
-                }
-                if (!ptr_vec_push(&entries, entry)) {
-                        entry_free(entry);
-                        goto memory;
                 }
         }
         watch->entries = entries;
@@ -184,6 +183,22 @@ void watch_free(Watch *watch)
         free(watch);
 }
 
+/* Takes ownership of path, including on failure. */
+static bool add_target(PtrVec *targets, StrMap *seen, char *path)
+{
+        if (!path)
+                return false;
+        if (str_map_contains(seen, path)) {
+                free(path);
+                return true;
+        }
+        if (!str_map_set(seen, path, NULL) || !ptr_vec_push(targets, path)) {
+                free(path);
+                return false;
+        }
+        return true;
+}
+
 bool watch_set_paths(Watch *watch, const PtrVec *paths, Error **error)
 {
         PtrVec candidate;
@@ -192,25 +207,19 @@ bool watch_set_paths(Watch *watch, const PtrVec *paths, Error **error)
         str_map_init(&seen, NULL);
         for (size_t i = 0; i < paths->len; ++i) {
                 const char *path = paths->items[i];
-                char *canonical;
-                if (!path_is_absolute(path) || str_map_contains(&seen, path))
+                if (!path_is_absolute(path))
                         continue;
-                canonical = path_canonicalize(path, NULL);
-                if (!canonical) {
-                        ptr_vec_clear(&candidate);
-                        str_map_clear(&seen);
-                        return error_set(error, ENOMEM, "Cannot allocate file-watch paths");
-                }
-                if (!ptr_vec_push(&candidate, canonical)) {
-                        free(canonical);
-                        ptr_vec_clear(&candidate);
-                        str_map_clear(&seen);
-                        return error_set(error, ENOMEM, "Cannot allocate file-watch paths");
-                }
-                if (!str_map_set(&seen, path, NULL)) {
-                        ptr_vec_clear(&candidate);
-                        str_map_clear(&seen);
-                        return error_set(error, ENOMEM, "Cannot allocate file-watch paths");
+                if (!add_target(&candidate, &seen, path_canonicalize(path, NULL)))
+                        goto memory;
+                /* Watch both a symlink's directory entry and its destination.
+                 * Watching only the link misses edits through the real path. */
+                errno = 0;
+                char *resolved = realpath(path, NULL);
+                if (resolved) {
+                        if (!add_target(&candidate, &seen, resolved))
+                                goto memory;
+                } else if (errno == ENOMEM) {
+                        goto memory;
                 }
         }
         str_map_clear(&seen);
@@ -224,6 +233,10 @@ bool watch_set_paths(Watch *watch, const PtrVec *paths, Error **error)
         }
         ptr_vec_clear(&previous);
         return true;
+memory:
+        ptr_vec_clear(&candidate);
+        str_map_clear(&seen);
+        return error_set(error, ENOMEM, "Cannot allocate file-watch paths");
 }
 
 int watch_inotify_fd(const Watch *watch)

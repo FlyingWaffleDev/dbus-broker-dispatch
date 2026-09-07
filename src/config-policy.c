@@ -732,6 +732,9 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 } else if (at_console && str_equal(at_console, "false")) {
                         state->context = POLICY_CONTEXT_NO_CONSOLE;
                         state->config->uses_console_policy = true;
+                } else if (at_console) {
+                        parser_warning(state, "ignoring D-Bus policy with invalid at_console value '%s'", at_console);
+                        state->context = POLICY_CONTEXT_NONE;
                 } else if (context && !str_equal(context, "default")) {
                         parser_warning(state, "ignoring D-Bus policy with unknown context '%s'", context);
                         state->context = POLICY_CONTEXT_NONE;
@@ -1154,7 +1157,7 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
         state.text = calloc(1, sizeof(*state.text));
         state.elements = ptr_vec_new(free);
         parser = XML_ParserCreate(NULL);
-        if (!state.text || !state.elements || !parser) {
+        if (!state.base_dir || !state.text || !state.elements || !parser) {
                 error_set(error, ENOMEM, "%s: cannot allocate XML parser", canonical);
                 if (state.text) {
                         str_buf_clear(state.text);

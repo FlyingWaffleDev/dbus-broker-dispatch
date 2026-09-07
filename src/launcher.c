@@ -47,6 +47,7 @@ typedef struct BrokerChild {
         gid_t gid;
         bool drop_privileges;
         bool retain_audit;
+        pid_t parent;
 } BrokerChild;
 
 struct Launcher {
@@ -340,6 +341,7 @@ static bool reload_config(Launcher *launcher, Error **error)
         Watch *candidate_watch = NULL;
         PtrVec *paths = NULL;
         PtrVec released, added;
+        size_t n_released = 0, n_added = 0;
         bool success = false;
         ptr_vec_init(&released, NULL);
         ptr_vec_init(&added, NULL);
@@ -383,25 +385,28 @@ static bool reload_config(Launcher *launcher, Error **error)
         for (size_t i = 0; i < current->len; ++i) {
                 Service *replacement = str_map_get(candidate_services, current->entries[i].key);
                 if (!replacement || !service_equal(current->entries[i].value, replacement)) {
-                        if (!service_release(launcher->service_manager, current->entries[i].value, error))
-                                goto rollback;
                         if (!ptr_vec_push(&released, current->entries[i].value)) {
                                 error_set(error, ENOMEM, "Out of memory tracking released service");
-                                goto rollback;
+                                goto out;
                         }
                 }
         }
         for (size_t i = 0; i < candidate_services->len; ++i) {
                 Service *previous = str_map_get(current, candidate_services->entries[i].key);
                 if (!previous || !service_equal(previous, candidate_services->entries[i].value)) {
-                        if (!service_register(launcher->service_manager, candidate_services->entries[i].value, error))
-                                goto rollback;
                         if (!ptr_vec_push(&added, candidate_services->entries[i].value)) {
                                 error_set(error, ENOMEM, "Out of memory tracking added service");
-                                goto rollback;
+                                goto out;
                         }
                 }
         }
+        /* Allocate the complete rollback plan before changing broker state. */
+        for (; n_released < released.len; ++n_released)
+                if (!service_release(launcher->service_manager, released.items[n_released], error))
+                        goto rollback;
+        for (; n_added < added.len; ++n_added)
+                if (!service_register(launcher->service_manager, added.items[n_added], error))
+                        goto rollback;
         if (!set_policy(launcher, candidate, error))
                 goto rollback;
         launcher_config_free(launcher->config_state);
@@ -430,12 +435,12 @@ static bool reload_config(Launcher *launcher, Error **error)
         }
         goto out;
 rollback:
-        for (size_t i = added.len; i > 0; --i) {
+        for (size_t i = n_added; i > 0; --i) {
                 Error *ignored = NULL;
                 service_release(launcher->service_manager, added.items[i - 1], &ignored);
                 error_free(ignored);
         }
-        for (size_t i = 0; i < released.len; ++i) {
+        for (size_t i = 0; i < n_released; ++i) {
                 Error *ignored = NULL;
                 service_register(launcher->service_manager, released.items[i], &ignored);
                 error_free(ignored);
@@ -691,15 +696,12 @@ static bool broker_child_setup(void *data, int *error_number)
 {
         BrokerChild *child = data;
         bool keep_audit = false;
-        pid_t parent = getppid();
         sigset_t empty;
         /* The dispatcher blocks its event-loop signals and the mask survives
          * execve. Leaving it set would, among other things, make the
          * PR_SET_PDEATHSIG below undeliverable. */
         sigemptyset(&empty);
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
-                goto fail;
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent)
                 goto fail;
         /* The controller and log descriptors both have to land on fixed
          * numbers, so vacate that range before either dup2() runs; otherwise
@@ -732,6 +734,10 @@ static bool broker_child_setup(void *data, int *error_number)
                                 goto fail;
                 }
         }
+        /* Changing credentials clears PDEATHSIG. Arm it after the drop and
+         * compare against the PID captured before fork. */
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != child->parent)
+                goto fail;
         return true;
 fail:
         *error_number = errno ? errno : EPERM;
@@ -793,6 +799,8 @@ static bool start_broker(Launcher *launcher, Error **error)
                 int saved = errno;
                 close(pair[0]);
                 close(pair[1]);
+                close(log_pair[0]);
+                close(log_pair[1]);
                 return error_set_errno(error, saved, "Cannot configure controller socket");
         }
         machine = read_machine_id(error);
@@ -815,7 +823,8 @@ static bool start_broker(Launcher *launcher, Error **error)
         arguments[6] = "--log=4";
         arguments[7] = launcher->audit ? "--audit" : NULL;
         arguments[8] = NULL;
-        child = (BrokerChild){.fd = pair[1],
+        child = (BrokerChild){.parent = getpid(),
+                              .fd = pair[1],
                               .log_fd = log_pair[1],
                               .uid = launcher->broker_uid,
                               .gid = launcher->broker_gid,

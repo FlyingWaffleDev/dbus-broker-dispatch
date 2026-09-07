@@ -297,7 +297,11 @@ bool str_map_contains(const StrMap *map, const char *key)
 
 static bool str_map_rehash(StrMap *map, size_t new_n_buckets)
 {
-        size_t *new_buckets = malloc(new_n_buckets * sizeof(size_t));
+        /* Removal moves entries before rehashing, so reuse the buckets and
+         * rebuild without an allocation that could fail. */
+        if (new_n_buckets > SIZE_MAX / sizeof(size_t))
+                return false;
+        size_t *new_buckets = new_n_buckets == map->n_buckets ? map->buckets : malloc(new_n_buckets * sizeof(size_t));
         if (!new_buckets)
                 return false;
         for (size_t i = 0; i < new_n_buckets; ++i)
@@ -313,7 +317,8 @@ static bool str_map_rehash(StrMap *map, size_t new_n_buckets)
                         }
                 }
         }
-        free(map->buckets);
+        if (new_buckets != map->buckets)
+                free(map->buckets);
         map->buckets = new_buckets;
         map->n_buckets = new_n_buckets;
         return true;
@@ -332,7 +337,8 @@ bool str_map_set(StrMap *map, const char *key, void *value)
         }
         if (map->len >= map->n_buckets / 2) {
                 size_t next_buckets = map->n_buckets ? map->n_buckets * 2 : 16;
-                str_map_rehash(map, next_buckets);
+                if (next_buckets < map->n_buckets || !str_map_rehash(map, next_buckets))
+                        return false;
         }
         copy = strdup(key);
         if (!copy)
@@ -452,7 +458,11 @@ bool u32_map_contains(const U32Map *map, uint32_t key)
 
 static bool u32_map_rehash(U32Map *map, size_t new_n_buckets)
 {
-        size_t *new_buckets = malloc(new_n_buckets * sizeof(size_t));
+        /* Removal moves entries before rehashing, so reuse the buckets and
+         * rebuild without an allocation that could fail. */
+        if (new_n_buckets > SIZE_MAX / sizeof(size_t))
+                return false;
+        size_t *new_buckets = new_n_buckets == map->n_buckets ? map->buckets : malloc(new_n_buckets * sizeof(size_t));
         if (!new_buckets)
                 return false;
         for (size_t i = 0; i < new_n_buckets; ++i)
@@ -468,7 +478,8 @@ static bool u32_map_rehash(U32Map *map, size_t new_n_buckets)
                         }
                 }
         }
-        free(map->buckets);
+        if (new_buckets != map->buckets)
+                free(map->buckets);
         map->buckets = new_buckets;
         map->n_buckets = new_n_buckets;
         return true;
@@ -485,7 +496,8 @@ bool u32_map_set(U32Map *map, uint32_t key, void *value)
         }
         if (map->len >= map->n_buckets / 2) {
                 size_t next_buckets = map->n_buckets ? map->n_buckets * 2 : 16;
-                u32_map_rehash(map, next_buckets);
+                if (next_buckets < map->n_buckets || !u32_map_rehash(map, next_buckets))
+                        return false;
         }
         if (map->len == map->capacity &&
             !grow((void **)&map->entries, &map->capacity, sizeof(*map->entries), map->len + 1))
@@ -615,7 +627,7 @@ char *path_dirname(const char *path)
         char *copy = strdup(path), *slash;
         if (!copy)
                 return NULL;
-        while (copy[1] && copy[strlen(copy) - 1] == '/')
+        while (*copy && copy[1] && copy[strlen(copy) - 1] == '/')
                 copy[strlen(copy) - 1] = '\0';
         slash = strrchr(copy, '/');
         if (!slash) {

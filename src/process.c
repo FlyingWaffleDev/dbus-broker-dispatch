@@ -9,6 +9,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+extern char **environ;
+
 static void close_nointr(int fd)
 {
         if (fd >= 0)
@@ -50,16 +52,15 @@ bool process_spawn(const ProcessSpec *spec, pid_t *pid, Error **error)
                         child_fail(failure_pipe[1], errno);
                 if (spec->child_setup && !spec->child_setup(spec->child_setup_data, &setup_error))
                         child_fail(failure_pipe[1], setup_error ? setup_error : EPERM);
-                if (spec->environment) {
-                        if (spec->search_path)
-                                execvpe(spec->argv[0], spec->argv, spec->environment);
-                        else
-                                execve(spec->argv[0], spec->argv, spec->environment);
-                } else if (spec->search_path) {
+                /* execvpe() searches the parent's PATH even with an explicit
+                 * environment. Install the child's environment before execvp()
+                 * so activation-environment PATH updates also select the binary. */
+                if (spec->environment)
+                        environ = (char **)spec->environment;
+                if (spec->search_path)
                         execvp(spec->argv[0], spec->argv);
-                } else {
+                else
                         execv(spec->argv[0], spec->argv);
-                }
                 child_fail(failure_pipe[1], errno);
         }
         close_nointr(failure_pipe[1]);

@@ -218,7 +218,10 @@ static bool activation_child_setup(void *data, int *error_number)
                 *error_number = errno ? errno : EPERM;
                 return false;
         }
-        if (!activation->user || (geteuid() == activation->uid && getegid() == activation->gid))
+        if (!activation->user)
+                return true;
+        /* Root must install the configured groups even when UID/GID match. */
+        if (geteuid() != 0 && geteuid() == activation->uid && getegid() == activation->gid)
                 return true;
         if (geteuid() != 0 || syscall(SYS_setgroups, activation->n_groups, activation->groups) < 0 ||
             syscall(SYS_setresgid, activation->gid, activation->gid, activation->gid) < 0 ||
@@ -326,7 +329,7 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
                     !environment_set(&environment, "LOGNAME", nss_user_name(identity)) ||
                     !environment_set(&environment, "SHELL", nss_user_shell(identity)))
                         goto memory_environment;
-                if (geteuid() != activation->uid || getegid() != activation->gid) {
+                if (geteuid() == 0 || geteuid() != activation->uid || getegid() != activation->gid) {
                         if (geteuid() != 0 || activation->n_groups > INT_MAX) {
                                 error_set(&error, EPERM, "Cannot prepare credentials for service user %s",
                                           nss_user_name(identity));
@@ -637,5 +640,9 @@ bool service_equal(Service *left, Service *right)
         const gid_t *right_groups = right->identity ? nss_user_groups(right->identity, &right_n) : NULL;
         return str_equal(left->name, right->name) && str_equal(left->exec, right->exec) &&
                str_equal(left->user, right->user) && left->uid == right->uid && left->gid == right->gid &&
+               (!left->identity == !right->identity) &&
+               (!left->identity || (str_equal(nss_user_name(left->identity), nss_user_name(right->identity)) &&
+                                    str_equal(nss_user_home(left->identity), nss_user_home(right->identity)) &&
+                                    str_equal(nss_user_shell(left->identity), nss_user_shell(right->identity)))) &&
                left_n == right_n && (!left_n || memcmp(left_groups, right_groups, left_n * sizeof(gid_t)) == 0);
 }

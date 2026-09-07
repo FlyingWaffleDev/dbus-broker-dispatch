@@ -33,6 +33,8 @@
 typedef struct {
         char *runtime;
         uid_t uid;
+        pid_t pid;
+        unsigned long long start_time;
 } SessionData;
 
 typedef struct {
@@ -566,7 +568,7 @@ static bool address_matches_socket(const char *address, const char *socket_path)
                 } else {
                         c = *p++;
                 }
-                if (*s++ != c)
+                if (!c || !*s || *s++ != c)
                         return false;
         }
         return *s == '\0';
@@ -666,6 +668,7 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
                         stop_owned_process(&(State){pid, start_time, 1}, entry.pw_uid);
                         goto out;
                 }
+                state = (State){pid, start_time, 1};
                 counted = true;
         }
         result = publish_address(pamh, runtime);
@@ -680,6 +683,8 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
                         goto out;
                 }
                 session->uid = entry.pw_uid;
+                session->pid = state.pid;
+                session->start_time = state.start_time;
                 result = pam_set_data(pamh, PAM_DATA_KEY, session, free_session_data);
                 if (result != PAM_SUCCESS)
                         goto out;
@@ -722,6 +727,10 @@ int dbus_dispatch_close_session(pam_handle_t *pamh)
                 unlinkat(directory_fd, STATE_NAME, 0);
                 goto out;
         }
+        /* A session opened before a bus restart owns no reference to the
+         * replacement bus, even though the runtime directory is the same. */
+        if (state.pid != session->pid || state.start_time != session->start_time)
+                goto out;
         if (state.count > 1) {
                 --state.count;
                 (void)write_state(directory_fd, session->uid, &state);

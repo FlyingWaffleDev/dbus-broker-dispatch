@@ -2,7 +2,9 @@
 #include "address.h"
 #include "process.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -10,9 +12,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/prctl.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
-#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t command_pid;
@@ -75,12 +77,17 @@ static char *find_program(const char *name)
         }
 }
 
+typedef struct {
+        pid_t parent;
+        int ready_fd;
+} LauncherChild;
+
 static bool launcher_child_setup(void *data, int *error_number)
 {
-        pid_t parent = getppid();
+        LauncherChild *child = data;
 
-        (void)data;
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != parent) {
+        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != child->parent ||
+            fcntl(child->ready_fd, F_SETFD, 0) < 0) {
                 *error_number = errno ? errno : ESRCH;
                 return false;
         }
@@ -89,41 +96,50 @@ static bool launcher_child_setup(void *data, int *error_number)
 
 static bool start_bus(const char *launcher, const char *address, pid_t *pid, Error **error)
 {
-        char *const arguments[] = {(char *)launcher, "--scope=user",  "--foreground",
-                                   "--address",      (char *)address, NULL};
+        int pair[2];
+        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
+                return error_set_errno(error, errno, "Cannot create bus startup socket");
+        /* --ready-fd reserves stdin/stdout/stderr, including when inherited
+         * standard descriptors were closed. */
+        if (pair[1] < 3) {
+                int moved = fcntl(pair[1], F_DUPFD_CLOEXEC, 3);
+                if (moved < 0) {
+                        int saved = errno;
+                        close(pair[0]);
+                        close(pair[1]);
+                        return error_set_errno(error, saved, "Cannot move bus startup socket");
+                }
+                close(pair[1]);
+                pair[1] = moved;
+        }
+        char ready_arg[32];
+        snprintf(ready_arg, sizeof(ready_arg), "--ready-fd=%d", pair[1]);
+        char *const arguments[] = {
+                (char *)launcher, "--scope=user", "--foreground", "--address", (char *)address, ready_arg, NULL};
+        LauncherChild child = {.parent = getpid(), .ready_fd = pair[1]};
         ProcessSpec spec = {
                 .argv = arguments,
                 .child_setup = launcher_child_setup,
+                .child_setup_data = &child,
         };
-        return process_spawn(&spec, pid, error);
-}
-
-static bool wait_for_bus(const char *socket_path, pid_t bus, bool *reaped, char **message)
-{
-        struct timespec delay = {.tv_nsec = 10 * 1000 * 1000};
-        struct stat st;
-        int status;
-
-        for (unsigned int attempt = 0; attempt < 500; ++attempt) {
-                pid_t result = waitpid(bus, &status, WNOHANG);
-                if (result == bus) {
-                        *reaped = true;
-                        *message = strdup("user bus dispatcher exited before its listener was ready");
-                        return false;
-                }
-                if (result < 0 && errno != EINTR) {
-                        if (asprintf(message, "waitpid: %s", strerror(errno)) < 0)
-                                *message = NULL;
-                        return false;
-                }
-                if (lstat(socket_path, &st) == 0 && S_ISSOCK(st.st_mode))
-                        return true;
-                while (nanosleep(&delay, &delay) < 0 && errno == EINTR)
-                        ;
-                delay = (struct timespec){.tv_nsec = 10 * 1000 * 1000};
+        bool success = process_spawn(&spec, pid, error);
+        close(pair[1]);
+        if (success) {
+                struct pollfd ready = {.fd = pair[0], .events = POLLIN};
+                int result;
+                char status = 0;
+                do
+                        result = poll(&ready, 1, 5000);
+                while (result < 0 && errno == EINTR);
+                if (result < 0)
+                        success = error_set_errno(error, errno, "Cannot wait for user bus startup");
+                else if (!result)
+                        success = error_set(error, ETIMEDOUT, "Timed out waiting for user bus startup");
+                else if (recv(pair[0], &status, 1, MSG_DONTWAIT) != 1 || status != 'R')
+                        success = error_set(error, EIO, "User bus dispatcher failed before it was ready");
         }
-        *message = strdup("timed out waiting for the user bus listener");
-        return false;
+        close(pair[0]);
+        return success;
 }
 
 static void stop_bus(pid_t bus)
@@ -139,7 +155,7 @@ static void stop_bus(pid_t bus)
 int main(int argc, char **argv)
 {
         const char *runtime;
-        char *launcher = NULL, *address = NULL, *socket_path = NULL, *message = NULL;
+        char *launcher = NULL, *address = NULL, *socket_path = NULL;
         char *directory = NULL, *escaped = NULL;
         Error *error = NULL;
         pid_t bus = 0, child;
@@ -147,7 +163,7 @@ int main(int argc, char **argv)
         sigset_t blocked_signals, previous_mask;
         struct stat st;
         int status, exit_status = 1;
-        bool bus_reaped = false, directory_created = false;
+        bool directory_created = false;
 
         if (argc < 2) {
                 fputs("Usage: dbus-broker-run-session -- COMMAND [ARGS...]\n", stderr);
@@ -192,10 +208,6 @@ int main(int argc, char **argv)
                 fprintf(stderr, "Cannot start user bus: %s\n", error ? error->message : "out of memory");
                 goto out;
         }
-        if (!wait_for_bus(socket_path, bus, &bus_reaped, &message)) {
-                fprintf(stderr, "Cannot start user bus: %s\n", message ? message : "out of memory");
-                goto out;
-        }
         sigemptyset(&blocked_signals);
         sigaddset(&blocked_signals, SIGINT);
         sigaddset(&blocked_signals, SIGTERM);
@@ -229,7 +241,7 @@ int main(int argc, char **argv)
         command_pid = 0;
         exit_status = WIFEXITED(status) ? WEXITSTATUS(status) : 128 + WTERMSIG(status);
 out:
-        if (bus > 0 && !bus_reaped)
+        if (bus > 0)
                 stop_bus(bus);
         if (directory_created) {
                 if (socket_path)
@@ -238,7 +250,6 @@ out:
                         fprintf(stderr, "Cannot remove temporary bus directory %s: %s\n", directory, strerror(errno));
         }
         error_free(error);
-        free(message);
         free(escaped);
         free(directory);
         free(address);

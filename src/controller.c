@@ -145,6 +145,9 @@ static bool call(Controller *controller, const char *path, const char *interface
 {
         uint32_t serial = dbus_transport_next_serial(&controller->transport);
 
+        /* A synchronous receive can also buffer packets after its reply.
+         * Make the next event-loop wait nonblocking so those get dispatched. */
+        controller->dispatch_pending = true;
         if (!send_message(controller, DBUS_MESSAGE_METHOD_CALL, serial, 0, path, interface, member, NULL, signature,
                           body, fds, n_fds, error))
                 return false;
@@ -268,8 +271,10 @@ bool controller_reply_error(Controller *controller, uint32_t reply_serial, const
 {
         DBusWriter body = {0};
         bool result;
-        if (!dbus_writer_string(&body, message))
+        if (!dbus_writer_string(&body, message)) {
+                dbus_writer_clear(&body);
                 return error_set(error, ENOMEM, "Cannot encode controller error reply");
+        }
         result = send_message(controller, DBUS_MESSAGE_ERROR, dbus_transport_next_serial(&controller->transport),
                               reply_serial, NULL, NULL, NULL, name, "s", &body, NULL, 0, error);
         dbus_writer_clear(&body);
