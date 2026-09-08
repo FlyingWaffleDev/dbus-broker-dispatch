@@ -455,7 +455,8 @@ static void parse_rule(ParserState *state, const char *element, const char **att
         }
         if ((rule->type == POLICY_RULE_SEND || rule->type == POLICY_RULE_RECV) &&
             (rule->message_type == 2 || rule->message_type == 3)) {
-                parser_warning(state, "ignoring explicit policy on %s messages; dbus-broker tracks expected replies itself",
+                parser_warning(state,
+                               "ignoring explicit policy on %s messages; dbus-broker tracks expected replies itself",
                                rule->message_type == 2 ? "method_return" : "error");
                 policy_rule_free(rule);
                 return;
