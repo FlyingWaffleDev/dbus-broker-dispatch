@@ -67,7 +67,7 @@ char *socket_path_from_address(const char *address, Error **error)
                                 goto invalid;
                 }
                 if (!str_buf_append_n(&path, &byte, 1))
-                        goto invalid;
+                        goto memory;
         }
         if (!path.data || !path_is_absolute(path.data))
                 goto invalid;
@@ -75,5 +75,9 @@ char *socket_path_from_address(const char *address, Error **error)
 invalid:
         str_buf_clear(&path);
         error_set(error, EINVAL, "The unix:path= listener must contain an absolute, valid escaped path");
+        return NULL;
+memory:
+        str_buf_clear(&path);
+        error_set(error, ENOMEM, "Cannot allocate D-Bus listener path");
         return NULL;
 }

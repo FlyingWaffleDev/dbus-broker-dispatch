@@ -113,4 +113,5 @@ char *path_dirname(const char *path);
 char *path_canonicalize(const char *path, const char *base);
 bool path_is_absolute(const char *path);
 bool read_file(const char *path, char **contents, size_t *length, Error **error);
+bool read_file_limited(const char *path, size_t maximum, char **contents, size_t *length, Error **error);
 bool parse_u64(const char *text, uint64_t maximum, uint64_t *value);

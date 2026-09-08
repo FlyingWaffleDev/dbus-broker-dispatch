@@ -200,7 +200,7 @@ bool service_file_load(const char *path, ServiceFile *file, Error **error)
         bool section = false;
 
         ptr_vec_init(&candidate.arguments, free);
-        if (!read_file(path, &contents, NULL, error))
+        if (!read_file_limited(path, 1024 * 1024, &contents, NULL, error))
                 return false;
         cursor = contents;
         while ((line = strsep(&cursor, "\n"))) {

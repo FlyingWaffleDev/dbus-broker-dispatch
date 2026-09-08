@@ -89,20 +89,21 @@ void event_loop_quit(EventLoop *loop)
 
 int event_signal_fd(const int *signals, size_t n_signals, sigset_t *previous_mask, Error **error)
 {
-        sigset_t mask;
+        sigset_t mask, saved_mask;
         int fd;
         sigemptyset(&mask);
         for (size_t i = 0; i < n_signals; ++i)
                 sigaddset(&mask, signals[i]);
-        if (sigprocmask(SIG_BLOCK, &mask, previous_mask) < 0) {
+        if (sigprocmask(SIG_BLOCK, &mask, &saved_mask) < 0) {
                 error_set_errno(error, errno, "Cannot block event-loop signals");
                 return -1;
         }
+        if (previous_mask)
+                *previous_mask = saved_mask;
         fd = signalfd(-1, &mask, SFD_CLOEXEC | SFD_NONBLOCK);
         if (fd < 0) {
                 int saved = errno;
-                if (previous_mask)
-                        sigprocmask(SIG_SETMASK, previous_mask, NULL);
+                sigprocmask(SIG_SETMASK, &saved_mask, NULL);
                 error_set_errno(error, saved, "Cannot create signal event source");
         }
         return fd;

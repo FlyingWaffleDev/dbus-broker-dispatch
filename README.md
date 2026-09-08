@@ -159,6 +159,12 @@ not stop it. The module never creates or changes ownership of a runtime
 directory. A missing runtime directory returns `PAM_IGNORE`, which makes module
 ordering important.
 
+The check for an existing bus only tests whether its Unix socket accepts a
+connection. It does not verify the listening program's identity. Processes
+running as the user can substitute another listener in that user's runtime
+directory. D-Bus EXTERNAL authenticates the client to the listener; it cannot
+prove that the listener is a trusted broker.
+
 Keep the module optional during initial testing so a bus failure cannot block
 login. Add it only to session stacks whose processes need a user bus.
 

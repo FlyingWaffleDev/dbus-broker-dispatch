@@ -35,7 +35,7 @@ typedef struct {
 
 static void optimize_rule_array(PtrVec *rules);
 static void optimize_rule_table(U32Map *table);
-static void optimize_strings(PtrVec *strings);
+static bool optimize_strings(PtrVec *strings, Error **error);
 static void parser_warning(ParserState *state, const char *format, ...);
 static void parser_fail(ParserState *state, Error *error);
 
@@ -455,6 +455,8 @@ static void parse_rule(ParserState *state, const char *element, const char **att
         }
         if ((rule->type == POLICY_RULE_SEND || rule->type == POLICY_RULE_RECV) &&
             (rule->message_type == 2 || rule->message_type == 3)) {
+                parser_warning(state, "ignoring explicit policy on %s messages; dbus-broker tracks expected replies itself",
+                               rule->message_type == 2 ? "method_return" : "error");
                 policy_rule_free(rule);
                 return;
         }
@@ -1088,6 +1090,8 @@ static void parser_end(void *data, const XML_Char *element)
                                 state->config->max_connections_per_user = parsed;
                         } else if (str_equal(state->limit_name, "max_match_rules_per_connection")) {
                                 state->config->max_matches_per_connection = parsed;
+                        } else {
+                                parser_warning(state, "ignoring unsupported D-Bus limit '%s'", state->limit_name);
                         }
                 }
         }
@@ -1111,7 +1115,7 @@ static void parser_text(void *data, const XML_Char *text, int length)
 
 static bool load_file(LauncherConfig *config, const char *path, bool ignore_missing, Error **error)
 {
-        char *canonical;
+        char *canonical, *resolved;
         char *contents;
         size_t length;
         XML_Parser parser;
@@ -1125,12 +1129,24 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                 free(canonical);
                 return error_set(error, ENOMEM, "%s: out of memory", path);
         }
-        if (str_map_contains(config->active_files, canonical)) {
+        /* Resolve aliases only for cycle detection. Relative includes and
+         * watches must still use the path through which the file was loaded. */
+        resolved = realpath(canonical, NULL);
+        if (!resolved) {
+                int saved = errno;
+                free(canonical);
+                if (ignore_missing && saved == ENOENT)
+                        return true;
+                return error_set_errno(error, saved, "%s", path);
+        }
+        if (str_map_contains(config->active_files, resolved)) {
                 log_warning("%s: recursive D-Bus configuration include ignored", canonical);
+                free(resolved);
                 free(canonical);
                 return true;
         }
-        if (!read_file(canonical, &contents, &length, error)) {
+        if (!read_file_limited(canonical, (size_t)16 * 1024 * 1024, &contents, &length, error)) {
+                free(resolved);
                 if (ignore_missing && error && *error && (*error)->code == ENOENT) {
                         error_clear(error);
                         free(canonical);
@@ -1139,15 +1155,10 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                 free(canonical);
                 return false;
         }
-        if (length > (size_t)16 * 1024 * 1024) {
-                error_set(error, EFBIG, "%s: D-Bus configuration exceeds 16 MiB", canonical);
-                free(contents);
-                free(canonical);
-                return false;
-        }
-        if (!str_map_set(config->active_files, canonical, NULL)) {
+        if (!str_map_set(config->active_files, resolved, NULL)) {
                 error_set(error, ENOMEM, "%s: out of memory", canonical);
                 free(contents);
+                free(resolved);
                 free(canonical);
                 return false;
         }
@@ -1167,7 +1178,8 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                         XML_ParserFree(parser);
                 free(state.base_dir);
                 free(contents);
-                str_map_remove(config->active_files, canonical);
+                str_map_remove(config->active_files, resolved);
+                free(resolved);
                 free(canonical);
                 return false;
         }
@@ -1202,7 +1214,8 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
         free(state.limit_name);
         free(state.base_dir);
         free(contents);
-        str_map_remove(config->active_files, canonical);
+        str_map_remove(config->active_files, resolved);
+        free(resolved);
         free(canonical);
         return success;
 }
@@ -1216,9 +1229,7 @@ bool launcher_config_load(LauncherConfig *config, const char *path, Error **erro
         optimize_rule_array(config->no_console_rules);
         optimize_rule_table(config->user_rules);
         optimize_rule_table(config->group_rules);
-        optimize_strings(config->service_dirs);
-        optimize_strings(config->watch_paths);
-        return true;
+        return optimize_strings(config->service_dirs, error) && optimize_strings(config->watch_paths, error);
 }
 
 /* Compare the match and action directly, without allocating a serialized key.
@@ -1306,7 +1317,7 @@ static void optimize_rule_table(U32Map *table)
                 optimize_rule_array(table->entries[i].value);
 }
 
-static void optimize_strings(PtrVec *strings)
+static bool optimize_strings(PtrVec *strings, Error **error)
 {
         StrMap seen;
         size_t kept = 0;
@@ -1316,10 +1327,19 @@ static void optimize_strings(PtrVec *strings)
                 if (str_map_contains(&seen, value))
                         free(value);
                 else {
-                        str_map_set(&seen, value, NULL);
+                        if (!str_map_set(&seen, value, NULL)) {
+                                /* Keep the unprocessed strings owned by the vector,
+                                 * without retaining any freed duplicate entries. */
+                                memmove(strings->items + kept, strings->items + i,
+                                        (strings->len - i) * sizeof(*strings->items));
+                                strings->len = kept + strings->len - i;
+                                str_map_clear(&seen);
+                                return error_set(error, ENOMEM, "Cannot deduplicate configuration paths");
+                        }
                         strings->items[kept++] = value;
                 }
         }
         strings->len = kept;
         str_map_clear(&seen);
+        return true;
 }

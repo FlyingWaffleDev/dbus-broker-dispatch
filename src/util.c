@@ -695,6 +695,11 @@ memory:
 
 bool read_file(const char *path, char **contents, size_t *length, Error **error)
 {
+        return read_file_limited(path, SIZE_MAX, contents, length, error);
+}
+
+bool read_file_limited(const char *path, size_t maximum, char **contents, size_t *length, Error **error)
+{
         int fd;
         StrBuf buffer = {0};
         char chunk[8192];
@@ -704,7 +709,17 @@ bool read_file(const char *path, char **contents, size_t *length, Error **error)
         fd = open(path, O_RDONLY | O_CLOEXEC);
         if (fd < 0)
                 return error_set_errno(error, errno, "%s", path);
-        while ((n = read(fd, chunk, sizeof(chunk))) > 0) {
+        for (;;) {
+                n = read(fd, chunk, sizeof(chunk));
+                if (n < 0 && errno == EINTR)
+                        continue;
+                if (n <= 0)
+                        break;
+                if ((size_t)n > maximum - buffer.len) {
+                        close(fd);
+                        str_buf_clear(&buffer);
+                        return error_set(error, EFBIG, "%s: file exceeds %zu bytes", path, maximum);
+                }
                 if (!str_buf_append_n(&buffer, chunk, (size_t)n)) {
                         close(fd);
                         str_buf_clear(&buffer);
