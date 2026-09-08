@@ -375,11 +375,8 @@ static bool reload_config(Launcher *launcher, Error **error)
                 Service *previous = str_map_get(current, candidate_services->entries[i].key);
                 if (previous && service_equal(previous, candidate_services->entries[i].value)) {
                         Service *ref = service_reference(previous);
-                        if (!str_map_set(candidate_services, candidate_services->entries[i].key, ref)) {
-                                service_unref(ref);
-                                error_set(error, ENOMEM, "Out of memory reusing service reference");
-                                goto out;
-                        }
+                        service_unref(candidate_services->entries[i].value);
+                        candidate_services->entries[i].value = ref;
                 }
         }
         for (size_t i = 0; i < current->len; ++i) {

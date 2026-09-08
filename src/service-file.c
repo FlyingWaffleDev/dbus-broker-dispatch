@@ -24,8 +24,10 @@ static char *unescape_value(const char *value, Error **error)
         for (const char *p = value; *p; ++p) {
                 char escaped;
                 if (*p != '\\') {
-                        if (!str_buf_append_n(&result, p, 1))
+                        size_t length = strcspn(p, "\\");
+                        if (!str_buf_append_n(&result, p, length))
                                 goto memory;
+                        p += length - 1;
                         continue;
                 }
                 if (!*++p) {

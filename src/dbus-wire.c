@@ -38,7 +38,7 @@ bool dbus_writer_align(DBusWriter *writer, size_t alignment)
                 writer->failed = true;
                 return false;
         }
-        padding = (alignment - writer->bytes.len % alignment) % alignment;
+        padding = -writer->bytes.len & (alignment - 1);
         return append(writer, zeroes, padding);
 }
 
@@ -123,7 +123,7 @@ bool dbus_reader_align(DBusReader *reader, size_t alignment)
         size_t padding;
         if (!alignment || (alignment & (alignment - 1)) || alignment > 8)
                 return false;
-        padding = (alignment - reader->offset % alignment) % alignment;
+        padding = -reader->offset & (alignment - 1);
         return reader_take(reader, padding, NULL);
 }
 

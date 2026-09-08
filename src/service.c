@@ -635,6 +635,8 @@ bool service_table_register_all(ServiceManager *manager, ServiceTable *services,
 
 bool service_equal(Service *left, Service *right)
 {
+        if (left == right)
+                return true;
         size_t left_n = 0, right_n = 0;
         const gid_t *left_groups = left->identity ? nss_user_groups(left->identity, &left_n) : NULL;
         const gid_t *right_groups = right->identity ? nss_user_groups(right->identity, &right_n) : NULL;
