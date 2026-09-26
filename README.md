@@ -35,10 +35,11 @@ For those who want to give it a go, I have made a Gentoo ebuild available in my
   without a shell
 - System service users, cleared supplementary groups, activation environment
   updates, and `DBUS_STARTER_*` variables
+- Activation timeouts from `<limit name="service_start_timeout">`
 - Transactional reloads from SIGHUP, the broker reload API, or watched config
   and service directories
 - Broker quotas derived from the four D-Bus limits that `dbus-broker` uses
-- Optional elogind monitoring for console-sensitive policy
+- Optional elogind monitoring for `at_console` and `no_console` policy
 - AppArmor detection and the `enabled`, `disabled`, and `required` config modes
 - SELinux name associations and optional SELinux-aware config includes
 - A fixed NSS identity snapshot for each config generation
@@ -65,12 +66,15 @@ meson compile -C build
 meson test -C build --print-errorlogs
 ```
 
-Meson detects the PAM and SELinux dependencies by default. The relevant build
-options are:
+Meson detects the PAM, elogind, and SELinux dependencies by default. The
+relevant build options are:
 
 - `-Dpam=enabled` or `-Dpam=disabled` requires or disables the PAM module.
 - `-Dpam-module-dir=/lib64/security` changes its install directory.
-- `-Delogind=true` enables live console-policy updates.
+- `-Delogind=enabled` or `-Delogind=disabled` requires or disables live
+  console-policy updates.
+- `-Dbroker=/usr/bin/dbus-broker` sets the broker executable. It defaults to
+  `dbus-broker` in the install prefix's `bindir`, where upstream installs it.
 - `-Dsystem-console-users=root,rescue` always treats the listed users as
   `at_console`.
 - `-Dselinux=enabled` or `-Dselinux=disabled` requires or disables SELinux-aware
@@ -96,6 +100,9 @@ dbus-broker-dispatch --scope=system --foreground
 dbus-broker-dispatch --scope=user --foreground
 ```
 
+The OpenRC, s6, Dinit, and runit services in [`init`](init/) restart the
+dispatcher when it exits, which it does whenever dbus-broker dies.
+
 `--scope` is required. Backgrounding follows `dbus-daemon`: the dispatcher stays
 in the foreground unless the configuration carries `<fork/>` or `--fork` is
 given, and `--foreground` overrides both. Use `dbus-broker-dispatch --help` for
@@ -103,24 +110,40 @@ the full option list.
 
 In the foreground the dispatcher writes diagnostics to standard error. In the
 background it writes them to syslog, because standard error is `/dev/null`
-there; `<syslog/>` selects syslog in the foreground too. Check the system log
-when a backgrounded dispatcher misbehaves.
+there; `--syslog` or `<syslog/>` selects syslog in the foreground too. Check
+the system log when a backgrounded dispatcher misbehaves.
+
+Each activation is logged with the service's PID. An activation fails if the
+name is not claimed within `service_start_timeout`, 25 seconds unless the
+configuration sets it; the stock session configuration uses 120 seconds.
+Services on a system bus start with a minimal environment, as with
+`dbus-daemon`'s activation helper: `PATH`, the `DBUS_STARTER_*` variables,
+the user variables for `User=` services, and the activation environment.
+User-bus services inherit the dispatcher's environment.
 
 dbus-broker's own messages, including policy denials, are re-emitted through the
 same logging, prefixed with `dbus-broker:`.
 
-Supervisors can pass `--foreground --ready-fd=FD`, where FD is an inherited,
-connected Unix stream socket numbered 3 or higher. The dispatcher sends one
-byte, `R`, after configuring the broker and listener, or `F` on startup failure,
-then closes the descriptor. EOF without `R` also means startup failed.
-The descriptor is not inherited by executed brokers or activated services.
-This private handshake distinguishes the new dispatcher from an existing bus
-at the same public address. The supervisor should enforce its own startup
-deadline.
+Supervisors can pass `--ready-fd=FD`, where FD is an inherited descriptor
+numbered 3 or higher, to learn when the broker and listener are configured:
+
+- On a connected Unix stream socket, the dispatcher sends one byte, `R` on
+  success or `F` on startup failure, then closes it. EOF without `R` also means
+  startup failed. This private handshake distinguishes the new dispatcher from
+  an existing bus at the same public address.
+- On a pipe, it writes the line `READY=1` on success and closes it without
+  writing on failure. This suits s6 `notification-fd`, Dinit
+  `ready-notification = pipefd:FD`, and OpenRC `notify=fd:FD`.
+
+With `--fork`, the daemon itself reports on FD and the parent exits at once.
+The descriptor is not inherited by executed brokers or activated services. The
+supervisor should enforce its own startup deadline.
 
 Starting a second dispatcher on a socket that is already served fails without
-disturbing the running one. The dispatcher removes only the socket and PID file
-it created itself.
+disturbing the running one. While running, the dispatcher holds a lock on
+`SOCKET.lock` next to its socket, so two dispatchers starting at once cannot
+both claim the address. It removes only the socket, lock, and PID file it
+created itself.
 
 The default config files are `/usr/share/dbus-1/system.conf` and
 `/usr/share/dbus-1/session.conf`. The default sockets are
@@ -136,7 +159,9 @@ The wrapper creates a private temporary bus beneath `XDG_RUNTIME_DIR`, even
 when a user bus already exists. It sets `DBUS_SESSION_BUS_ADDRESS` for the
 command and leaves `XDG_RUNTIME_DIR` unchanged. Nested invocations each get
 their own bus. The wrapper returns the command's exit status and removes its
-socket and temporary directory when the command exits.
+socket and temporary directory when the command exits. The bus runs in its own
+process group, so Ctrl-C reaches the command but does not stop the bus under
+it. Signals sent to the wrapper itself are forwarded to the command.
 
 ## Start user buses from PAM
 
@@ -150,7 +175,8 @@ manager. Add it after the module that creates `XDG_RUNTIME_DIR`, usually
 
 When a PAM session opens, the module checks that `XDG_RUNTIME_DIR` is an
 absolute, user-owned `0700` directory. It serializes concurrent starts, runs a
-user-scope dispatcher with the user's credentials, and adds
+user-scope dispatcher with the user's credentials, waits up to 25 seconds for
+it to report readiness, and adds
 `DBUS_SESSION_BUS_ADDRESS` to the PAM environment. Sessions for the same user
 share one module-owned bus. The last session to close stops it.
 
@@ -185,6 +211,11 @@ already-configured user supervisor.
   implemented. The dispatcher supports `max_outgoing_bytes`,
   `max_outgoing_unix_fds`, `max_connections_per_user`, and
   `max_match_rules_per_connection`.
+- With elogind, `at_console` applies to users with an active local session on a
+  seat, and `no_console` to everyone else, as with `dbus-daemon`. Without
+  elogind, or until elogind first answers, the dispatcher follows
+  `dbus-broker-launch`: UIDs above `--system-uid-max` (999) always receive
+  `at_console`, and system users only when listed in `system-console-users`.
 - Policy rules whose only condition is `send_requested_reply` or
   `receive_requested_reply` are ignored with a warning. `dbus-broker` tracks
   expected replies itself, so there is nothing left for such a rule to match
@@ -192,4 +223,5 @@ already-configured user supervisor.
 
 ## License
 
-Licensed GPLv3 to match dbus-broker.
+Licensed under the GNU General Public License, version 3 or any later version, 
+matching dbus-broker. See [`COPYING`](COPYING).

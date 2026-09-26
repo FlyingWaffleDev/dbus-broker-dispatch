@@ -1,4 +1,5 @@
 type = process
-command = /usr/bin/dbus-broker-dispatch --scope=user --foreground
+ready-notification = pipefd:3
+command = /usr/bin/dbus-broker-dispatch --scope=user --foreground --ready-fd=3
 restart = true
 smooth-recovery = true

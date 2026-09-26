@@ -1,4 +1,5 @@
 type = process
-command = /bin/sh -ec "/usr/bin/dbus-uuidgen --ensure=/etc/machine-id && /usr/bin/install -d -m 0755 /run/dbus && exec /usr/bin/dbus-broker-dispatch --scope=system --foreground"
+ready-notification = pipefd:3
+command = /bin/sh -ec "/usr/bin/dbus-uuidgen --ensure=/etc/machine-id && /usr/bin/install -d -m 0755 /run/dbus && exec /usr/bin/dbus-broker-dispatch --scope=system --foreground --ready-fd=3"
 restart = true
 smooth-recovery = true

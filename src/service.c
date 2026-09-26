@@ -56,6 +56,8 @@ struct ServiceManager {
         StrMap environment;
         U32Map activations;
         PtrVec pending_deadlines;
+        uint64_t start_timeout_ms;
+        bool user_scope;
 };
 
 static uint64_t now_monotonic_ms(void)
@@ -119,6 +121,8 @@ ServiceManager *service_manager_new(void)
         str_map_init(&manager->environment, free);
         u32_map_init(&manager->activations, activation_free);
         ptr_vec_init(&manager->pending_deadlines, service_destroy);
+        manager->start_timeout_ms = 25000;
+        manager->user_scope = true;
         if (!manager->services) {
                 service_manager_free(manager);
                 return NULL;
@@ -147,6 +151,12 @@ void service_manager_set_controller(ServiceManager *manager, Controller *control
         free(manager->bus_type);
         manager->address = str_dup(address);
         manager->bus_type = str_dup(bus_type);
+}
+
+void service_manager_configure(ServiceManager *manager, bool user_scope, uint64_t start_timeout_ms)
+{
+        manager->user_scope = user_scope;
+        manager->start_timeout_ms = start_timeout_ms;
 }
 
 ServiceTable *service_manager_table(ServiceManager *manager)
@@ -261,6 +271,17 @@ static bool environment_current(StrMap *environment)
         return true;
 }
 
+/* Like dbus-daemon's activation helper, system services do not inherit the
+ * dispatcher's environment. */
+static bool environment_minimal(StrMap *environment)
+{
+        str_map_init(environment, free);
+        if (environment_set(environment, "PATH", "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"))
+                return true;
+        str_map_clear(environment);
+        return false;
+}
+
 static char **environment_export(const StrMap *environment)
 {
         char **values = calloc(environment->len + 1, sizeof(*values));
@@ -303,7 +324,7 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
         service->serial = serial;
         ++service->generation;
         service->activation_deadline_ms = 0;
-        if (!environment_current(&environment))
+        if (!(manager->user_scope ? environment_current(&environment) : environment_minimal(&environment)))
                 goto memory;
         for (size_t i = 0; i < manager->environment.len; ++i)
                 if (!environment_set(&environment, manager->environment.entries[i].key,
@@ -366,6 +387,19 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
                 goto failure;
         }
         activation = NULL;
+        log_info("Activating D-Bus service %s (pid %ld)", service->name, (long)pid);
+        /* The broker never re-requests a name while its activation is pending,
+         * so every attempt needs a deadline, even while the child runs. Once
+         * the name is owned, the broker ignores the stale reset. */
+        uint64_t now = now_monotonic_ms();
+        service->activation_deadline_ms =
+                manager->start_timeout_ms > UINT64_MAX - now ? UINT64_MAX : now + manager->start_timeout_ms;
+        Service *ref = service_reference(service);
+        if (!ptr_vec_push(&manager->pending_deadlines, ref)) {
+                service_unref(ref);
+                error_set(&error, ENOMEM, "Cannot track activation deadline");
+                goto failure;
+        }
         free(arguments);
         string_vector_free(environment_vector);
         str_map_clear(&environment);
@@ -394,24 +428,30 @@ bool service_manager_reap(ServiceManager *manager, pid_t pid, int status)
         Service *service = activation->service;
         /* Child lifetime can extend past name release, another activation, or
          * replacement of the service definition. Only the matching attempt
-         * may reset the name or install a successful-exit deadline. */
+         * may reset the name. A successful exit, as from a daemonizing
+         * service, leaves the activation deadline running. */
         if (!service->starting || activation->serial != service->serial ||
             activation->generation != service->generation || str_map_get(manager->services, service->path) != service) {
                 activation_free(activation);
                 return true;
         }
-        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+        if (WIFSIGNALED(status)) {
+                log_warning("D-Bus service %s was killed by signal %d during activation", service->name,
+                            WTERMSIG(status));
                 reset_service(manager, service, "org.bus1.DBus.Name.Error.UnitFailure");
-        } else {
-                service->activation_deadline_ms = now_monotonic_ms() + 25000;
-                Service *ref = service_reference(service);
-                if (!ptr_vec_push(&manager->pending_deadlines, ref)) {
-                        service_unref(ref);
-                        reset_service(manager, service, "org.bus1.DBus.Name.Error.StartupFailure");
-                }
+        } else if (WEXITSTATUS(status) != 0) {
+                log_warning("D-Bus service %s exited with status %d during activation", service->name,
+                            WEXITSTATUS(status));
+                reset_service(manager, service, "org.bus1.DBus.Name.Error.UnitFailure");
         }
         activation_free(activation);
         return true;
+}
+
+/* A service replaced in the table no longer owns its broker name. */
+static bool deadline_active(ServiceManager *manager, Service *service)
+{
+        return service->activation_deadline_ms && str_map_get(manager->services, service->path) == service;
 }
 
 int service_manager_timeout_ms(ServiceManager *manager)
@@ -422,7 +462,7 @@ int service_manager_timeout_ms(ServiceManager *manager)
         uint64_t min_remaining = UINT64_MAX;
         for (size_t i = 0; i < manager->pending_deadlines.len; ++i) {
                 Service *service = manager->pending_deadlines.items[i];
-                if (!service->activation_deadline_ms)
+                if (!deadline_active(manager, service))
                         continue;
                 if (service->activation_deadline_ms <= now)
                         return 0;
@@ -445,7 +485,7 @@ void service_manager_dispatch_timeouts(ServiceManager *manager)
         size_t i = 0;
         while (i < manager->pending_deadlines.len) {
                 Service *service = manager->pending_deadlines.items[i];
-                if (!service->activation_deadline_ms) {
+                if (!deadline_active(manager, service)) {
                         ptr_vec_delete(&manager->pending_deadlines, i);
                         continue;
                 }

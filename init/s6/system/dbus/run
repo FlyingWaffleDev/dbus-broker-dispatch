@@ -4,4 +4,4 @@ set -eu
 /usr/bin/dbus-uuidgen --ensure=/etc/machine-id
 /usr/bin/install -d -m 0755 /run/dbus
 
-exec /usr/bin/dbus-broker-dispatch --scope=system --foreground
+exec /usr/bin/dbus-broker-dispatch --scope=system --foreground --ready-fd=3

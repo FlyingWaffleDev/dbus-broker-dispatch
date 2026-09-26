@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* These assertions have side effects and must survive NDEBUG builds. */
+#undef NDEBUG
 #include "address.h"
 #include "dbus-transport.h"
 #include "dbus-wire.h"
@@ -79,14 +81,14 @@ static void run_command(const char *wrapper, const char *self, const char *runti
         wait_for_exit(child, 42);
 }
 
-static void check_runtime(const char *runtime, const char *allowed)
+static void check_runtime(const char *runtime, const char *allowed, const char *lock)
 {
         DIR *directory = opendir(runtime);
         struct dirent *entry;
         assert(directory);
         while ((entry = readdir(directory))) {
                 assert(strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0 ||
-                       (allowed && strcmp(entry->d_name, allowed) == 0));
+                       (allowed && strcmp(entry->d_name, allowed) == 0) || (lock && strcmp(entry->d_name, lock) == 0));
         }
         assert(closedir(directory) == 0);
 }
@@ -134,7 +136,7 @@ int main(int argc, char **argv)
         assert(setenv("DBUS_SESSION_BUS_ADDRESS", address, 1) == 0);
 
         run_command(argv[1], argv[0], runtime, address, "yes");
-        check_runtime(runtime, NULL);
+        check_runtime(runtime, NULL, NULL);
 
         dispatcher = fork();
         assert(dispatcher >= 0);
@@ -147,7 +149,7 @@ int main(int argc, char **argv)
         run_command(argv[1], argv[0], runtime, address, "yes");
         assert(lstat(socket_path, &after) == 0 && before.st_dev == after.st_dev && before.st_ino == after.st_ino);
         call_bus(&existing, "ListNames");
-        check_runtime(runtime, "bus");
+        check_runtime(runtime, "bus", "bus.lock");
         dbus_transport_clear(&existing);
         assert(kill(dispatcher, SIGTERM) == 0);
         wait_for_exit(dispatcher, 0);
@@ -159,7 +161,7 @@ int main(int argc, char **argv)
                 _exit(126);
         }
         wait_for_exit(child, 127);
-        check_runtime(runtime, NULL);
+        check_runtime(runtime, NULL, NULL);
 
         child = fork();
         assert(child >= 0);
@@ -168,7 +170,7 @@ int main(int argc, char **argv)
                 _exit(127);
         }
         wait_for_exit(child, 128 + SIGTERM);
-        check_runtime(runtime, NULL);
+        check_runtime(runtime, NULL, NULL);
 
         char *fake_dispatcher = path_join(runtime, "dbus-broker-dispatch");
         assert(fake_dispatcher && symlink("/bin/false", fake_dispatcher) == 0);

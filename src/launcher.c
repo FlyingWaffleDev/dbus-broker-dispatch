@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <sys/file.h>
 #include <sys/prctl.h>
 #include <sys/signalfd.h>
 #include <sys/socket.h>
@@ -55,8 +56,11 @@ struct Launcher {
         /* Only paths this process actually created may be removed on exit. A
          * failed start must never delete a running dispatcher's socket. */
         bool listener_bound, pid_file_written;
-        int startup_fd, listener_fd, signal_fd;
-        char *config, *address, *broker, *socket_path, *pid_file;
+        /* A pipe from a supervisor (s6, dinit, OpenRC) gets a readiness line;
+         * a socket gets the private R/F handshake byte. */
+        bool startup_pipe;
+        int startup_fd, listener_fd, signal_fd, lock_fd;
+        char *config, *address, *broker, *socket_path, *pid_file, *lock_path;
         uint32_t system_uid_max;
         uint64_t max_bytes, max_fds, max_matches;
         uid_t broker_uid;
@@ -78,6 +82,9 @@ struct Launcher {
         ServiceManager *service_manager;
         PtrVec *service_dirs;
         U32Vec static_uids, dynamic_uids;
+        /* Set once elogind has answered. From then on at_console follows local
+         * sessions for every UID, not only system users. */
+        bool console_tracked;
         LauncherConfig *config_state;
         Watch *watch;
 #ifdef HAVE_ELOGIND
@@ -181,14 +188,16 @@ static void load_static_console_users(Launcher *launcher)
 static bool make_policy(Launcher *launcher, LauncherConfig *config, DBusWriter *policy, Error **error)
 {
         U32Vec uids = effective_console_uids(launcher);
-        bool result = launcher_config_export_policy_wire(config, launcher->user, launcher->system_uid_max, uids.items,
-                                                         uids.len, policy, error);
+        uint32_t uid_max = launcher->console_tracked ? UINT32_MAX : launcher->system_uid_max;
+        bool result = launcher_config_export_policy_wire(config, launcher->user, uid_max, uids.items, uids.len, policy,
+                                                         error);
         u32_vec_clear(&uids);
         return result;
 }
 
 #ifdef HAVE_ELOGIND
-static bool refresh_console_users(Launcher *launcher)
+/* Sets *changed when the policy-relevant console state differs. */
+static bool refresh_console_users(Launcher *launcher, bool *changed)
 {
         uid_t *uids = NULL;
         U32Vec candidate = {0};
@@ -224,8 +233,12 @@ static bool refresh_console_users(Launcher *launcher)
         }
         free(uids);
         u32_vec_sort_unique(&candidate);
+        *changed = !launcher->console_tracked || candidate.len != launcher->dynamic_uids.len ||
+                   (candidate.len &&
+                    memcmp(candidate.items, launcher->dynamic_uids.items, candidate.len * sizeof(*candidate.items)));
         u32_vec_clear(&launcher->dynamic_uids);
         launcher->dynamic_uids = candidate;
+        launcher->console_tracked = true;
         return true;
 }
 
@@ -234,10 +247,13 @@ static bool console_event(EventSource *source, uint32_t events, void *data, Erro
         Launcher *launcher = data;
         DBusWriter policy = {0};
         Error *local_error = NULL;
+        bool changed = false;
         (void)source;
         (void)events;
         sd_login_monitor_flush(launcher->console_monitor);
-        if (refresh_console_users(launcher) && make_policy(launcher, launcher->config_state, &policy, &local_error) &&
+        if (!refresh_console_users(launcher, &changed) || !changed)
+                return true;
+        if (make_policy(launcher, launcher->config_state, &policy, &local_error) &&
             controller_set_policy(&launcher->controller, "/org/bus1/DBus/Listener/0",
                                   launcher_config_policy_signature(), &policy, &local_error)) {
                 dbus_writer_clear(&policy);
@@ -265,9 +281,10 @@ static bool configure_console_monitor(Launcher *launcher, Error **error)
                                 error);
 }
 #else
-static bool refresh_console_users(Launcher *launcher)
+static bool refresh_console_users(Launcher *launcher, bool *changed)
 {
         (void)launcher;
+        *changed = false;
         return true;
 }
 static bool configure_console_monitor(Launcher *launcher, Error **error)
@@ -416,6 +433,8 @@ static bool reload_config(Launcher *launcher, Error **error)
                                        launcher_config_bus_type(launcher->config_state)
                                                ? launcher_config_bus_type(launcher->config_state)
                                                : (launcher->user ? "session" : "system"));
+        service_manager_configure(launcher->service_manager, launcher->user,
+                                  launcher_config_service_start_timeout(launcher->config_state));
         event_source_remove(&launcher->watch_source);
         event_source_remove(&launcher->watch_timer_source);
         watch_free(launcher->watch);
@@ -521,6 +540,36 @@ static void run_pending_reload(Launcher *launcher)
         error_free(reload_error);
 }
 
+/* Serializes dispatchers starting on one address: without it, two could both
+ * judge the socket stale and one would replace the other's listener. The lock
+ * file is removed on exit, so a lock taken on an unlinked file is retried. */
+static bool lock_listener(Launcher *launcher, Error **error)
+{
+        struct stat locked, current;
+        launcher->lock_path = str_printf("%s.lock", launcher->socket_path);
+        if (!launcher->lock_path)
+                return error_set(error, ENOMEM, "Cannot allocate listener lock path");
+        for (;;) {
+                int fd = open(launcher->lock_path, O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+                if (fd < 0)
+                        return error_set_errno(error, errno, "Cannot open %s", launcher->lock_path);
+                if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+                        int saved = errno;
+                        close(fd);
+                        if (saved == EWOULDBLOCK)
+                                return error_set(error, EADDRINUSE, "A D-Bus listener is already active at %s",
+                                                 launcher->socket_path);
+                        return error_set_errno(error, saved, "Cannot lock %s", launcher->lock_path);
+                }
+                if (fstat(fd, &locked) == 0 && stat(launcher->lock_path, &current) == 0 &&
+                    locked.st_dev == current.st_dev && locked.st_ino == current.st_ino) {
+                        launcher->lock_fd = fd;
+                        return true;
+                }
+                close(fd);
+        }
+}
+
 static bool bind_listener(Launcher *launcher, Error **error)
 {
         struct stat st, parent_stat;
@@ -529,8 +578,11 @@ static bool bind_listener(Launcher *launcher, Error **error)
         int probe;
         if (!parent)
                 return error_set(error, ENOMEM, "Cannot allocate socket parent path");
+        /* A user bus needs a directory it owns; a system bus one owned by root
+         * or by the dispatcher's user. Nobody else may be able to write it. */
         if (lstat(parent, &parent_stat) < 0 || !S_ISDIR(parent_stat.st_mode) ||
-            (launcher->user && parent_stat.st_uid != geteuid()) || (parent_stat.st_mode & 0022)) {
+            (parent_stat.st_uid != geteuid() && (launcher->user || parent_stat.st_uid != 0)) ||
+            (parent_stat.st_mode & 0022)) {
                 error_set(error, EPERM, "D-Bus socket parent must be a non-writable trusted directory: %s", parent);
                 free(parent);
                 return false;
@@ -538,6 +590,8 @@ static bool bind_listener(Launcher *launcher, Error **error)
         free(parent);
         if (strlen(launcher->socket_path) >= sizeof(address.sun_path))
                 return error_set(error, ENAMETOOLONG, "Socket path is too long: %s", launcher->socket_path);
+        if (!lock_listener(launcher, error))
+                return false;
         strcpy(address.sun_path, launcher->socket_path);
         if (lstat(launcher->socket_path, &st) == 0) {
                 if (!S_ISSOCK(st.st_mode) || st.st_uid != geteuid())
@@ -927,18 +981,25 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
         pid_t child;
         char status;
         ssize_t n;
+        /* With --ready-fd the caller learns the outcome there, so the parent
+         * exits at once. Otherwise it waits and reports it as its exit status. */
+        bool wait_ready = launcher->startup_fd < 0;
         if (!launcher->daemonize)
                 return true;
-        if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
+        if (wait_ready && socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0)
                 return error_set_errno(error, errno, "Cannot create startup socketpair");
         child = fork();
         if (child < 0) {
                 int saved = errno;
-                close(pair[0]);
-                close(pair[1]);
+                if (wait_ready) {
+                        close(pair[0]);
+                        close(pair[1]);
+                }
                 return error_set_errno(error, saved, "Cannot daemonize");
         }
         if (child > 0) {
+                if (!wait_ready)
+                        _exit(0);
                 close(pair[1]);
                 do
                         n = read(pair[0], &status, 1);
@@ -946,8 +1007,10 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
                 close(pair[0]);
                 _exit(n == 1 && status == 'R' ? 0 : 1);
         }
-        close(pair[0]);
-        launcher->startup_fd = pair[1];
+        if (wait_ready) {
+                close(pair[0]);
+                launcher->startup_fd = pair[1];
+        }
         if (!launcher_config_keep_umask(launcher->config_state))
                 umask(0022);
         null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
@@ -966,8 +1029,21 @@ static void notify_startup(Launcher *launcher, bool ready)
         char status = ready ? 'R' : 'F';
         if (launcher->startup_fd < 0)
                 return;
-        while (send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 && errno == EINTR)
-                ;
+        if (launcher->startup_pipe) {
+                /* Supervisors read a newline as readiness and EOF as failure.
+                 * A closed reader must not kill us with SIGPIPE. */
+                if (ready) {
+                        static const char line[] = "READY=1\n";
+                        struct sigaction ignore = {.sa_handler = SIG_IGN}, previous;
+                        sigaction(SIGPIPE, &ignore, &previous);
+                        while (write(launcher->startup_fd, line, sizeof(line) - 1) < 0 && errno == EINTR)
+                                ;
+                        sigaction(SIGPIPE, &previous, NULL);
+                }
+        } else {
+                while (send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 && errno == EINTR)
+                        ;
+        }
         close(launcher->startup_fd);
         launcher->startup_fd = -1;
 }
@@ -1063,12 +1139,16 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
         }
 }
 
+/* Fallback for when the configured broker path is missing. Relative and empty
+ * PATH entries name the working directory, so they are never searched. */
 static char *find_program(const char *name)
 {
         const char *path = getenv("PATH");
         char *copy = str_dup(path ? path : "/usr/local/bin:/usr/bin:/bin"), *cursor = copy, *directory;
         while (copy && (directory = strsep(&cursor, ":"))) {
-                char *candidate = path_join(*directory ? directory : ".", name);
+                if (!path_is_absolute(directory))
+                        continue;
+                char *candidate = path_join(directory, name);
                 if (candidate && access(candidate, X_OK) == 0) {
                         free(copy);
                         return candidate;
@@ -1095,7 +1175,9 @@ static void usage(void)
              "  --audit               Pass audit capability to dbus-broker.\n"
              "  --foreground          Never daemonize, whatever <fork/> says.\n"
              "  --fork                Daemonize even without <fork/> in the configuration.\n"
-             "  --ready-fd=FD         Report R/F on a connected Unix stream socket; requires --foreground.\n"
+             "  --syslog              Log to syslog even in the foreground, like <syslog/>.\n"
+             "  --ready-fd=FD         Report readiness on FD: R/F on a Unix stream socket, or a\n"
+             "                        newline on a pipe (s6, dinit, OpenRC notify=fd).\n"
              "  --help                Show this help text.\n"
              "  --version             Show the version.");
 }
@@ -1128,6 +1210,12 @@ static void launcher_clear(Launcher *launcher)
         str_buf_clear(&launcher->broker_log);
         if (launcher->listener_bound && launcher->socket_path)
                 unlink(launcher->socket_path);
+        /* Unlink while still holding the lock; see lock_listener(). */
+        if (launcher->lock_fd >= 0) {
+                unlink(launcher->lock_path);
+                close(launcher->lock_fd);
+        }
+        free(launcher->lock_path);
         if (launcher->pid_file_written && launcher->pid_file)
                 unlink(launcher->pid_file);
         service_manager_free(launcher->service_manager);
@@ -1148,14 +1236,17 @@ int main(int argc, char **argv)
         Launcher launcher = {.startup_fd = -1,
                              .listener_fd = -1,
                              .signal_fd = -1,
+                             .lock_fd = -1,
                              .broker_log_fd = -1,
                              .controller.transport.fd = -1,
                              .loop.epoll_fd = -1};
         Error *error = NULL;
         bool scope_set = false, broker_explicit = false, foreground_flag = false, fork_flag = false;
+        bool syslog_flag = false;
         uint64_t parsed;
         int option;
         const char *runtime, *configured_address;
+        /* clang-format off */
         static const struct option options[] = {
                 {"scope", required_argument, NULL, 's'},
                 {"config-file", required_argument, NULL, 'c'},
@@ -1166,11 +1257,13 @@ int main(int argc, char **argv)
                 {"audit", no_argument, NULL, 'A'},
                 {"foreground", no_argument, NULL, 'f'},
                 {"fork", no_argument, NULL, 'F'},
+                {"syslog", no_argument, NULL, 'S'},
                 {"ready-fd", required_argument, NULL, 'r'},
                 {"help", no_argument, NULL, 'h'},
                 {"version", no_argument, NULL, 'V'},
                 {NULL, 0, NULL, 0},
         };
+        /* clang-format on */
         launcher.system_uid_max = 999;
         while ((option = getopt_long(argc, argv, "", options, NULL)) != -1) {
                 switch (option) {
@@ -1212,6 +1305,9 @@ int main(int argc, char **argv)
                 case 'F':
                         fork_flag = true;
                         break;
+                case 'S':
+                        syslog_flag = true;
+                        break;
                 case 'r':
                         if (launcher.startup_fd >= 0 || !parse_u64(optarg, INT_MAX, &parsed) || parsed < 3) {
                                 fputs("Invalid or repeated --ready-fd\n", stderr);
@@ -1233,15 +1329,18 @@ int main(int argc, char **argv)
         }
         if (launcher.startup_fd >= 0) {
                 struct sockaddr_storage peer;
+                struct stat st;
                 socklen_t peer_length = sizeof(peer), type_length = sizeof(int);
                 int type, flags = fcntl(launcher.startup_fd, F_GETFD);
-                if (!foreground_flag || flags < 0 ||
-                    getsockopt(launcher.startup_fd, SOL_SOCKET, SO_TYPE, &type, &type_length) < 0 ||
-                    type != SOCK_STREAM ||
-                    getpeername(launcher.startup_fd, (struct sockaddr *)&peer, &peer_length) < 0 ||
-                    peer.ss_family != AF_UNIX || fcntl(launcher.startup_fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
-                        fputs("--ready-fd requires --foreground and a connected Unix stream socket on fd >= 3\n",
-                              stderr);
+                launcher.startup_pipe = flags >= 0 && fstat(launcher.startup_fd, &st) == 0 && S_ISFIFO(st.st_mode);
+                if (flags < 0 ||
+                    (!launcher.startup_pipe &&
+                     (getsockopt(launcher.startup_fd, SOL_SOCKET, SO_TYPE, &type, &type_length) < 0 ||
+                      type != SOCK_STREAM ||
+                      getpeername(launcher.startup_fd, (struct sockaddr *)&peer, &peer_length) < 0 ||
+                      peer.ss_family != AF_UNIX)) ||
+                    fcntl(launcher.startup_fd, F_SETFD, flags | FD_CLOEXEC) < 0) {
+                        fputs("--ready-fd requires a pipe or a connected Unix stream socket on fd >= 3\n", stderr);
                         return 2;
                 }
         }
@@ -1284,9 +1383,9 @@ int main(int argc, char **argv)
                 goto fail;
         }
         launcher.daemonize = !foreground_flag && (fork_flag || launcher_config_fork(launcher.config_state));
-        /* <syslog/> asks for syslog even in the foreground; daemonizing forces
+        /* --syslog and <syslog/> ask for syslog even in the foreground; daemonizing forces
          * it regardless, because stderr becomes /dev/null there. */
-        if (launcher_config_syslog(launcher.config_state))
+        if (syslog_flag || launcher_config_syslog(launcher.config_state))
                 log_use_syslog("dbus-broker-dispatch");
         if (!launcher.pid_file && launcher_config_pid_file(launcher.config_state)) {
                 launcher.pid_file = str_dup(launcher_config_pid_file(launcher.config_state));
@@ -1319,8 +1418,9 @@ int main(int argc, char **argv)
         }
         if (!launcher.user) {
                 load_static_console_users(&launcher);
+                bool changed;
                 if (launcher_config_uses_console_policy(launcher.config_state))
-                        refresh_console_users(&launcher);
+                        refresh_console_users(&launcher, &changed);
         }
         if (!service_table_scan(launcher.service_dirs, launcher_config_nss_cache(launcher.config_state), launcher.user,
                                 service_manager_table(launcher.service_manager), &error) ||
@@ -1348,6 +1448,8 @@ int main(int argc, char **argv)
                                        launcher_config_bus_type(launcher.config_state)
                                                ? launcher_config_bus_type(launcher.config_state)
                                                : (launcher.user ? "session" : "system"));
+        service_manager_configure(launcher.service_manager, launcher.user,
+                                  launcher_config_service_start_timeout(launcher.config_state));
         if (!service_table_register_all(launcher.service_manager, service_manager_table(launcher.service_manager),
                                         &error) ||
             !add_listener(&launcher, &error) || !configure_console_monitor(&launcher, &error) ||

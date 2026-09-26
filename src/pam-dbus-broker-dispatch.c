@@ -29,6 +29,9 @@
 #define STATE_NAME ".dbus-broker-dispatch.pam"
 #define PID_NAME "dbus-broker-dispatch.pid"
 #define PAM_DATA_KEY "dbus-broker-dispatch/session"
+/* A login waiting on another login's bus start must outlast that start. */
+#define STARTUP_TIMEOUT_MS 25000
+#define LOCK_TIMEOUT_MS 30000
 
 typedef struct {
         char *runtime;
@@ -125,13 +128,31 @@ static bool socket_is_live(const char *runtime)
 
         if (!join_path(path, sizeof(path), runtime, "bus") || strlen(path) >= sizeof(address.sun_path))
                 return false;
-        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
+        /* Non-blocking, so a listener that never accepts cannot hang the
+         * login. A full backlog still means something is listening. */
+        fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
         if (fd < 0)
                 return false;
         memcpy(address.sun_path, path, strlen(path) + 1);
-        live = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0;
+        live = connect(fd, (struct sockaddr *)&address, sizeof(address)) == 0 || errno == EAGAIN;
         close(fd);
         return live;
+}
+
+/* Waits for the per-user startup lock, but not forever: a stuck holder must
+ * not block every later login of that user. */
+static bool lock_runtime_dir(int directory_fd)
+{
+        for (int waited = 0; flock(directory_fd, LOCK_EX | LOCK_NB) < 0; waited += 50) {
+                if (errno != EWOULDBLOCK && errno != EINTR)
+                        return false;
+                if (waited >= LOCK_TIMEOUT_MS) {
+                        errno = ETIMEDOUT;
+                        return false;
+                }
+                poll(NULL, 0, 50);
+        }
+        return true;
 }
 
 static bool process_start_time(pid_t pid, uid_t uid, unsigned long long *start_time)
@@ -426,9 +447,9 @@ static void free_environment(char **environment)
 }
 
 static void child_exec(const Options *options, const struct passwd *entry, const char *pid_path, gid_t *groups,
-                       int group_count, char **environment)
+                       int group_count, char **environment, int ready_fd)
 {
-        char *arguments[9];
+        char *arguments[10];
         size_t n = 0;
         sigset_t empty;
         struct sigaction action = {.sa_handler = SIG_DFL};
@@ -436,6 +457,7 @@ static void child_exec(const Options *options, const struct passwd *entry, const
         arguments[n++] = (char *)options->dispatcher;
         arguments[n++] = "--scope=user";
         arguments[n++] = "--fork";
+        arguments[n++] = "--ready-fd=3";
         arguments[n++] = "--pid-file";
         arguments[n++] = (char *)pid_path;
         if (options->config) {
@@ -456,9 +478,12 @@ static void child_exec(const Options *options, const struct passwd *entry, const
                                syscall(SYS_setresgid, entry->pw_gid, entry->pw_gid, entry->pw_gid) < 0 ||
                                syscall(SYS_setresuid, entry->pw_uid, entry->pw_uid, entry->pw_uid) < 0))
                 _exit(126);
+        /* dup2() onto itself would leave FD_CLOEXEC set. */
+        if (ready_fd == 3 ? fcntl(3, F_SETFD, 0) < 0 : dup2(ready_fd, 3) < 0)
+                _exit(126);
         bool close_fallback = true;
 #ifdef SYS_close_range
-        if (syscall(SYS_close_range, 3U, UINT_MAX, 0U) == 0)
+        if (syscall(SYS_close_range, 4U, UINT_MAX, 0U) == 0)
                 close_fallback = false;
         else if (errno != ENOSYS)
                 _exit(126);
@@ -467,7 +492,7 @@ static void child_exec(const Options *options, const struct passwd *entry, const
                 long limit = sysconf(_SC_OPEN_MAX);
                 if (limit < 0 || limit > 1048576)
                         limit = 65536;
-                for (int fd = 3; fd < limit; ++fd)
+                for (int fd = 4; fd < limit; ++fd)
                         close(fd);
         }
         execve(options->dispatcher, arguments, environment);
@@ -478,29 +503,43 @@ static bool start_dispatcher(pam_handle_t *pamh, const Options *options, const s
                              const char *runtime, const char *pid_path)
 {
         gid_t *groups = NULL;
-        int group_count = 0, status;
-        char **environment;
+        int group_count = 0, pair[2], result;
+        char **environment, status = 0;
         pid_t child;
 
         if (geteuid() == 0 && !supplementary_groups(entry->pw_name, entry->pw_gid, &groups, &group_count))
                 return false;
         environment = build_environment(pamh, entry, runtime);
-        if (!environment) {
+        if (!environment || socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) < 0) {
                 free(groups);
+                free_environment(environment);
                 return false;
         }
         child = fork();
         if (child == 0)
-                child_exec(options, entry, pid_path, groups, group_count, environment);
+                child_exec(options, entry, pid_path, groups, group_count, environment, pair[1]);
         free(groups);
         free_environment(environment);
-        if (child < 0)
+        close(pair[1]);
+        if (child < 0) {
+                close(pair[0]);
                 return false;
-        while (waitpid(child, &status, 0) < 0) {
-                if (errno != EINTR)
-                        return false;
         }
-        return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+        /* The dispatcher reports readiness itself. Its exit status is not
+         * reliable here: the host application may reap children on its own
+         * or ignore SIGCHLD. */
+        struct pollfd ready = {.fd = pair[0], .events = POLLIN};
+        do
+                result = poll(&ready, 1, STARTUP_TIMEOUT_MS);
+        while (result < 0 && errno == EINTR);
+        bool success = result > 0 && recv(pair[0], &status, 1, 0) == 1 && status == 'R';
+        close(pair[0]);
+        /* A dispatcher stuck before daemonizing is still this child. */
+        if (result == 0)
+                kill(child, SIGKILL);
+        while (waitpid(child, NULL, 0) < 0 && errno == EINTR)
+                ;
+        return success;
 }
 
 static bool state_matches_bus(int directory_fd, uid_t uid, State *state)
@@ -637,7 +676,7 @@ int dbus_dispatch_open_session(pam_handle_t *pamh, int argc, const char **argv)
                 pam_syslog(pamh, LOG_ERR, "unsafe XDG_RUNTIME_DIR for user %s", user);
                 goto out;
         }
-        if (flock(directory_fd, LOCK_EX) < 0) {
+        if (!lock_runtime_dir(directory_fd)) {
                 pam_syslog(pamh, LOG_ERR, "cannot lock user bus startup: %s", strerror(errno));
                 goto out;
         }
@@ -721,7 +760,7 @@ int dbus_dispatch_close_session(pam_handle_t *pamh)
                 return PAM_SUCCESS;
         if (!safe_runtime_dir(session->runtime, session->uid, &directory_fd))
                 return PAM_SUCCESS;
-        if (flock(directory_fd, LOCK_EX) < 0)
+        if (!lock_runtime_dir(directory_fd))
                 goto out;
         if (!state_matches_bus(directory_fd, session->uid, &state)) {
                 unlinkat(directory_fd, STATE_NAME, 0);

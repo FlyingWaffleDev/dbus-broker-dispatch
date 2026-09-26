@@ -15,13 +15,20 @@ jobs:
   # project targets, elogind, and dbus-broker. Running here rather than on a
   # systemd host is what makes the elogind build testable at all.
   artix:
-    name: artix (${{ matrix.cc }})
+    name: artix (${{ matrix.cc }}, ${{ matrix.config }})
     runs-on: ubuntu-latest
     container: docker.io/artixlinux/artixlinux:base
     strategy:
       fail-fast: false
       matrix:
         cc: [gcc, clang]
+        config: [full, minimal]
+        # minimal compiles the #ifdef paths used without PAM and elogind.
+        include:
+          - config: full
+            options: -Dpam=enabled -Delogind=enabled
+          - config: minimal
+            options: -Dpam=disabled -Delogind=disabled -Dselinux=disabled
     env:
       CC: ${{ matrix.cc }}
     steps:
@@ -41,7 +48,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: meson setup build --buildtype=debugoptimized --werror -Dpam=enabled -Delogind=true
+        run: meson setup build --buildtype=debugoptimized --werror ${{ matrix.options }}
 
       - name: Compile
         run: meson compile -C build
@@ -56,7 +63,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: testlog-artix-${{ matrix.cc }}
+          name: testlog-artix-${{ matrix.cc }}-${{ matrix.config }}
           path: build/meson-logs/
 
   # Void is non-systemd (runit) and the only such distro packaging libselinux,
@@ -84,9 +91,9 @@ jobs:
             dbus python3 git bash coreutils gawk tar
 
       # Void packages no dbus-broker, and four tests spawn a real broker.
-      # Pinned to v36 because v37 requires a Rust toolchain to build. Upstream
-      # installs into libexecdir, which is not on PATH, so place the binary
-      # where the dispatcher will find it.
+      # Pinned to v36 because v37 requires a Rust toolchain to build. Install
+      # just the broker, into bindir as upstream does, where the dispatcher
+      # finds it.
       - name: Build dbus-broker
         run: |
           git clone --depth 1 --branch v36 https://github.com/bus1/dbus-broker.git /tmp/dbus-broker
@@ -101,7 +108,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Configure
-        run: meson setup build --buildtype=debugoptimized --werror -Dpam=enabled -Dselinux=enabled -Delogind=true
+        run: meson setup build --buildtype=debugoptimized --werror -Dpam=enabled -Dselinux=enabled -Delogind=enabled
 
       - name: Compile
         run: meson compile -C build
@@ -142,7 +149,7 @@ jobs:
         run: |
           meson setup build --buildtype=debugoptimized \
             -Db_sanitize=address,undefined -Db_lundef=false \
-            -Dpam=enabled -Delogind=true
+            -Dpam=enabled -Delogind=enabled
 
       - name: Compile
         run: meson compile -C build
@@ -158,14 +165,20 @@ jobs:
           path: build/meson-logs/
 
   format:
-    name: clang-format
+    name: clang-format + shellcheck
     runs-on: ubuntu-latest
     container: docker.io/artixlinux/artixlinux:base
     steps:
       - name: Install dependencies
-        run: pacman -Syu --noconfirm --needed clang git
+        run: pacman -Syu --noconfirm --needed clang git shellcheck
 
       - uses: actions/checkout@v4
 
       - name: Check formatting
         run: clang-format --dry-run -Werror src/*.c src/*.h tests/*.c
+
+      # OpenRC scripts use variables that openrc-run and conf.d define.
+      - name: Check shell scripts
+        run: |
+          shellcheck -s sh init/*/dbus-broker-dispatch.sh init/*/*/dbus/run
+          shellcheck -s sh -e SC2034,SC2154 init/openrc/dbus.initd init/openrc/dbus.user.initd init/openrc/dbus.confd

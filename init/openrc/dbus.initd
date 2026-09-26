@@ -1,9 +1,16 @@
 #!/sbin/openrc-run
 
 description="D-Bus system message bus (dbus-broker-dispatch)"
+supervisor=supervise-daemon
 command="/usr/bin/dbus-broker-dispatch"
-pidfile="/run/dbus/dbus-broker-dispatch.pid"
-command_args="--scope=system --fork --pid-file=${pidfile} ${dbus_dispatch_args}"
+command_args="--scope=system --foreground --syslog --ready-fd=3 ${dbus_dispatch_args}"
+# The dispatcher reports on fd 3 once the listener is live, so dependent
+# services only start when they can connect.
+notify="fd:3"
+# The dispatcher exits when dbus-broker dies; restart the pair.
+respawn_delay=1
+respawn_max=5
+respawn_period=60
 
 extra_started_commands="reload"
 
@@ -25,6 +32,6 @@ start_pre() {
 
 reload() {
 	ebegin "Reloading D-Bus system configuration"
-	start-stop-daemon --signal HUP --pidfile "${pidfile}"
+	supervise-daemon "${RC_SVCNAME}" --signal HUP
 	eend $?
 }

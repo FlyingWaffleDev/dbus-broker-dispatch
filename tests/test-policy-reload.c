@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* These assertions have side effects and must survive NDEBUG builds. */
+#undef NDEBUG
 #include "dbus-transport.h"
 #include "dbus-wire.h"
 

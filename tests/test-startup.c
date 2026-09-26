@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* These assertions have side effects and must survive NDEBUG builds. */
+#undef NDEBUG
 #include <assert.h>
 #include <errno.h>
 #include <fcntl.h>

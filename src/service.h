@@ -12,6 +12,9 @@ ServiceManager *service_manager_new(void);
 void service_manager_free(ServiceManager *manager);
 void service_manager_set_controller(ServiceManager *manager, Controller *controller, const char *address,
                                     const char *bus_type);
+/* User buses pass the dispatcher's environment to activated services; system
+ * buses start from a minimal one. start_timeout_ms bounds each activation. */
+void service_manager_configure(ServiceManager *manager, bool user_scope, uint64_t start_timeout_ms);
 ServiceTable *service_manager_table(ServiceManager *manager);
 void service_manager_take_table(ServiceManager *manager, ServiceTable *services);
 

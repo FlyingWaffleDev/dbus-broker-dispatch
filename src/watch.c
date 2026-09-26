@@ -111,15 +111,16 @@ static bool rebuild(Watch *watch, Error **error)
                         entry_free(entry);
                         goto memory;
                 }
-                /* Only a direct child can be recognised by the name inotify
-                 * reports. A target further below the watched ancestor keeps
-                 * the unfiltered behaviour. */
+                /* inotify names only direct children, so filter on the first
+                 * component below the watched ancestor. Creating it triggers
+                 * a rebuild that moves the watch one level deeper. */
                 if (substituted) {
-                        char *parent = path_dirname(entry->target);
-                        const char *slash = strrchr(entry->target, '/');
-                        if (parent && slash && strcmp(parent, entry->monitored) == 0)
-                                entry->filter = strdup(slash + 1);
-                        free(parent);
+                        size_t n = strlen(entry->monitored);
+                        if (strncmp(entry->target, entry->monitored, n) == 0 && (n == 1 || entry->target[n] == '/')) {
+                                const char *rest = entry->target + (n == 1 ? 1 : n + 1);
+                                if (*rest)
+                                        entry->filter = strndup(rest, strcspn(rest, "/"));
+                        }
                 }
                 if (!ptr_vec_push(&entries, entry)) {
                         entry_free(entry);
@@ -249,7 +250,7 @@ int watch_timer_fd(const Watch *watch)
 }
 
 /* True when the event concerns something we actually watch for. Entries that
- * only watch a parent directory to observe one file ignore its siblings. */
+ * only watch an ancestor to observe one path ignore unrelated names. */
 static bool event_is_relevant(const Watch *watch, const struct inotify_event *event)
 {
         bool matched_descriptor = false;

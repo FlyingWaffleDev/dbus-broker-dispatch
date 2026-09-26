@@ -1,18 +1,20 @@
-project('dbus-broker-dispatch', 'c', version: '0.1.0',
+project('dbus-broker-dispatch', 'c', version: '0.1.0', license: 'GPL-3.0-or-later',
         default_options: ['c_std=c11', 'warning_level=3'])
 
 expat = dependency('expat')
 selinux = dependency('libselinux', required: get_option('selinux'))
+elogind = dependency('libelogind', required: get_option('elogind'))
+broker = get_option('broker')
+if broker == ''
+  broker = get_option('prefix') / get_option('bindir') / 'dbus-broker'
+endif
 conf = configuration_data()
 conf.set_quoted('PROJECT_VERSION', meson.project_version())
-conf.set_quoted('DEFAULT_BROKER', get_option('prefix') / get_option('libexecdir') / 'dbus-broker')
+conf.set_quoted('DEFAULT_BROKER', broker)
 conf.set_quoted('DEFAULT_DISPATCHER', get_option('prefix') / get_option('bindir') / 'dbus-broker-dispatch')
 conf.set_quoted('SYSTEM_CONSOLE_USERS', ','.join(get_option('system-console-users')))
-if get_option('elogind')
-  elogind = dependency('libelogind', required: true)
+if elogind.found()
   conf.set('HAVE_ELOGIND', 1)
-else
-  elogind = disabler()
 endif
 if selinux.found()
   conf.set('HAVE_SELINUX', 1)
@@ -23,7 +25,7 @@ deps = [expat]
 if selinux.found()
   deps += selinux
 endif
-if get_option('elogind')
+if elogind.found()
   deps += elogind
 endif
 src_inc = include_directories('src')

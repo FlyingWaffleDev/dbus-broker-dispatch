@@ -1,7 +1,9 @@
-option('elogind', type: 'boolean', value: false,
+option('elogind', type: 'feature', value: 'auto',
        description: 'Use elogind to detect active local sessions')
 option('system-console-users', type: 'array', value: [],
        description: 'Users that always receive at_console policy')
+option('broker', type: 'string', value: '',
+       description: 'Path of the dbus-broker executable; defaults to bindir/dbus-broker')
 option('pam', type: 'feature', value: 'auto',
        description: 'Build the PAM session module')
 option('pam-module-dir', type: 'string', value: '',

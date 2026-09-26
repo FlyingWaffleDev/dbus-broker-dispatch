@@ -1,4 +1,6 @@
 #define _GNU_SOURCE
+/* These assertions have side effects and must survive NDEBUG builds. */
+#undef NDEBUG
 #include "address.h"
 #include "config-policy-internal.h"
 #include "config-policy.h"
@@ -375,12 +377,13 @@ static void test_controller_reply_ordering(void)
         close(sockets[1]);
 }
 
-/* A file target is watched through its parent directory; unrelated siblings in
- * that directory must not look like changes. */
+/* A file target, and a missing directory two levels down, are both watched
+ * through their common ancestor; unrelated names there must not look like
+ * changes. */
 static void test_watch_filters_siblings(void)
 {
         char root[] = "/tmp/dbd-native-filter-XXXXXX";
-        char *target, *sibling;
+        char *target, *sibling, *missing;
         unsigned int calls = 0;
         PtrVec paths;
         Error *error = NULL;
@@ -390,12 +393,14 @@ static void test_watch_filters_siblings(void)
         assert(mkdtemp(root));
         assert(asprintf(&target, "%s/watched.conf", root) >= 0);
         assert(asprintf(&sibling, "%s/unrelated.log", root) >= 0);
+        assert(asprintf(&missing, "%s/dbus-1/services", root) >= 0);
         write_contents(target, "x");
 
         watch = watch_new(watch_called, &calls, &error);
         assert(watch);
         ptr_vec_init(&paths, free);
-        assert(ptr_vec_push(&paths, strdup(target)) && watch_set_paths(watch, &paths, &error));
+        assert(ptr_vec_push(&paths, strdup(target)) && ptr_vec_push(&paths, missing) &&
+               watch_set_paths(watch, &paths, &error));
 
         inotify_poll = (struct pollfd){.fd = watch_inotify_fd(watch), .events = POLLIN};
         write_contents(sibling, "noise");
@@ -672,7 +677,8 @@ static void test_activation_generations(void)
                         pid_t new_pid = activate_and_wait(manager, path, serial, &new_status);
                         assert(new_pid > 0);
                         assert(service_manager_reap(manager, old_pid, old_status));
-                        assert(service_manager_timeout_ms(manager) == -1);
+                        /* The current attempt's deadline must survive the stale exit. */
+                        assert(service_manager_timeout_ms(manager) > 0);
                         /* A stale failure must not make the current serial start twice. */
                         errno = 0;
                         assert(activate_and_wait(manager, path, serial, &unused) == -1 && errno == ECHILD);

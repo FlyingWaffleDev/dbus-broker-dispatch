@@ -25,6 +25,7 @@ void launcher_config_set_apparmor_mode(LauncherConfig *config, uint32_t mode);
 uint64_t launcher_config_max_bytes(LauncherConfig *config);
 uint64_t launcher_config_max_fds(LauncherConfig *config);
 uint64_t launcher_config_max_matches(LauncherConfig *config);
+uint64_t launcher_config_service_start_timeout(LauncherConfig *config);
 
 const char *launcher_config_policy_signature(void);
 bool launcher_config_export_policy_wire(LauncherConfig *config, bool user_scope, uint32_t system_uid_max,

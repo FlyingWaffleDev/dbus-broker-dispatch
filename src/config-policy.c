@@ -84,6 +84,7 @@ LauncherConfig *launcher_config_new(void)
         config->max_outgoing_fds = 64;
         config->max_connections_per_user = 64;
         config->max_matches_per_connection = 256;
+        config->service_start_timeout = 25000;
         return config;
 }
 
@@ -191,6 +192,11 @@ uint64_t launcher_config_max_fds(LauncherConfig *config)
 uint64_t launcher_config_max_matches(LauncherConfig *config)
 {
         return multiply_saturating(config->max_connections_per_user, config->max_matches_per_connection);
+}
+
+uint64_t launcher_config_service_start_timeout(LauncherConfig *config)
+{
+        return config->service_start_timeout;
 }
 
 static const char *attribute(const char **attributes, const char *name)
@@ -1091,6 +1097,8 @@ static void parser_end(void *data, const XML_Char *element)
                                 state->config->max_connections_per_user = parsed;
                         } else if (str_equal(state->limit_name, "max_match_rules_per_connection")) {
                                 state->config->max_matches_per_connection = parsed;
+                        } else if (str_equal(state->limit_name, "service_start_timeout")) {
+                                state->config->service_start_timeout = parsed;
                         } else {
                                 parser_warning(state, "ignoring unsupported D-Bus limit '%s'", state->limit_name);
                         }

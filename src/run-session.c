@@ -19,9 +19,12 @@
 
 static volatile sig_atomic_t command_pid;
 
-static void forward_signal(int signal_number)
+/* The command shares our process group, so signals from the terminal (sent by
+ * the kernel) already reached it. Forwarding those would deliver them twice. */
+static void forward_signal(int signal_number, siginfo_t *info, void *context)
 {
-        if (command_pid > 0)
+        (void)context;
+        if (command_pid > 0 && info->si_code != SI_KERNEL)
                 kill(command_pid, signal_number);
 }
 
@@ -86,7 +89,9 @@ static bool launcher_child_setup(void *data, int *error_number)
 {
         LauncherChild *child = data;
 
-        if (prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != child->parent ||
+        /* Its own process group keeps terminal signals such as Ctrl-C from
+         * stopping the bus while the command is still using it. */
+        if (setpgid(0, 0) < 0 || prctl(PR_SET_PDEATHSIG, SIGTERM) < 0 || getppid() != child->parent ||
             fcntl(child->ready_fd, F_SETFD, 0) < 0) {
                 *error_number = errno ? errno : ESRCH;
                 return false;
@@ -159,7 +164,7 @@ int main(int argc, char **argv)
         char *directory = NULL, *escaped = NULL;
         Error *error = NULL;
         pid_t bus = 0, child;
-        struct sigaction action = {.sa_handler = forward_signal};
+        struct sigaction action = {.sa_sigaction = forward_signal, .sa_flags = SA_SIGINFO};
         sigset_t blocked_signals, previous_mask;
         struct stat st;
         int status, exit_status = 1;

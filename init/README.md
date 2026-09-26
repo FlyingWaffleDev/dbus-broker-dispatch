@@ -17,13 +17,18 @@ Install the files as follows:
   `/etc/user/init.d/dbus`. When the PAM module is disabled,
   `openrc/dbus-broker-dispatch.sh` can be installed in `/etc/profile.d`.
 - s6: install `s6/system/dbus` or `s6/user/dbus` as a service directory in the
-  appropriate scan directory.
+  appropriate scan directory, including its `notification-fd` file.
 - Dinit: install `dinit/system/dbus` in a system service-description directory
   or `dinit/user/dbus` in a user service-description directory.
 - runit: install `runit/system/dbus` or `runit/user/dbus` as a service directory
   in the appropriate `runsvdir`.
 
 The s6 and runit `run` files must remain executable.
+
+The OpenRC system service runs under `supervise-daemon`, which restarts the
+dispatcher if it or dbus-broker dies. OpenRC, s6, and Dinit services report
+readiness through `--ready-fd`, so dependent services start only once the bus
+accepts connections. runit has no readiness protocol.
 
 ## Login-shell fallback without PAM
 
@@ -69,8 +74,8 @@ Alternatively, use a persistent writable directory and set the override.
 If adding a service to an already running scan tree, request a rescan with
 `s6-svscanctl -a /absolute/path/to/scan-directory`.
 The profile script uses [`s6-svc -u`](https://skarnet.org/software/s6/s6-svc.html).
-It checks for the bus socket itself; the service does not implement s6
-readiness notifications. These are plain s6 services, not s6-rc definitions.
+It checks for the bus socket itself rather than waiting on s6 readiness
+notifications. These are plain s6 services, not s6-rc definitions.
 
 For Dinit, ensure the user instance can find the supplied `dbus` description.
 Gentoo installs it in `/etc/dinit.d/user`, one of Dinit's default user search

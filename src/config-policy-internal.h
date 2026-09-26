@@ -64,4 +64,5 @@ struct LauncherConfig {
         uint64_t max_outgoing_fds;
         uint64_t max_connections_per_user;
         uint64_t max_matches_per_connection;
+        uint64_t service_start_timeout;
 };

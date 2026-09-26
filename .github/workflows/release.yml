@@ -32,7 +32,7 @@ jobs:
         run: git config --global --add safe.directory "${GITHUB_WORKSPACE}"
 
       - name: Configure
-        run: meson setup build --buildtype=release -Dpam=enabled -Delogind=true
+        run: meson setup build --buildtype=release -Dpam=enabled -Delogind=enabled
 
       - name: Check tag against project version
         if: startsWith(github.ref, 'refs/tags/v')
