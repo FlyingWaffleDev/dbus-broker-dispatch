@@ -451,20 +451,30 @@ static bool reload_config(Launcher *launcher, Error **error)
         }
         goto out;
 rollback:
+        /* A failure here leaves the broker matching neither generation, so it
+         * must be visible even though the reload error is what gets returned. */
         for (size_t i = n_added; i > 0; --i) {
-                Error *ignored = NULL;
-                service_release(launcher->service_manager, added.items[i - 1], &ignored);
-                error_free(ignored);
+                Error *rollback_error = NULL;
+                if (!service_release(launcher->service_manager, added.items[i - 1], &rollback_error))
+                        log_error("Reload rollback cannot release D-Bus service %s: %s",
+                                  service_name(added.items[i - 1]),
+                                  rollback_error ? rollback_error->message : "unknown error");
+                error_free(rollback_error);
         }
         for (size_t i = 0; i < n_released; ++i) {
-                Error *ignored = NULL;
-                service_register(launcher->service_manager, released.items[i], &ignored);
-                error_free(ignored);
+                Error *rollback_error = NULL;
+                if (!service_register(launcher->service_manager, released.items[i], &rollback_error))
+                        log_error("Reload rollback cannot restore D-Bus service %s: %s",
+                                  service_name(released.items[i]),
+                                  rollback_error ? rollback_error->message : "unknown error");
+                error_free(rollback_error);
         }
         {
-                Error *ignored = NULL;
-                set_policy(launcher, launcher->config_state, &ignored);
-                error_free(ignored);
+                Error *rollback_error = NULL;
+                if (!set_policy(launcher, launcher->config_state, &rollback_error))
+                        print_error("Reload rollback cannot restore D-Bus policy", rollback_error);
+                else
+                        error_free(rollback_error);
         }
         goto out;
 memory:

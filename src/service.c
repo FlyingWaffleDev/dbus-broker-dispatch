@@ -86,6 +86,11 @@ void service_unref(Service *service)
         free(service);
 }
 
+const char *service_name(const Service *service)
+{
+        return service->name;
+}
+
 static void service_destroy(void *data)
 {
         service_unref(data);

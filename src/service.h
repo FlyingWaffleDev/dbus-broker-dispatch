@@ -25,6 +25,7 @@ bool service_table_register_all(ServiceManager *manager, ServiceTable *services,
 
 Service *service_reference(Service *service);
 void service_unref(Service *service);
+const char *service_name(const Service *service);
 bool service_equal(Service *left, Service *right);
 bool service_register(ServiceManager *manager, Service *service, Error **error);
 bool service_release(ServiceManager *manager, Service *service, Error **error);
