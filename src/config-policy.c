@@ -39,6 +39,16 @@ static bool optimize_strings(PtrVec *strings, Error **error);
 static void parser_warning(ParserState *state, const char *format, ...);
 static void parser_fail(ParserState *state, Error *error);
 
+/* expat 2.10 deprecates the XML_Size getter in favour of a fixed-width one. */
+static unsigned long long parser_line(XML_Parser parser)
+{
+#ifdef HAVE_XML_GETCURRENTLINENUMBER64
+        return XML_GetCurrentLineNumber64(parser);
+#else
+        return XML_GetCurrentLineNumber(parser);
+#endif
+}
+
 static void policy_rule_free(void *data)
 {
         PolicyRule *rule = data;
@@ -504,7 +514,7 @@ static void parser_warning(ParserState *state, const char *format, ...)
         if (vasprintf(&message, format, arguments) < 0)
                 message = NULL;
         va_end(arguments);
-        log_warning("%s:%lu: %s", state->file, (unsigned long)XML_GetCurrentLineNumber(state->parser),
+        log_warning("%s:%llu: %s", state->file, parser_line(state->parser),
                     message ? message : "out of memory while formatting warning");
         free(message);
 }
@@ -1205,8 +1215,7 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                                 error_free(state.error);
                         state.error = NULL;
                 } else {
-                        error_set(error, EILSEQ, "%s:%lu: %s", canonical,
-                                  (unsigned long)XML_GetCurrentLineNumber(parser),
+                        error_set(error, EILSEQ, "%s:%llu: %s", canonical, parser_line(parser),
                                   XML_ErrorString(XML_GetErrorCode(parser)));
                 }
         } else {

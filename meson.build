@@ -19,6 +19,10 @@ endif
 if selinux.found()
   conf.set('HAVE_SELINUX', 1)
 endif
+# expat 2.10 deprecates XML_GetCurrentLineNumber in favour of this.
+if meson.get_compiler('c').has_header_symbol('expat.h', 'XML_GetCurrentLineNumber64', dependencies: expat)
+  conf.set('HAVE_XML_GETCURRENTLINENUMBER64', 1)
+endif
 configure_file(output: 'config.h', configuration: conf)
 
 deps = [expat]

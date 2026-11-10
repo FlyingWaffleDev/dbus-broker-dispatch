@@ -133,6 +133,18 @@ int main(int argc, char **argv)
                 write_contents(fault, "0");
                 call_bus(&bus, "ReloadConfig", false);
                 call_bus(&bus, "RequestName", true);
+                /* A changed limit needs a restart, but must not hold back
+                 * the rest of the reload: the deny rule is gone as well. */
+                xml = str_printf("<busconfig><type>session</type><listen>unix:path=%s</listen>"
+                                 "<limit name='max_match_rules_per_connection'>1024</limit>"
+                                 "<policy context='default'><allow user='*'/><allow own='*'/>"
+                                 "<allow send_destination='*'/><allow receive_sender='*'/></policy></busconfig>",
+                                 socket_path);
+                assert(xml);
+                write_contents(config, xml);
+                free(xml);
+                call_bus(&bus, "ReloadConfig", false);
+                call_bus(&bus, "RequestName", false);
                 dbus_transport_clear(&bus);
                 assert(kill(child, SIGTERM) == 0);
                 wait_for_exit(child, 0);

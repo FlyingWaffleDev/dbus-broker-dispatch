@@ -33,7 +33,7 @@ For those who want to give it a go, I have made a Gentoo ebuild available in my
   `no_console`
 - The standard service-directory search order and direct `Exec=` activation
   without a shell
-- System service users, cleared supplementary groups, activation environment
+- System service users with their supplementary groups, activation environment
   updates, and `DBUS_STARTER_*` variables
 - Activation timeouts from `<limit name="service_start_timeout">`
 - Transactional reloads from SIGHUP, the broker reload API, or watched config
@@ -213,9 +213,11 @@ already-configured user supervisor.
   `max_match_rules_per_connection`.
 - With elogind, `at_console` applies to users with an active local session on a
   seat, and `no_console` to everyone else, as with `dbus-daemon`. Without
-  elogind, or until elogind first answers, the dispatcher follows
+  elogind, or until elogind is running, the dispatcher follows
   `dbus-broker-launch`: UIDs above `--system-uid-max` (999) always receive
   `at_console`, and system users only when listed in `system-console-users`.
+  elogind needs the system bus, so every boot starts on that fallback and
+  switches once elogind is up.
 - Policy rules whose only condition is `send_requested_reply` or
   `receive_requested_reply` are ignored with a warning. `dbus-broker` tracks
   expected replies itself, so there is nothing left for such a rule to match

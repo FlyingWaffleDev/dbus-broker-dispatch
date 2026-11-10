@@ -59,6 +59,8 @@ struct Launcher {
         /* A pipe from a supervisor (s6, dinit, OpenRC) gets a readiness line;
          * a socket gets the private R/F handshake byte. */
         bool startup_pipe;
+        /* --address was given, so the configuration's <listen> is not in use. */
+        bool address_override;
         int startup_fd, listener_fd, signal_fd, lock_fd;
         char *config, *address, *broker, *socket_path, *pid_file, *lock_path;
         uint32_t system_uid_max;
@@ -82,14 +84,19 @@ struct Launcher {
         ServiceManager *service_manager;
         PtrVec *service_dirs;
         U32Vec static_uids, dynamic_uids;
-        /* Set once elogind has answered. From then on at_console follows local
-         * sessions for every UID, not only system users. */
+        /* Set once a running elogind has answered. From then on at_console
+         * follows local sessions for every UID, not only system users. */
         bool console_tracked;
         LauncherConfig *config_state;
         Watch *watch;
 #ifdef HAVE_ELOGIND
         sd_login_monitor *console_monitor;
         EventSource console_source;
+        /* elogind needs the system bus, so it starts after us. Until its
+         * session directory exists this waits for it to appear. */
+        Watch *console_wait;
+        bool console_wait_fired;
+        EventSource console_wait_source, console_wait_timer_source;
 #endif
 };
 
@@ -175,7 +182,11 @@ static void load_static_console_users(Launcher *launcher)
 {
         char *copy = str_dup(SYSTEM_CONSOLE_USERS), *cursor = copy, *name;
         while (copy && (name = strsep(&cursor, ","))) {
-                struct passwd *entry = getpwnam(name);
+                struct passwd *entry;
+                /* An empty list still yields one empty name. */
+                if (!*name)
+                        continue;
+                entry = getpwnam(name);
                 if (!entry)
                         log_warning("Ignoring unknown system-console user '%s'", name);
                 else
@@ -195,7 +206,18 @@ static bool make_policy(Launcher *launcher, LauncherConfig *config, DBusWriter *
         return result;
 }
 
+static bool set_policy(Launcher *launcher, LauncherConfig *config, Error **error);
+
+/* Makes console tracking match what @config needs. It is never fatal: without
+ * a session monitor the policy stays on the dbus-broker-launch fallback. @push
+ * resends the policy when the tracked users changed; callers that send a
+ * policy themselves right afterwards pass false. */
+static void console_tracking_sync(Launcher *launcher, LauncherConfig *config, bool push);
+
 #ifdef HAVE_ELOGIND
+/* libelogind cannot create a session monitor before this directory exists. */
+#define ELOGIND_SESSIONS_DIR "/run/systemd/sessions"
+
 /* Sets *changed when the policy-relevant console state differs. */
 static bool refresh_console_users(Launcher *launcher, bool *changed)
 {
@@ -242,56 +264,177 @@ static bool refresh_console_users(Launcher *launcher, bool *changed)
         return true;
 }
 
+static void push_console_policy(Launcher *launcher)
+{
+        Error *error = NULL;
+        if (!set_policy(launcher, launcher->config_state, &error))
+                print_error("Cannot update console-sensitive D-Bus policy", error);
+}
+
 static bool console_event(EventSource *source, uint32_t events, void *data, Error **error)
 {
         Launcher *launcher = data;
-        DBusWriter policy = {0};
-        Error *local_error = NULL;
         bool changed = false;
         (void)source;
         (void)events;
-        sd_login_monitor_flush(launcher->console_monitor);
-        if (!refresh_console_users(launcher, &changed) || !changed)
-                return true;
-        if (make_policy(launcher, launcher->config_state, &policy, &local_error) &&
-            controller_set_policy(&launcher->controller, "/org/bus1/DBus/Listener/0",
-                                  launcher_config_policy_signature(), &policy, &local_error)) {
-                dbus_writer_clear(&policy);
-                return true;
-        }
-        dbus_writer_clear(&policy);
-        if (local_error)
-                print_error("Cannot update console-sensitive D-Bus policy", local_error);
         (void)error;
+        sd_login_monitor_flush(launcher->console_monitor);
+        if (refresh_console_users(launcher, &changed) && changed)
+                push_console_policy(launcher);
         return true;
 }
 
-static bool configure_console_monitor(Launcher *launcher, Error **error)
+/* Returns 0 once the monitor is attached, or a negative errno. -ENOENT means
+ * elogind has not created its session directory yet. */
+static int console_monitor_start(Launcher *launcher)
 {
-        int result, fd;
-        if (launcher->user || !launcher_config_uses_console_policy(launcher->config_state))
-                return true;
-        result = sd_login_monitor_new("session", &launcher->console_monitor);
+        sd_login_monitor *monitor = NULL;
+        Error *error = NULL;
+        int result = sd_login_monitor_new("session", &monitor), fd;
         if (result < 0)
-                return error_set_errno(error, -result, "Cannot create elogind session monitor");
-        fd = sd_login_monitor_get_fd(launcher->console_monitor);
-        if (fd < 0)
-                return error_set_errno(error, -fd, "Cannot access elogind session monitor");
-        return event_source_add(&launcher->loop, &launcher->console_source, fd, EPOLLIN, console_event, launcher,
-                                error);
+                return result;
+        fd = sd_login_monitor_get_fd(monitor);
+        if (fd >= 0 && event_source_add(&launcher->loop, &launcher->console_source, fd, EPOLLIN, console_event,
+                                        launcher, &error)) {
+                launcher->console_monitor = monitor;
+                return 0;
+        }
+        result = fd < 0 ? fd : -(error && error->code > 0 ? error->code : EIO);
+        error_free(error);
+        sd_login_monitor_unref(monitor);
+        return result;
+}
+
+static void console_monitor_stop(Launcher *launcher)
+{
+        event_source_remove(&launcher->console_source);
+        if (launcher->console_monitor)
+                sd_login_monitor_unref(launcher->console_monitor);
+        launcher->console_monitor = NULL;
+}
+
+static void console_wait_stop(Launcher *launcher)
+{
+        event_source_remove(&launcher->console_wait_source);
+        event_source_remove(&launcher->console_wait_timer_source);
+        watch_free(launcher->console_wait);
+        launcher->console_wait = NULL;
+        launcher->console_wait_fired = false;
+}
+
+static void console_wait_changed(void *data)
+{
+        ((Launcher *)data)->console_wait_fired = true;
+}
+
+static bool console_wait_event(EventSource *source, uint32_t events, void *data, Error **error)
+{
+        Launcher *launcher = data;
+        Error *watch_error = NULL;
+        (void)source;
+        (void)events;
+        (void)error;
+        if (!watch_dispatch_inotify(launcher->console_wait, &watch_error)) {
+                print_error("Cannot keep waiting for elogind; at_console policy stays on its fallback", watch_error);
+                console_wait_stop(launcher);
+        }
+        return true;
+}
+
+static bool console_wait_timer_event(EventSource *source, uint32_t events, void *data, Error **error)
+{
+        Launcher *launcher = data;
+        Error *watch_error = NULL;
+        (void)source;
+        (void)events;
+        (void)error;
+        if (!watch_dispatch_timer(launcher->console_wait, &watch_error)) {
+                print_error("Cannot keep waiting for elogind; at_console policy stays on its fallback", watch_error);
+                console_wait_stop(launcher);
+        } else if (launcher->console_wait_fired) {
+                /* Not from the watch callback: this may free the watch. */
+                launcher->console_wait_fired = false;
+                console_tracking_sync(launcher, launcher->config_state, true);
+        }
+        return true;
+}
+
+static void console_wait_start(Launcher *launcher)
+{
+        Error *error = NULL;
+        PtrVec paths;
+        char *path;
+        if (launcher->console_wait)
+                return;
+        ptr_vec_init(&paths, free);
+        path = str_dup(ELOGIND_SESSIONS_DIR);
+        if (!path || !ptr_vec_push(&paths, path)) {
+                free(path);
+                error_set(&error, ENOMEM, "Out of memory");
+        } else {
+                launcher->console_wait = watch_new(console_wait_changed, launcher, &error);
+        }
+        if (!launcher->console_wait || !watch_set_paths(launcher->console_wait, &paths, &error) ||
+            !event_source_add(&launcher->loop, &launcher->console_wait_source, watch_inotify_fd(launcher->console_wait),
+                              EPOLLIN, console_wait_event, launcher, &error) ||
+            !event_source_add(&launcher->loop, &launcher->console_wait_timer_source,
+                              watch_timer_fd(launcher->console_wait), EPOLLIN, console_wait_timer_event, launcher,
+                              &error)) {
+                print_error("Cannot wait for elogind; at_console policy stays on its fallback", error);
+                console_wait_stop(launcher);
+        }
+        ptr_vec_clear(&paths);
+}
+
+static void console_tracking_stop(Launcher *launcher)
+{
+        console_wait_stop(launcher);
+        console_monitor_stop(launcher);
+        u32_vec_clear(&launcher->dynamic_uids);
+        launcher->console_tracked = false;
+}
+
+static void console_tracking_sync(Launcher *launcher, LauncherConfig *config, bool push)
+{
+        bool changed = false;
+        int result;
+        if (launcher->user || !launcher_config_uses_console_policy(config)) {
+                console_tracking_stop(launcher);
+                return;
+        }
+        if (launcher->console_monitor)
+                return;
+        result = console_monitor_start(launcher);
+        if (result == -ENOENT) {
+                bool waiting = launcher->console_wait != NULL;
+                console_wait_start(launcher);
+                /* elogind may have started while the wait was being set up. */
+                result = console_monitor_start(launcher);
+                if (result == -ENOENT && !waiting)
+                        log_info("elogind is not running yet; at_console policy uses its fallback until it starts");
+        }
+        if (result == -ENOENT)
+                return;
+        console_wait_stop(launcher);
+        if (result < 0) {
+                log_warning("Cannot monitor elogind sessions: %s; at_console policy stays on its fallback",
+                            strerror(-result));
+                return;
+        }
+        log_info("Following elogind sessions for at_console policy");
+        if (refresh_console_users(launcher, &changed) && changed && push)
+                push_console_policy(launcher);
 }
 #else
-static bool refresh_console_users(Launcher *launcher, bool *changed)
+static void console_tracking_stop(Launcher *launcher)
 {
         (void)launcher;
-        *changed = false;
-        return true;
 }
-static bool configure_console_monitor(Launcher *launcher, Error **error)
+static void console_tracking_sync(Launcher *launcher, LauncherConfig *config, bool push)
 {
         (void)launcher;
-        (void)error;
-        return true;
+        (void)config;
+        (void)push;
 }
 #endif
 
@@ -350,6 +493,28 @@ static bool set_policy(Launcher *launcher, LauncherConfig *config, Error **error
         return result;
 }
 
+/* The listener, the broker's user, and its resource limits are fixed when the
+ * broker starts. A reload that changes them still applies everything else:
+ * refusing it would hold back unrelated policy and service updates, such as a
+ * newly installed service, until the bus is restarted. */
+static void warn_restart_only_changes(Launcher *launcher, LauncherConfig *candidate)
+{
+        LauncherConfig *current = launcher->config_state;
+        uint64_t bytes = launcher_config_max_bytes(candidate), fds = launcher_config_max_fds(candidate);
+        uint64_t matches = launcher_config_max_matches(candidate);
+        if (!launcher->address_override &&
+            !str_equal(launcher_config_address(candidate), launcher_config_address(current)))
+                log_warning("The configured listener address changed; it applies after the bus is restarted");
+        if (!str_equal(launcher_config_user(candidate), launcher_config_user(current)))
+                log_warning("The configured bus user changed; it applies after the bus is restarted");
+        /* Warn when the change arrives, not on every later reload, and not
+         * when it restores what the broker is running with. */
+        if ((bytes != launcher_config_max_bytes(current) || fds != launcher_config_max_fds(current) ||
+             matches != launcher_config_max_matches(current)) &&
+            (bytes != launcher->max_bytes || fds != launcher->max_fds || matches != launcher->max_matches))
+                log_warning("The configured resource limits changed; they apply after the bus is restarted");
+}
+
 static bool reload_config(Launcher *launcher, Error **error)
 {
         LauncherConfig *candidate;
@@ -376,14 +541,6 @@ static bool reload_config(Launcher *launcher, Error **error)
             !service_table_scan(launcher_config_service_dirs(candidate), launcher_config_nss_cache(candidate),
                                 launcher->user, candidate_services, error))
                 goto out;
-        if (!str_equal(launcher_config_address(candidate), launcher_config_address(launcher->config_state)) ||
-            launcher_config_max_bytes(candidate) != launcher->max_bytes ||
-            launcher_config_max_fds(candidate) != launcher->max_fds ||
-            launcher_config_max_matches(candidate) != launcher->max_matches ||
-            !str_equal(launcher_config_user(candidate), launcher_config_user(launcher->config_state))) {
-                error_set(error, ENOTSUP, "Reload cannot change listener, resource limits, or broker user");
-                goto out;
-        }
         paths = watch_paths_for_config(candidate);
         candidate_watch = watch_new(automatic_reload, launcher, error);
         if (!paths || !candidate_watch || !watch_set_paths(candidate_watch, paths, error))
@@ -421,8 +578,12 @@ static bool reload_config(Launcher *launcher, Error **error)
         for (; n_added < added.len; ++n_added)
                 if (!service_register(launcher->service_manager, added.items[n_added], error))
                         goto rollback;
+        /* Before the policy is built, so a reload that introduces or drops
+         * console rules never sends one based on the wrong tracking state. */
+        console_tracking_sync(launcher, candidate, false);
         if (!set_policy(launcher, candidate, error))
                 goto rollback;
+        warn_restart_only_changes(launcher, candidate);
         launcher_config_free(launcher->config_state);
         launcher->config_state = candidate;
         candidate = NULL;
@@ -471,6 +632,7 @@ rollback:
         }
         {
                 Error *rollback_error = NULL;
+                console_tracking_sync(launcher, launcher->config_state, false);
                 if (!set_policy(launcher, launcher->config_state, &rollback_error))
                         print_error("Reload rollback cannot restore D-Bus policy", rollback_error);
                 else
@@ -1195,11 +1357,7 @@ static void usage(void)
 static void launcher_clear(Launcher *launcher)
 {
         notify_startup(launcher, false);
-#ifdef HAVE_ELOGIND
-        event_source_remove(&launcher->console_source);
-        if (launcher->console_monitor)
-                sd_login_monitor_unref(launcher->console_monitor);
-#endif
+        console_tracking_stop(launcher);
         event_source_remove(&launcher->controller_source);
         event_source_remove(&launcher->signal_source);
         event_source_remove(&launcher->watch_source);
@@ -1409,6 +1567,7 @@ int main(int argc, char **argv)
         launcher.max_matches = launcher_config_max_matches(launcher.config_state);
         launcher.service_dirs = launcher_config_service_dirs(launcher.config_state);
         configured_address = launcher_config_address(launcher.config_state);
+        launcher.address_override = launcher.address != NULL;
         if (!launcher.address && configured_address)
                 launcher.address = str_dup(configured_address);
         if (!launcher.address) {
@@ -1426,12 +1585,8 @@ int main(int argc, char **argv)
                 print_error("Invalid D-Bus address", error);
                 goto fail;
         }
-        if (!launcher.user) {
+        if (!launcher.user)
                 load_static_console_users(&launcher);
-                bool changed;
-                if (launcher_config_uses_console_policy(launcher.config_state))
-                        refresh_console_users(&launcher, &changed);
-        }
         if (!service_table_scan(launcher.service_dirs, launcher_config_nss_cache(launcher.config_state), launcher.user,
                                 service_manager_table(launcher.service_manager), &error) ||
             !daemonize_launcher(&launcher, &error) || !event_loop_init(&launcher.loop, &error)) {
@@ -1460,9 +1615,12 @@ int main(int argc, char **argv)
                                                : (launcher.user ? "session" : "system"));
         service_manager_configure(launcher.service_manager, launcher.user,
                                   launcher_config_service_start_timeout(launcher.config_state));
+        /* Before the listener gets its first policy, which then already
+         * reflects local sessions when elogind is up. */
+        console_tracking_sync(&launcher, launcher.config_state, false);
         if (!service_table_register_all(launcher.service_manager, service_manager_table(launcher.service_manager),
                                         &error) ||
-            !add_listener(&launcher, &error) || !configure_console_monitor(&launcher, &error) ||
+            !add_listener(&launcher, &error) ||
             !event_source_add(&launcher.loop, &launcher.controller_source, controller_fd(&launcher.controller), EPOLLIN,
                               controller_event, &launcher, &error) ||
             !write_pid_file(&launcher, &error)) {
