@@ -28,7 +28,7 @@ static bool encode_message(DBusWriter *writer, const PolicyRule *rule)
 static bool encode_batch(DBusWriter *writer, const PtrVec *base, const PtrVec *specific, bool default_connect)
 {
         bool connect = default_connect;
-        uint64_t connect_priority = 1;
+        uint64_t connect_priority = default_connect ? 2 : 1;
         const PtrVec *sets[] = {base, specific, NULL};
         DBusArray own, send, receive;
 
@@ -105,12 +105,11 @@ bool launcher_config_export_policy_wire(LauncherConfig *config, bool user_scope,
                 goto memory;
         for (size_t i = 0; i < config->user_rules->len; ++i) {
                 uint32_t uid = config->user_rules->entries[i].key;
-                if (!encode_uid_entry(writer, uid, config, config->user_rules->entries[i].value,
-                                      user_scope && uid == self))
+                if (!encode_uid_entry(writer, uid, config, config->user_rules->entries[i].value, uid == self))
                         goto memory;
                 have_self |= uid == self;
         }
-        if (user_scope && !have_self && !encode_uid_entry(writer, self, config, NULL, true))
+        if (!have_self && !encode_uid_entry(writer, self, config, NULL, true))
                 goto memory;
         if (!dbus_writer_array_end(writer, &uids) || !dbus_writer_array_begin(writer, 8, &gids))
                 goto memory;
@@ -121,24 +120,27 @@ bool launcher_config_export_policy_wire(LauncherConfig *config, bool user_scope,
         }
         if (config->no_console_rules->len || config->at_console_rules->len) {
                 uint32_t next = 0;
+                bool done = false;
                 for (size_t i = 0; i < n_console_uids; ++i) {
                         uint32_t uid = console_uids[i];
                         if (uid > system_uid_max || uid < next)
                                 continue;
-                        if (uid > next && !encode_gid_entry(writer, false, next, uid - 1, config->no_console_rules))
+                        if (uid > next && config->no_console_rules->len &&
+                            !encode_gid_entry(writer, false, next, uid - 1, config->no_console_rules))
                                 goto memory;
-                        if (!encode_gid_entry(writer, false, uid, uid, config->at_console_rules))
+                        if (config->at_console_rules->len &&
+                            !encode_gid_entry(writer, false, uid, uid, config->at_console_rules))
                                 goto memory;
                         if (uid == UINT32_MAX) {
-                                next = UINT32_MAX;
+                                done = true;
                                 break;
                         }
                         next = uid + 1;
                 }
-                if (next <= system_uid_max &&
+                if (!done && next <= system_uid_max && config->no_console_rules->len &&
                     !encode_gid_entry(writer, false, next, system_uid_max, config->no_console_rules))
                         goto memory;
-                if (system_uid_max < UINT32_MAX &&
+                if (system_uid_max < UINT32_MAX && config->at_console_rules->len &&
                     !encode_gid_entry(writer, false, system_uid_max + 1, UINT32_MAX, config->at_console_rules))
                         goto memory;
         }
@@ -152,7 +154,7 @@ bool launcher_config_export_policy_wire(LauncherConfig *config, bool user_scope,
                 }
         ptr_vec_sort(&names, compare_string_pointers);
         for (size_t i = 0; i < names.len; ++i)
-                if (!dbus_writer_align(writer, 4) || !dbus_writer_string(writer, names.items[i]) ||
+                if (!dbus_writer_align(writer, 8) || !dbus_writer_string(writer, names.items[i]) ||
                     !dbus_writer_string(writer, str_map_get(config->selinux_associations, names.items[i]))) {
                         ptr_vec_clear(&names);
                         goto memory;

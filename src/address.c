@@ -1,10 +1,15 @@
 #define _GNU_SOURCE
 #include "address.h"
 
-#include <ctype.h>
 #include <errno.h>
 #include <stdlib.h>
 #include <string.h>
+
+static bool is_unreserved_address_byte(unsigned char c)
+{
+        return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_' || c == '-' ||
+               c == '.' || c == '/';
+}
 
 char *percent_escape(const char *value)
 {
@@ -12,7 +17,7 @@ char *percent_escape(const char *value)
         StrBuf out = {0};
         for (const unsigned char *p = (const unsigned char *)value; *p; ++p) {
                 bool appended;
-                if (isalnum(*p) || strchr("_-./", *p)) {
+                if (is_unreserved_address_byte(*p)) {
                         appended = str_buf_append_n(&out, (const char *)p, 1);
                 } else {
                         char escaped[] = {'%', hex[*p >> 4], hex[*p & 15]};

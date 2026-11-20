@@ -46,6 +46,22 @@ typedef struct Launcher Launcher;
  * dispatcher itself to stop. */
 #define BROKER_STOP_TIMEOUT_MS 2000
 
+#ifdef SYS_setgroups32
+#define SYSCALL_SETGROUPS SYS_setgroups32
+#else
+#define SYSCALL_SETGROUPS SYS_setgroups
+#endif
+#ifdef SYS_setresgid32
+#define SYSCALL_SETRESGID SYS_setresgid32
+#else
+#define SYSCALL_SETRESGID SYS_setresgid
+#endif
+#ifdef SYS_setresuid32
+#define SYSCALL_SETRESUID SYS_setresuid32
+#else
+#define SYSCALL_SETRESUID SYS_setresuid
+#endif
+
 typedef struct BrokerChild {
         int fd;
         int log_fd;
@@ -72,6 +88,7 @@ struct Launcher {
         uint64_t max_bytes, max_fds, max_matches;
         uid_t broker_uid;
         gid_t broker_gid;
+        bool broker_user_configured;
         bool drop_broker_privileges;
         pid_t broker_pid;
         EventLoop loop;
@@ -168,6 +185,7 @@ static bool configure_broker_user(Launcher *launcher, Error **error)
                 return error_set(error, EPERM, "Only root can start dbus-broker as configured user %s", name);
         launcher->broker_uid = nss_user_uid(user);
         launcher->broker_gid = nss_user_gid(user);
+        launcher->broker_user_configured = true;
         launcher->drop_broker_privileges = geteuid() != launcher->broker_uid || getegid() != launcher->broker_gid;
         return true;
 }
@@ -480,8 +498,7 @@ static PtrVec *watch_paths_for_config(LauncherConfig *config)
         }
         for (size_t i = 0; i < service_dirs->len; ++i) {
                 const char *directory = service_dirs->items[i];
-                if (access(directory, F_OK) == 0 && access(directory, R_OK | X_OK) < 0 &&
-                    (errno == EACCES || errno == EPERM))
+                if (access(directory, R_OK | X_OK) < 0 && (errno == EACCES || errno == EPERM))
                         continue;
                 char *path = path_canonicalize(directory, NULL);
                 if (!path || !ptr_vec_push(paths, path)) {
@@ -567,9 +584,29 @@ static bool reload_config(Launcher *launcher, Error **error)
                                 launcher->user, candidate_services, error))
                 goto out;
         paths = watch_paths_for_config(candidate);
-        candidate_watch = watch_new(automatic_reload, launcher, error);
-        if (!paths || !candidate_watch || !watch_set_paths(candidate_watch, paths, error))
+        if (!paths) {
+                error_set(error, ENOMEM, "Out of memory collecting watch paths");
                 goto out;
+        }
+        {
+                Error *watch_error = NULL;
+                candidate_watch = watch_new(automatic_reload, launcher, &watch_error);
+                if (candidate_watch && !watch_set_paths(candidate_watch, paths, &watch_error)) {
+                        watch_free(candidate_watch);
+                        candidate_watch = NULL;
+                }
+                if (!candidate_watch) {
+                        if (watch_error && watch_error->code == ENOMEM) {
+                                if (error)
+                                        *error = watch_error;
+                                else
+                                        error_free(watch_error);
+                                goto out;
+                        }
+                        print_error("Cannot update D-Bus file watches; continuing without automatic reloads",
+                                    watch_error);
+                }
+        }
         for (size_t i = 0; i < candidate_services->len; ++i) {
                 Service *previous = str_map_get(current, candidate_services->entries[i].key);
                 if (previous && service_equal(previous, candidate_services->entries[i].value)) {
@@ -630,10 +667,15 @@ static bool reload_config(Launcher *launcher, Error **error)
          * cannot be reported as a failed reload; it would leave callers
          * believing the old configuration was kept. */
         success = true;
-        if (!install_watch_sources(launcher, error)) {
-                print_error("Reloaded configuration is active but file watching stopped", error ? *error : NULL);
-                if (error)
-                        *error = NULL;
+        if (launcher->watch) {
+                Error *install_error = NULL;
+                if (!install_watch_sources(launcher, &install_error)) {
+                        print_error("Reloaded configuration is active but file watching stopped", install_error);
+                        event_source_remove(&launcher->watch_source);
+                        event_source_remove(&launcher->watch_timer_source);
+                        watch_free(launcher->watch);
+                        launcher->watch = NULL;
+                }
         }
         goto out;
 rollback:
@@ -775,11 +817,16 @@ static bool bind_listener(Launcher *launcher, Error **error)
         int probe;
         if (!parent)
                 return error_set(error, ENOMEM, "Cannot allocate socket parent path");
-        /* A user bus needs a directory it owns; a system bus one owned by root
-         * or by the dispatcher's user. Nobody else may be able to write it. */
+        /* A user bus needs a private directory it owns (the socket itself is
+         * 0777, so the parent directory is the access boundary). A system bus
+         * accepts a non-group/world-writable directory owned by root, the
+         * dispatcher's user, or the configured broker user. */
+        mode_t forbidden_mode = launcher->user ? 0077 : 0022;
         if (lstat(parent, &parent_stat) < 0 || !S_ISDIR(parent_stat.st_mode) ||
-            (parent_stat.st_uid != geteuid() && (launcher->user || parent_stat.st_uid != 0)) ||
-            (parent_stat.st_mode & 0022)) {
+            (parent_stat.st_uid != geteuid() &&
+             (launcher->user || (parent_stat.st_uid != 0 &&
+                                 (!launcher->broker_user_configured || parent_stat.st_uid != launcher->broker_uid)))) ||
+            (parent_stat.st_mode & forbidden_mode)) {
                 error_set(error, EPERM, "D-Bus socket parent must be a non-writable trusted directory: %s", parent);
                 free(parent);
                 return false;
@@ -797,7 +844,7 @@ static bool bind_listener(Launcher *launcher, Error **error)
                 probe = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
                 if (probe < 0)
                         return error_set_errno(error, errno, "Cannot create stale-socket probe");
-                if (connect(probe, (struct sockaddr *)&address, sizeof(address)) == 0) {
+                if (connect(probe, (struct sockaddr *)&address, sizeof(address)) == 0 || errno == EAGAIN) {
                         close(probe);
                         return error_set(error, EADDRINUSE, "A D-Bus listener is already active at %s",
                                          launcher->socket_path);
@@ -822,13 +869,11 @@ static bool bind_listener(Launcher *launcher, Error **error)
         return true;
 }
 
-/* Move @fd out of the 3..4 range the broker expects its own descriptors on. */
-static bool vacate_fd(int *fd)
+static bool move_fd_above_stdio(int *fd)
 {
-        int moved;
-        if (*fd < 3 || *fd > 4)
+        if (*fd >= 3)
                 return true;
-        moved = fcntl(*fd, F_DUPFD_CLOEXEC, 5);
+        int moved = fcntl(*fd, F_DUPFD_CLOEXEC, 3);
         if (moved < 0)
                 return false;
         close(*fd);
@@ -890,13 +935,18 @@ static void emit_broker_lines(Launcher *launcher)
         }
 }
 
-/* Read whatever the broker has queued. Returns false once its end is gone. */
-static bool broker_log_consume(Launcher *launcher)
+/* Read broker log output. Normal event-loop dispatches cap work per pass so a
+ * flood of policy denials cannot starve controller or signal handling. Returns
+ * false once the broker end is gone. */
+static bool broker_log_consume(Launcher *launcher, bool drain_all)
 {
         char chunk[1024];
         ssize_t n;
+        size_t chunks = 0;
 
         for (;;) {
+                if (!drain_all && chunks >= 32)
+                        return true;
                 n = read(launcher->broker_log_fd, chunk, sizeof(chunk));
                 if (n < 0 && errno == EINTR)
                         continue;
@@ -904,6 +954,7 @@ static bool broker_log_consume(Launcher *launcher)
                         return true;
                 if (n <= 0)
                         return false;
+                ++chunks;
                 if (!str_buf_append_n(&launcher->broker_log, chunk, (size_t)n)) {
                         launcher->broker_log.len = 0;
                         log_warning("Dropped dbus-broker log output: out of memory");
@@ -922,7 +973,7 @@ static bool broker_log_event(EventSource *source, uint32_t events, void *data, E
         (void)error;
         /* The broker closed its end or the socket failed; the SIGCHLD handler
          * reports the exit itself. */
-        if (!broker_log_consume(launcher))
+        if (!broker_log_consume(launcher, false))
                 broker_log_close(launcher);
         return true;
 }
@@ -931,13 +982,23 @@ static void broker_log_finish(Launcher *launcher)
 {
         if (launcher->broker_log_fd < 0)
                 return;
-        broker_log_consume(launcher);
+        broker_log_consume(launcher, true);
         if (launcher->broker_log.len) {
                 launcher->broker_log.data[launcher->broker_log.len] = 0;
                 emit_broker_line(launcher->broker_log.data);
                 launcher->broker_log.len = 0;
         }
         broker_log_close(launcher);
+}
+
+static void log_broker_exit(int status)
+{
+        if (WIFSIGNALED(status))
+                log_error("dbus-broker was killed by signal %d", WTERMSIG(status));
+        else if (WIFEXITED(status) && WEXITSTATUS(status))
+                log_error("dbus-broker exited with status %d", WEXITSTATUS(status));
+        else
+                log_error("dbus-broker exited unexpectedly");
 }
 
 /* Reaps @pid if it exits within @timeout_ms. SIGCHLD is blocked for the
@@ -968,9 +1029,15 @@ static bool reap_within(pid_t pid, int timeout_ms)
 static void stop_broker(Launcher *launcher)
 {
         pid_t pid = launcher->broker_pid;
+        int status;
         if (!pid)
                 return;
         launcher->broker_pid = 0;
+        if (waitpid(pid, &status, WNOHANG) == pid) {
+                if (launcher->broker_failed)
+                        log_broker_exit(status);
+                return;
+        }
         kill(pid, SIGTERM);
         if (reap_within(pid, BROKER_STOP_TIMEOUT_MS))
                 return;
@@ -985,21 +1052,22 @@ static bool broker_child_setup(void *data, int *error_number)
         BrokerChild *child = data;
         bool keep_audit = false;
         sigset_t empty;
+        struct sigaction action = {.sa_handler = SIG_DFL};
         /* The dispatcher blocks its event-loop signals and the mask survives
          * execve. Leaving it set would, among other things, make the
          * PR_SET_PDEATHSIG below undeliverable. */
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGHUP, &action, NULL);
+        sigaction(SIGINT, &action, NULL);
+        sigaction(SIGTERM, &action, NULL);
+        sigaction(SIGQUIT, &action, NULL);
+        sigaction(SIGPIPE, &action, NULL);
+        sigaction(SIGCHLD, &action, NULL);
         sigemptyset(&empty);
         if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0)
                 goto fail;
-        /* The controller and log descriptors both have to land on fixed
-         * numbers, so vacate that range before either dup2() runs; otherwise
-         * one of them could clobber the other's source. */
-        if (!vacate_fd(&child->fd) || !vacate_fd(&child->log_fd))
+        if (fcntl(child->fd, F_SETFD, 0) < 0 || fcntl(child->log_fd, F_SETFD, 0) < 0)
                 goto fail;
-        if (dup2(child->fd, 3) < 0 || dup2(child->log_fd, 4) < 0)
-                goto fail;
-        close(child->fd);
-        close(child->log_fd);
         if (child->drop_privileges) {
                 struct __user_cap_header_struct header = {.version = _LINUX_CAPABILITY_VERSION_3};
                 struct __user_cap_data_struct capabilities[_LINUX_CAPABILITY_U32S_3] = {0};
@@ -1009,9 +1077,9 @@ static bool broker_child_setup(void *data, int *error_number)
                                 goto fail;
                         keep_audit = (capabilities[index].permitted & mask) != 0;
                 }
-                if ((keep_audit && prctl(PR_SET_KEEPCAPS, 1) < 0) || syscall(SYS_setgroups, 0, NULL) < 0 ||
-                    syscall(SYS_setresgid, child->gid, child->gid, child->gid) < 0 ||
-                    syscall(SYS_setresuid, child->uid, child->uid, child->uid) < 0)
+                if ((keep_audit && prctl(PR_SET_KEEPCAPS, 1) < 0) || syscall(SYSCALL_SETGROUPS, 0, NULL) < 0 ||
+                    syscall(SYSCALL_SETRESGID, child->gid, child->gid, child->gid) < 0 ||
+                    syscall(SYSCALL_SETRESUID, child->uid, child->uid, child->uid) < 0)
                         goto fail;
                 if (keep_audit) {
                         memset(capabilities, 0, sizeof(capabilities));
@@ -1032,32 +1100,65 @@ fail:
         return false;
 }
 
+static bool is_ascii_xdigit(unsigned char c)
+{
+        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+}
+
 static char *read_machine_id(Error **error)
 {
+        static const char *const paths[] = {"/etc/machine-id", "/var/lib/dbus/machine-id"};
+        const char *selected = paths[0];
         char *id = NULL;
-        size_t length;
-        if (!read_file("/etc/machine-id", &id, &length, error))
+        size_t length = 0;
+        bool all_zero = true;
+
+        for (size_t i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
+                Error *local_error = NULL;
+                if (read_file_limited(paths[i], 4096, &id, &length, &local_error)) {
+                        selected = paths[i];
+                        break;
+                }
+                if (local_error && local_error->code == ENOENT && i + 1 < sizeof(paths) / sizeof(paths[0])) {
+                        error_free(local_error);
+                        continue;
+                }
+                if (error)
+                        *error = local_error;
+                else
+                        error_free(local_error);
                 return NULL;
-        while (length && isspace((unsigned char)id[length - 1]))
+        }
+        while (length &&
+               (id[length - 1] == '\n' || id[length - 1] == '\r' || id[length - 1] == ' ' || id[length - 1] == '\t'))
                 id[--length] = 0;
         if (length != 32) {
                 free(id);
-                error_set(error, EINVAL, "/etc/machine-id must contain a 32-character machine ID");
+                error_set(error, EINVAL, "%s must contain a 32-character machine ID", selected);
                 return NULL;
         }
-        for (size_t i = 0; i < length; ++i)
-                if (!isxdigit((unsigned char)id[i])) {
+        for (size_t i = 0; i < length; ++i) {
+                if (!is_ascii_xdigit((unsigned char)id[i])) {
                         free(id);
-                        error_set(error, EINVAL, "/etc/machine-id is not hexadecimal");
+                        error_set(error, EINVAL, "%s is not hexadecimal", selected);
                         return NULL;
                 }
+                if (id[i] != '0')
+                        all_zero = false;
+        }
+        if (all_zero) {
+                free(id);
+                error_set(error, EINVAL, "%s must not be all zeroes", selected);
+                return NULL;
+        }
         return id;
 }
 
 static bool start_broker(Launcher *launcher, Error **error)
 {
         int pair[2], log_pair[2];
-        char *machine = NULL, *machine_arg = NULL, *bytes = NULL, *fds = NULL, *matches = NULL;
+        char *machine = NULL, *controller_arg = NULL, *log_arg = NULL;
+        char *machine_arg = NULL, *bytes = NULL, *fds = NULL, *matches = NULL;
         char *arguments[9];
         BrokerChild child;
         ProcessSpec spec;
@@ -1072,43 +1173,41 @@ static bool start_broker(Launcher *launcher, Error **error)
                 close(pair[1]);
                 return error_set_errno(error, saved, "Cannot create broker log socketpair");
         }
+        if (!move_fd_above_stdio(&pair[1]) || !move_fd_above_stdio(&log_pair[1])) {
+                error_set_errno(error, errno, "Cannot prepare broker file descriptors");
+                goto fail;
+        }
         if (fcntl(log_pair[0], F_SETFL, fcntl(log_pair[0], F_GETFL, 0) | O_NONBLOCK) < 0) {
-                int saved = errno;
-                close(pair[0]);
-                close(pair[1]);
-                close(log_pair[0]);
-                close(log_pair[1]);
-                return error_set_errno(error, saved, "Cannot configure broker log socket");
+                error_set_errno(error, errno, "Cannot configure broker log socket");
+                goto fail;
         }
         /* Only our end becomes non-blocking; the broker inherits pair[1] as-is.
          * Without this the transport's poll timeouts can never fire and any
          * stalled controller exchange would hang the dispatcher forever. */
         if (fcntl(pair[0], F_SETFL, fcntl(pair[0], F_GETFL, 0) | O_NONBLOCK) < 0) {
-                int saved = errno;
-                close(pair[0]);
-                close(pair[1]);
-                close(log_pair[0]);
-                close(log_pair[1]);
-                return error_set_errno(error, saved, "Cannot configure controller socket");
+                error_set_errno(error, errno, "Cannot configure controller socket");
+                goto fail;
         }
         machine = read_machine_id(error);
         if (!machine)
                 goto fail;
+        controller_arg = str_printf("--controller=%d", pair[1]);
+        log_arg = str_printf("--log=%d", log_pair[1]);
         machine_arg = str_printf("--machine-id=%s", machine);
         bytes = str_printf("--max-bytes=%" PRIu64, launcher->max_bytes);
         fds = str_printf("--max-fds=%" PRIu64, launcher->max_fds);
         matches = str_printf("--max-matches=%" PRIu64, launcher->max_matches);
-        if (!machine_arg || !bytes || !fds || !matches) {
+        if (!controller_arg || !log_arg || !machine_arg || !bytes || !fds || !matches) {
                 error_set(error, ENOMEM, "Cannot allocate broker arguments");
                 goto fail;
         }
         arguments[0] = launcher->broker;
-        arguments[1] = "--controller=3";
+        arguments[1] = controller_arg;
         arguments[2] = machine_arg;
         arguments[3] = bytes;
         arguments[4] = fds;
         arguments[5] = matches;
-        arguments[6] = "--log=4";
+        arguments[6] = log_arg;
         arguments[7] = launcher->audit ? "--audit" : NULL;
         arguments[8] = NULL;
         child = (BrokerChild){.parent = getpid(),
@@ -1134,10 +1233,12 @@ static bool start_broker(Launcher *launcher, Error **error)
         if (!controller_authenticate(&launcher->controller, geteuid(), error)) {
                 stop_broker(launcher);
                 controller_clear(&launcher->controller);
-                broker_log_close(launcher);
+                broker_log_finish(launcher);
                 goto fail_controller;
         }
         free(machine);
+        free(controller_arg);
+        free(log_arg);
         free(machine_arg);
         free(bytes);
         free(fds);
@@ -1154,6 +1255,8 @@ fail:
         close(log_pair[1]);
 fail_controller:
         free(machine);
+        free(controller_arg);
+        free(log_arg);
         free(machine_arg);
         free(bytes);
         free(fds);
@@ -1179,8 +1282,9 @@ static bool write_pid_file(Launcher *launcher, Error **error)
         struct stat st;
         if (!path)
                 return true;
-        fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0644);
-        if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid()) {
+        fd = open(path, O_WRONLY | O_CREAT | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK, 0644);
+        if (fd < 0 || fstat(fd, &st) < 0 || !S_ISREG(st.st_mode) || st.st_uid != geteuid() || st.st_nlink != 1 ||
+            ftruncate(fd, 0) < 0) {
                 int saved = fd < 0 ? errno : EINVAL;
                 if (fd >= 0)
                         close(fd);
@@ -1241,13 +1345,19 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
         if (wait_ready) {
                 close(pair[0]);
                 launcher->startup_fd = pair[1];
+                if (!move_fd_above_stdio(&launcher->startup_fd))
+                        return error_set_errno(error, errno, "Cannot preserve daemon startup socket");
         }
         if (!launcher_config_keep_umask(launcher->config_state))
                 umask(0022);
         null_fd = open("/dev/null", O_RDWR | O_CLOEXEC);
         if (setsid() < 0 || chdir("/") < 0 || null_fd < 0 || dup2(null_fd, 0) < 0 || dup2(null_fd, 1) < 0 ||
-            dup2(null_fd, 2) < 0)
-                return error_set_errno(error, errno, "Cannot configure daemon process");
+            dup2(null_fd, 2) < 0) {
+                int saved = errno;
+                if (null_fd >= 0)
+                        close(null_fd);
+                return error_set_errno(error, saved, "Cannot configure daemon process");
+        }
         if (null_fd > 2)
                 close(null_fd);
         /* stderr is /dev/null from here on, so diagnostics must go to syslog. */
@@ -1289,10 +1399,15 @@ static bool notify_startup(Launcher *launcher, bool ready)
 
 static bool controller_event(EventSource *source, uint32_t events, void *data, Error **error)
 {
+        Launcher *launcher = data;
         (void)source;
+        if (events & EPOLLIN) {
+                if (!controller_dispatch(&launcher->controller, error))
+                        return false;
+        }
         if (events & (EPOLLERR | EPOLLHUP))
                 return error_set(error, ECONNRESET, "D-Bus controller disconnected");
-        return controller_dispatch(&((Launcher *)data)->controller, error);
+        return true;
 }
 
 /* File watching is an optimisation, not a correctness requirement: losing it
@@ -1326,6 +1441,8 @@ static bool watch_timer_event(EventSource *source, uint32_t events, void *data, 
 
 static bool install_watch_sources(Launcher *launcher, Error **error)
 {
+        if (!launcher->watch)
+                return true;
         return event_source_add(&launcher->loop, &launcher->watch_source, watch_inotify_fd(launcher->watch), EPOLLIN,
                                 watch_event, launcher, error) &&
                event_source_add(&launcher->loop, &launcher->watch_timer_source, watch_timer_fd(launcher->watch),
@@ -1352,14 +1469,7 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
                                         if (pid <= 0)
                                                 break;
                                         if (pid == launcher->broker_pid) {
-                                                if (WIFSIGNALED(status))
-                                                        log_error("dbus-broker was killed by signal %d",
-                                                                  WTERMSIG(status));
-                                                else if (WIFEXITED(status) && WEXITSTATUS(status))
-                                                        log_error("dbus-broker exited with status %d",
-                                                                  WEXITSTATUS(status));
-                                                else
-                                                        log_error("dbus-broker exited unexpectedly");
+                                                log_broker_exit(status);
                                                 launcher->broker_pid = 0;
                                                 launcher->broker_failed = true;
                                                 event_loop_quit(&launcher->loop);
@@ -1378,6 +1488,12 @@ static bool signal_event(EventSource *source, uint32_t events, void *data, Error
         }
 }
 
+static bool is_executable_file(const char *path)
+{
+        struct stat st;
+        return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
 /* Fallback for when the configured broker path is missing. Relative and empty
  * PATH entries name the working directory, so they are never searched. */
 static char *find_program(const char *name)
@@ -1388,7 +1504,7 @@ static char *find_program(const char *name)
                 if (!path_is_absolute(directory))
                         continue;
                 char *candidate = path_join(directory, name);
-                if (candidate && access(candidate, X_OK) == 0) {
+                if (is_executable_file(candidate)) {
                         free(copy);
                         return candidate;
                 }
@@ -1508,17 +1624,29 @@ int main(int argc, char **argv)
                         }
                         break;
                 case 'c':
+                        free(launcher.config);
                         launcher.config = str_dup(optarg);
+                        if (!launcher.config)
+                                goto nomem_arg;
                         break;
                 case 'a':
+                        free(launcher.address);
                         launcher.address = str_dup(optarg);
+                        if (!launcher.address)
+                                goto nomem_arg;
                         break;
                 case 'b':
+                        free(launcher.broker);
                         launcher.broker = str_dup(optarg);
+                        if (!launcher.broker)
+                                goto nomem_arg;
                         broker_explicit = true;
                         break;
                 case 'p':
+                        free(launcher.pid_file);
                         launcher.pid_file = str_dup(optarg);
+                        if (!launcher.pid_file)
+                                goto nomem_arg;
                         break;
                 case 'm':
                         if (!parse_u64(optarg, UINT32_MAX, &parsed)) {
@@ -1581,7 +1709,7 @@ int main(int argc, char **argv)
                 goto fail;
         }
         launcher.broker = launcher.broker ? launcher.broker : str_dup(DEFAULT_BROKER);
-        if (!launcher.broker || access(launcher.broker, X_OK) < 0) {
+        if (!is_executable_file(launcher.broker)) {
                 if (broker_explicit) {
                         fprintf(stderr, "Configured dbus-broker is not executable: %s\n", launcher.broker);
                         goto fail;
@@ -1594,21 +1722,33 @@ int main(int argc, char **argv)
                 goto fail;
         }
         if (launcher.user) {
-                struct stat st;
                 runtime = getenv("XDG_RUNTIME_DIR");
-                if (!runtime || lstat(runtime, &st) < 0 || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
-                    (st.st_mode & 0077)) {
-                        fputs("XDG_RUNTIME_DIR is required for --scope=user\n", stderr);
+                if (runtime && *runtime) {
+                        struct stat st;
+                        if (!path_is_absolute(runtime) || lstat(runtime, &st) < 0 || !S_ISDIR(st.st_mode) ||
+                            st.st_uid != geteuid() || (st.st_mode & 0077)) {
+                                fputs("XDG_RUNTIME_DIR must be an absolute, private, user-owned directory\n", stderr);
+                                goto fail;
+                        }
+                        launcher.socket_path = path_join(runtime, "bus");
+                        if (!launcher.socket_path) {
+                                fputs("Cannot allocate D-Bus socket path\n", stderr);
+                                goto fail;
+                        }
+                }
+        } else {
+                launcher.socket_path = str_dup("/run/dbus/system_bus_socket");
+                if (!launcher.socket_path) {
+                        fputs("Cannot allocate D-Bus socket path\n", stderr);
                         goto fail;
                 }
-                launcher.socket_path = path_join(runtime, "bus");
-        } else
-                launcher.socket_path = str_dup("/run/dbus/system_bus_socket");
+        }
         launcher.config = launcher.config ? launcher.config
                                           : str_dup(launcher.user ? "/usr/share/dbus-1/session.conf"
                                                                   : "/usr/share/dbus-1/system.conf");
         launcher.config_state = launcher_config_new();
-        if (!launcher.config_state || !launcher_config_load(launcher.config_state, launcher.config, &error) ||
+        if (!launcher.config || !launcher.config_state ||
+            !launcher_config_load(launcher.config_state, launcher.config, &error) ||
             !configure_apparmor(launcher.config_state, &error) || !configure_broker_user(&launcher, &error)) {
                 print_error("Invalid D-Bus configuration", error);
                 goto fail;
@@ -1631,9 +1771,18 @@ int main(int argc, char **argv)
         launcher.service_dirs = launcher_config_service_dirs(launcher.config_state);
         configured_address = launcher_config_address(launcher.config_state);
         launcher.address_override = launcher.address != NULL;
-        if (!launcher.address && configured_address)
+        if (!launcher.address && configured_address) {
                 launcher.address = str_dup(configured_address);
+                if (!launcher.address) {
+                        fputs("Cannot build the D-Bus listener address\n", stderr);
+                        goto fail;
+                }
+        }
         if (!launcher.address) {
+                if (!launcher.socket_path) {
+                        fputs("XDG_RUNTIME_DIR is required for --scope=user\n", stderr);
+                        goto fail;
+                }
                 char *escaped = percent_escape(launcher.socket_path);
                 launcher.address = escaped ? str_printf("unix:path=%s", escaped) : NULL;
                 free(escaped);
@@ -1660,20 +1809,47 @@ int main(int argc, char **argv)
                 goto fail;
         }
         PtrVec *paths = watch_paths_for_config(launcher.config_state);
-        launcher.watch = watch_new(automatic_reload, &launcher, &error);
-        int signals[] = {SIGHUP, SIGTERM, SIGINT, SIGCHLD};
-        launcher.signal_fd = event_signal_fd(signals, 4, NULL, &error);
-        if (!paths || !launcher.watch || !watch_set_paths(launcher.watch, paths, &error) || launcher.signal_fd < 0 ||
-            !install_watch_sources(&launcher, &error) ||
-            !event_source_add(&launcher.loop, &launcher.signal_source, launcher.signal_fd, EPOLLIN, signal_event,
-                              &launcher, &error) ||
-            !bind_listener(&launcher, &error) || !start_broker(&launcher, &error)) {
-                ptr_vec_free(paths);
+        if (!paths) {
+                error_set(&error, ENOMEM, "Out of memory collecting watch paths");
                 notify_startup(&launcher, false);
                 print_error("Cannot start dispatcher", error);
                 goto fail;
         }
-        ptr_vec_free(paths);
+        {
+                Error *watch_error = NULL;
+                launcher.watch = watch_new(automatic_reload, &launcher, &watch_error);
+                if (launcher.watch && !watch_set_paths(launcher.watch, paths, &watch_error)) {
+                        watch_free(launcher.watch);
+                        launcher.watch = NULL;
+                }
+                ptr_vec_free(paths);
+                if (!launcher.watch) {
+                        if (watch_error && watch_error->code == ENOMEM) {
+                                notify_startup(&launcher, false);
+                                print_error("Cannot start dispatcher", watch_error);
+                                goto fail;
+                        }
+                        print_error("Cannot start D-Bus file watches; continuing without automatic reloads",
+                                    watch_error);
+                } else if (!install_watch_sources(&launcher, &watch_error)) {
+                        print_error("Cannot attach D-Bus file watches; continuing without automatic reloads",
+                                    watch_error);
+                        event_source_remove(&launcher.watch_source);
+                        event_source_remove(&launcher.watch_timer_source);
+                        watch_free(launcher.watch);
+                        launcher.watch = NULL;
+                }
+        }
+        int signals[] = {SIGHUP, SIGTERM, SIGINT, SIGCHLD};
+        launcher.signal_fd = event_signal_fd(signals, 4, NULL, &error);
+        if (launcher.signal_fd < 0 ||
+            !event_source_add(&launcher.loop, &launcher.signal_source, launcher.signal_fd, EPOLLIN, signal_event,
+                              &launcher, &error) ||
+            !bind_listener(&launcher, &error) || !start_broker(&launcher, &error)) {
+                notify_startup(&launcher, false);
+                print_error("Cannot start dispatcher", error);
+                goto fail;
+        }
         service_manager_set_controller(launcher.service_manager, &launcher.controller, launcher.address,
                                        launcher_config_bus_type(launcher.config_state)
                                                ? launcher_config_bus_type(launcher.config_state)
@@ -1716,12 +1892,16 @@ int main(int argc, char **argv)
                         launcher.broker_failed = true;
                         break;
                 }
+                if (!launcher.loop.running)
+                        break;
                 service_manager_dispatch_timeouts(launcher.service_manager);
                 run_pending_reload(&launcher);
         }
         bool failed = launcher.broker_failed;
         launcher_clear(&launcher);
         return failed ? 1 : 0;
+nomem_arg:
+        fputs("Cannot allocate command-line argument\n", stderr);
 fail:
         launcher_clear(&launcher);
         return 1;

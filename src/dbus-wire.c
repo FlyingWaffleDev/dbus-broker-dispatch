@@ -189,8 +189,9 @@ bool dbus_reader_string(DBusReader *reader, const char **value, size_t *length)
 {
         uint32_t encoded_length;
         const uint8_t *bytes;
-        if (!dbus_reader_u32(reader, &encoded_length) || !reader_take(reader, (size_t)encoded_length + 1, &bytes) ||
-            bytes[encoded_length] != 0 || memchr(bytes, 0, encoded_length))
+        if (!dbus_reader_u32(reader, &encoded_length) || encoded_length >= reader->length - reader->offset ||
+            !reader_take(reader, (size_t)encoded_length + 1, &bytes) || bytes[encoded_length] != 0 ||
+            memchr(bytes, 0, encoded_length))
                 return false;
         *value = (const char *)bytes;
         if (length)

@@ -83,7 +83,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_existing_socket_is_reused_without_control_commands(self):
         self.listen(self.runtime / "bus")
-        for backend in ("runit", "dinit", "s6"):
+        for backend in BACKENDS:
             for shell in ("/bin/sh", "/bin/bash"):
                 with self.subTest(backend=backend, shell=shell):
                     self.assertEqual(unquote(self.run_hook(backend, shell=shell)),
@@ -92,6 +92,7 @@ class ProfileTests(unittest.TestCase):
 
     def test_delayed_start_and_explicit_user_control_paths(self):
         for backend, args, overrides in (
+            ("openrc", ["--user", "dbus", "start"], {}),
             ("runit", ["up", str(self.root / "custom service/dbus")], {
                 "DBUS_BROKER_DISPATCH_RUNIT_SERVICE": str(self.root / "custom service/dbus"),
             }),
@@ -121,15 +122,15 @@ class ProfileTests(unittest.TestCase):
                     (self.runtime / "bus").unlink(missing_ok=True)
 
     def test_missing_commands_and_relative_paths_do_not_start_services(self):
-        for name in ("sv", "dinitctl", "s6-svc"):
+        for name in ("rc-service", "sv", "dinitctl", "s6-svc"):
             (self.bin / name).unlink()
-        for backend in ("runit", "dinit", "s6"):
+        for backend in BACKENDS:
             self.assertEqual(self.run_hook(backend), "")
             self.assertEqual(self.run_hook(backend, {"XDG_RUNTIME_DIR": "relative"}), "")
         self.assertFalse(self.log.exists())
 
     def test_successful_control_without_socket_times_out(self):
-        for backend in ("runit", "dinit", "s6"):
+        for backend in BACKENDS:
             with self.subTest(backend=backend):
                 self.assertEqual(self.run_hook(backend, {"MOCK_RESULT": "0"}), "")
 

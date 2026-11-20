@@ -15,17 +15,27 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 
 static volatile sig_atomic_t command_pid;
+
+static uint64_t now_monotonic_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
 
 /* The command shares our process group, so signals from the terminal (sent by
  * the kernel) already reached it. Forwarding those would deliver them twice. */
 static void forward_signal(int signal_number, siginfo_t *info, void *context)
 {
+        int saved_errno = errno;
         (void)context;
         if (command_pid > 0 && info->si_code != SI_KERNEL)
                 kill(command_pid, signal_number);
+        errno = saved_errno;
 }
 
 static char *join_path(const char *directory, const char *name)
@@ -46,6 +56,12 @@ static char *join_path(const char *directory, const char *name)
         return path;
 }
 
+static bool is_executable_file(const char *path)
+{
+        struct stat st;
+        return path && stat(path, &st) == 0 && S_ISREG(st.st_mode) && access(path, X_OK) == 0;
+}
+
 /* Relative and empty PATH entries name the working directory, so they are
  * never searched; the dispatcher resolves dbus-broker the same way. */
 static char *find_program(const char *name)
@@ -54,7 +70,7 @@ static char *find_program(const char *name)
         const char *part;
 
         if (strchr(name, '/'))
-                return access(name, X_OK) == 0 ? strdup(name) : NULL;
+                return is_executable_file(name) ? strdup(name) : NULL;
         path = getenv("PATH");
         if (!path)
                 path = "/usr/local/bin:/usr/bin:/bin";
@@ -70,7 +86,7 @@ static char *find_program(const char *name)
                         memcpy(candidate, part, length);
                         candidate[length] = '/';
                         strcpy(candidate + length + 1, name);
-                        if (access(candidate, X_OK) == 0)
+                        if (is_executable_file(candidate))
                                 return candidate;
                         free(candidate);
                 }
@@ -131,11 +147,17 @@ static bool start_bus(const char *launcher, const char *address, pid_t *pid, Err
         close(pair[1]);
         if (success) {
                 struct pollfd ready = {.fd = pair[0], .events = POLLIN};
-                int result;
+                int result = 0;
                 char status = 0;
-                do
-                        result = poll(&ready, 1, 5000);
-                while (result < 0 && errno == EINTR);
+                uint64_t deadline = now_monotonic_ms() + 15000;
+                for (;;) {
+                        uint64_t now = now_monotonic_ms();
+                        int remaining = now >= deadline ? 0 : (int)(deadline - now);
+                        result = poll(&ready, 1, remaining);
+                        if (result < 0 && errno == EINTR)
+                                continue;
+                        break;
+                }
                 if (result < 0)
                         success = error_set_errno(error, errno, "Cannot wait for user bus startup");
                 else if (!result)
@@ -150,9 +172,25 @@ static bool start_bus(const char *launcher, const char *address, pid_t *pid, Err
 static void stop_bus(pid_t bus)
 {
         int status;
+        uint64_t deadline;
 
-        if (kill(bus, SIGTERM) < 0 && errno != ESRCH)
+        if (kill(bus, SIGTERM) < 0) {
+                if (errno == ESRCH)
+                        return;
                 fprintf(stderr, "Cannot stop user bus: %s\n", strerror(errno));
+        }
+        deadline = now_monotonic_ms() + 5000;
+        for (;;) {
+                pid_t reaped = waitpid(bus, &status, WNOHANG);
+                if (reaped == bus || (reaped < 0 && errno != EINTR))
+                        return;
+                uint64_t now = now_monotonic_ms();
+                if (now >= deadline)
+                        break;
+                int slice = deadline - now > 50 ? 50 : (int)(deadline - now);
+                poll(NULL, 0, slice);
+        }
+        kill(bus, SIGKILL);
         while (waitpid(bus, &status, 0) < 0 && errno == EINTR)
                 ;
 }
@@ -230,6 +268,7 @@ int main(int argc, char **argv)
         if (child == 0) {
                 sigprocmask(SIG_SETMASK, &previous_mask, NULL);
                 execvp(argv[1], argv + 1);
+                fprintf(stderr, "Cannot execute %s: %s\n", argv[1], strerror(errno));
                 _exit(127);
         }
         command_pid = child;
@@ -251,8 +290,14 @@ out:
         if (bus > 0)
                 stop_bus(bus);
         if (directory_created) {
-                if (socket_path)
+                if (socket_path) {
+                        char *lock_path = str_printf("%s.lock", socket_path);
                         unlink(socket_path);
+                        if (lock_path) {
+                                unlink(lock_path);
+                                free(lock_path);
+                        }
+                }
                 if (rmdir(directory) < 0)
                         fprintf(stderr, "Cannot remove temporary bus directory %s: %s\n", directory, strerror(errno));
         }

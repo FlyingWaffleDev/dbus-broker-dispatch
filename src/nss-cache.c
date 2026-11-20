@@ -8,6 +8,7 @@
 #include <pwd.h>
 #include <stdatomic.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
@@ -29,10 +30,14 @@ struct NssUser {
 struct NssCache {
         StrMap users_by_name;
         U32Map users_by_uid;
+        StrMap uids_by_name;
+        U32Map uids_by_uid;
         StrMap groups_by_name;
         U32Map groups_by_gid;
         StrMap missing_users;
         StrMap missing_groups;
+        bool passwd_loaded;
+        bool group_loaded;
 };
 
 static size_t nss_buffer_size(int key)
@@ -125,7 +130,8 @@ void nss_user_unref(NssUser *user)
 static NssUser *nss_user_new(const struct passwd *entry, Error **error)
 {
         NssUser *user;
-        int count = 0;
+        int needed = 16;
+        gid_t *groups = NULL;
 
         if (!entry->pw_name || !*entry->pw_name || entry->pw_uid == (uid_t)-1 || entry->pw_gid == (gid_t)-1) {
                 error_set(error, NSS_INVALID_DATA, "NSS returned an invalid user record");
@@ -147,27 +153,30 @@ static NssUser *nss_user_new(const struct passwd *entry, Error **error)
                 nss_user_unref(user);
                 return NULL;
         }
-        /* Sizing call: with a zero-length list getgrouplist() cannot succeed,
-         * so a non-negative return means it did not report the count we need. */
-        if (getgrouplist(user->name, user->gid, NULL, &count) >= 0 || count <= 0) {
-                error_set(error, NSS_INVALID_DATA, "NSS returned an invalid supplementary-group list for '%s'",
-                          user->name);
-                nss_user_unref(user);
-                return NULL;
+        for (;;) {
+                gid_t *resized = realloc(groups, (size_t)needed * sizeof(*groups));
+                if (!resized) {
+                        free(groups);
+                        error_set(error, ENOMEM, "NSS supplementary groups: out of memory");
+                        nss_user_unref(user);
+                        return NULL;
+                }
+                groups = resized;
+                int available = needed;
+                if (getgrouplist(user->name, user->gid, groups, &available) >= 0) {
+                        user->groups = groups;
+                        user->n_groups = (size_t)available;
+                        break;
+                }
+                if (available <= needed || available > 65536) {
+                        free(groups);
+                        error_set(error, NSS_INVALID_DATA, "NSS returned an invalid supplementary-group list for '%s'",
+                                  user->name);
+                        nss_user_unref(user);
+                        return NULL;
+                }
+                needed = available;
         }
-        user->groups = malloc(sizeof(*user->groups) * (size_t)count);
-        if (!user->groups) {
-                error_set(error, ENOMEM, "NSS supplementary groups: out of memory");
-                nss_user_unref(user);
-                return NULL;
-        }
-        if (getgrouplist(user->name, user->gid, user->groups, &count) < 0) {
-                error_set(error, NSS_INVALID_DATA, "NSS supplementary-group lookup for '%s' changed while being read",
-                          user->name);
-                nss_user_unref(user);
-                return NULL;
-        }
-        user->n_groups = (size_t)count;
         if (user->n_groups > 1)
                 qsort(user->groups, user->n_groups, sizeof(*user->groups), compare_gids);
         size_t out = 0;
@@ -183,6 +192,121 @@ static void user_destroy(void *data)
         nss_user_unref(data);
 }
 
+static void cache_store_uid(NssCache *cache, const char *name, uid_t uid)
+{
+        if (!str_map_contains(&cache->uids_by_name, name)) {
+                uid_t *value = malloc(sizeof(*value));
+                if (value) {
+                        *value = uid;
+                        if (!str_map_set(&cache->uids_by_name, name, value))
+                                free(value);
+                }
+        }
+        if (!u32_map_contains(&cache->uids_by_uid, (uint32_t)uid)) {
+                uid_t *value = malloc(sizeof(*value));
+                if (value) {
+                        *value = uid;
+                        if (!u32_map_set(&cache->uids_by_uid, (uint32_t)uid, value))
+                                free(value);
+                }
+        }
+}
+
+static void cache_store_gid(NssCache *cache, const char *name, gid_t gid)
+{
+        if (!str_map_contains(&cache->groups_by_name, name)) {
+                gid_t *value = malloc(sizeof(*value));
+                if (value) {
+                        *value = gid;
+                        if (!str_map_set(&cache->groups_by_name, name, value))
+                                free(value);
+                }
+        }
+        if (!u32_map_contains(&cache->groups_by_gid, (uint32_t)gid)) {
+                gid_t *value = malloc(sizeof(*value));
+                if (value) {
+                        *value = gid;
+                        if (!u32_map_set(&cache->groups_by_gid, (uint32_t)gid, value))
+                                free(value);
+                }
+        }
+}
+
+/* Pre-load local /etc/passwd and /etc/group entries so policy UID/GID lookups
+ * avoid glibc NSS and getgrouplist() calls at boot time (matching dbus-broker).
+ * Misses still fall back to getpwnam_r()/getgrnam_r(). */
+static void nss_cache_populate_passwd(NssCache *cache)
+{
+        FILE *file;
+        char *line = NULL;
+        size_t capacity = 0;
+
+        if (cache->passwd_loaded)
+                return;
+        cache->passwd_loaded = true;
+        file = fopen("/etc/passwd", "re");
+        if (file) {
+                while (getline(&line, &capacity, file) >= 0) {
+                        char *colon1, *colon2, *colon3;
+                        uint64_t parsed = 0;
+                        if (!*line || *line == '#' || *line == '+' || *line == '-')
+                                continue;
+                        colon1 = strchr(line, ':');
+                        if (!colon1 || colon1 == line)
+                                continue;
+                        colon2 = strchr(colon1 + 1, ':');
+                        if (!colon2)
+                                continue;
+                        colon3 = strchr(colon2 + 1, ':');
+                        if (!colon3)
+                                continue;
+                        *colon1 = '\0';
+                        *colon3 = '\0';
+                        if (parse_u64(colon2 + 1, UINT32_MAX - 1, &parsed))
+                                cache_store_uid(cache, line, (uid_t)parsed);
+                }
+                free(line);
+                fclose(file);
+        }
+        cache_store_uid(cache, "root", 0);
+}
+
+static void nss_cache_populate_group(NssCache *cache)
+{
+        FILE *file;
+        char *line = NULL;
+        size_t capacity = 0;
+
+        if (cache->group_loaded)
+                return;
+        cache->group_loaded = true;
+        file = fopen("/etc/group", "re");
+        if (file) {
+                while (getline(&line, &capacity, file) >= 0) {
+                        char *colon1, *colon2, *colon3;
+                        uint64_t parsed = 0;
+                        if (!*line || *line == '#' || *line == '+' || *line == '-')
+                                continue;
+                        colon1 = strchr(line, ':');
+                        if (!colon1 || colon1 == line)
+                                continue;
+                        colon2 = strchr(colon1 + 1, ':');
+                        if (!colon2)
+                                continue;
+                        colon3 = strchr(colon2 + 1, ':');
+                        if (!colon3)
+                                continue;
+                        *colon1 = '\0';
+                        *colon3 = '\0';
+                        if (parse_u64(colon2 + 1, UINT32_MAX - 1, &parsed))
+                                cache_store_gid(cache, line, (gid_t)parsed);
+                }
+                free(line);
+                fclose(file);
+        }
+        cache_store_gid(cache, "root", 0);
+}
+
 NssCache *nss_cache_new(void)
 {
         NssCache *cache = calloc(1, sizeof(*cache));
@@ -190,6 +314,8 @@ NssCache *nss_cache_new(void)
                 return NULL;
         str_map_init(&cache->users_by_name, user_destroy);
         u32_map_init(&cache->users_by_uid, user_destroy);
+        str_map_init(&cache->uids_by_name, free);
+        u32_map_init(&cache->uids_by_uid, free);
         str_map_init(&cache->groups_by_name, free);
         u32_map_init(&cache->groups_by_gid, free);
         str_map_init(&cache->missing_users, NULL);
@@ -203,6 +329,8 @@ void nss_cache_free(NssCache *cache)
                 return;
         str_map_clear(&cache->users_by_name);
         u32_map_clear(&cache->users_by_uid);
+        str_map_clear(&cache->uids_by_name);
+        u32_map_clear(&cache->uids_by_uid);
         str_map_clear(&cache->groups_by_name);
         u32_map_clear(&cache->groups_by_gid);
         str_map_clear(&cache->missing_users);
@@ -217,6 +345,7 @@ const NssUser *nss_cache_lookup_user(NssCache *cache, const char *name, Error **
         NssUser *user;
         char *buffer = NULL;
         struct passwd entry;
+        Error *local_error = NULL;
 
         if (!cache || !name) {
                 error_set(error, EINVAL, "Invalid NSS user lookup");
@@ -230,32 +359,35 @@ const NssUser *nss_cache_lookup_user(NssCache *cache, const char *name, Error **
                 error_set(error, NSS_NOT_FOUND, "NSS user '%s' was not found", name);
                 return NULL;
         }
-        if (!lookup_passwd(name, by_id, (uid_t)parsed, &entry, &buffer, error)) {
-                if (error && *error && (*error)->code == NSS_NOT_FOUND)
+        if (!lookup_passwd(name, by_id, (uid_t)parsed, &entry, &buffer, &local_error)) {
+                if (local_error && local_error->code == NSS_NOT_FOUND)
                         str_map_set(&cache->missing_users, name, NULL);
+                if (error)
+                        *error = local_error;
+                else
+                        error_free(local_error);
                 free(buffer);
                 return NULL;
         }
-        user = u32_map_get(&cache->users_by_uid, (uint32_t)entry.pw_uid);
+        /* Match by canonical name so aliased UIDs (such as root and toor) keep
+         * distinct home, shell, and supplementary-group records. */
+        user = entry.pw_name ? str_map_get(&cache->users_by_name, entry.pw_name) : NULL;
         if (!user) {
                 user = nss_user_new(&entry, error);
                 if (!user) {
                         free(buffer);
                         return NULL;
                 }
-                if (!u32_map_set(&cache->users_by_uid, (uint32_t)user->uid, nss_user_ref(user))) {
-                        nss_user_unref(user);
+                if (!str_map_set(&cache->users_by_name, user->name, user)) {
                         nss_user_unref(user);
                         free(buffer);
                         error_set(error, ENOMEM, "NSS cache: out of memory");
                         return NULL;
                 }
-                nss_user_unref(user);
-                user = u32_map_get(&cache->users_by_uid, (uint32_t)entry.pw_uid);
         }
-        if (!str_map_contains(&cache->users_by_name, entry.pw_name)) {
+        if (!u32_map_contains(&cache->users_by_uid, (uint32_t)user->uid)) {
                 NssUser *ref = nss_user_ref(user);
-                if (!str_map_set(&cache->users_by_name, entry.pw_name, ref))
+                if (!u32_map_set(&cache->users_by_uid, (uint32_t)user->uid, ref))
                         nss_user_unref(ref);
         }
         if (!by_id && !str_map_contains(&cache->users_by_name, name)) {
@@ -263,16 +395,58 @@ const NssUser *nss_cache_lookup_user(NssCache *cache, const char *name, Error **
                 if (!str_map_set(&cache->users_by_name, name, ref))
                         nss_user_unref(ref);
         }
+        cache_store_uid(cache, user->name, user->uid);
+        if (!by_id && strcmp(name, user->name) != 0)
+                cache_store_uid(cache, name, user->uid);
         free(buffer);
         return user;
 }
 
 bool nss_cache_lookup_uid(NssCache *cache, const char *name, uid_t *uid, Error **error)
 {
-        const NssUser *user = nss_cache_lookup_user(cache, name, error);
-        if (!user)
+        uint64_t parsed = 0;
+        bool by_id;
+        uid_t *stored;
+        const NssUser *user;
+        char *buffer = NULL;
+        struct passwd entry;
+        Error *local_error = NULL;
+
+        if (!cache || !name || !uid)
+                return error_set(error, EINVAL, "Invalid NSS user lookup");
+        nss_cache_populate_passwd(cache);
+        by_id = parse_u64(name, UINT32_MAX - 1, &parsed);
+        stored = by_id ? u32_map_get(&cache->uids_by_uid, (uint32_t)parsed) : str_map_get(&cache->uids_by_name, name);
+        if (stored) {
+                *uid = *stored;
+                return true;
+        }
+        user = by_id ? u32_map_get(&cache->users_by_uid, (uint32_t)parsed) : str_map_get(&cache->users_by_name, name);
+        if (user) {
+                *uid = user->uid;
+                return true;
+        }
+        if (str_map_contains(&cache->missing_users, name))
+                return error_set(error, NSS_NOT_FOUND, "NSS user '%s' was not found", name);
+        if (!lookup_passwd(name, by_id, (uid_t)parsed, &entry, &buffer, &local_error)) {
+                if (local_error && local_error->code == NSS_NOT_FOUND)
+                        str_map_set(&cache->missing_users, name, NULL);
+                if (error)
+                        *error = local_error;
+                else
+                        error_free(local_error);
+                free(buffer);
                 return false;
-        *uid = user->uid;
+        }
+        if (entry.pw_uid == (uid_t)-1 || !entry.pw_name || !*entry.pw_name) {
+                free(buffer);
+                return error_set(error, NSS_INVALID_DATA, "NSS returned an invalid user record for '%s'", name);
+        }
+        *uid = entry.pw_uid;
+        cache_store_uid(cache, entry.pw_name, entry.pw_uid);
+        if (!by_id && strcmp(name, entry.pw_name) != 0)
+                cache_store_uid(cache, name, entry.pw_uid);
+        free(buffer);
         return true;
 }
 
@@ -283,9 +457,11 @@ bool nss_cache_lookup_gid(NssCache *cache, const char *name, gid_t *gid, Error *
         gid_t *stored;
         char *buffer = NULL;
         struct group entry;
+        Error *local_error = NULL;
 
         if (!cache || !name || !gid)
                 return error_set(error, EINVAL, "Invalid NSS group lookup");
+        nss_cache_populate_group(cache);
         by_id = parse_u64(name, UINT32_MAX - 1, &parsed);
         stored = by_id ? u32_map_get(&cache->groups_by_gid, (uint32_t)parsed)
                        : str_map_get(&cache->groups_by_name, name);
@@ -295,9 +471,13 @@ bool nss_cache_lookup_gid(NssCache *cache, const char *name, gid_t *gid, Error *
         }
         if (str_map_contains(&cache->missing_groups, name))
                 return error_set(error, NSS_NOT_FOUND, "NSS group '%s' was not found", name);
-        if (!lookup_group(name, by_id, (gid_t)parsed, &entry, &buffer, error)) {
-                if (error && *error && (*error)->code == NSS_NOT_FOUND)
+        if (!lookup_group(name, by_id, (gid_t)parsed, &entry, &buffer, &local_error)) {
+                if (local_error && local_error->code == NSS_NOT_FOUND)
                         str_map_set(&cache->missing_groups, name, NULL);
+                if (error)
+                        *error = local_error;
+                else
+                        error_free(local_error);
                 free(buffer);
                 return false;
         }
@@ -306,27 +486,9 @@ bool nss_cache_lookup_gid(NssCache *cache, const char *name, gid_t *gid, Error *
                 return error_set(error, NSS_INVALID_DATA, "NSS returned an invalid group record for '%s'", name);
         }
         *gid = entry.gr_gid;
-        gid_t *by_gid_value = malloc(sizeof(*by_gid_value));
-        gid_t *by_name_value = malloc(sizeof(*by_name_value));
-        if (!by_gid_value || !by_name_value) {
-                free(by_gid_value);
-                free(by_name_value);
-                free(buffer);
-                return error_set(error, ENOMEM, "NSS group cache: out of memory");
-        }
-        *by_gid_value = *by_name_value = entry.gr_gid;
-        if (!u32_map_set(&cache->groups_by_gid, (uint32_t)entry.gr_gid, by_gid_value))
-                free(by_gid_value);
-        if (!str_map_set(&cache->groups_by_name, entry.gr_name, by_name_value))
-                free(by_name_value);
-        if (!by_id && strcmp(name, entry.gr_name) != 0) {
-                gid_t *alias = malloc(sizeof(*alias));
-                if (alias) {
-                        *alias = entry.gr_gid;
-                        if (!str_map_set(&cache->groups_by_name, name, alias))
-                                free(alias);
-                }
-        }
+        cache_store_gid(cache, entry.gr_name, entry.gr_gid);
+        if (!by_id && strcmp(name, entry.gr_name) != 0)
+                cache_store_gid(cache, name, entry.gr_gid);
         free(buffer);
         return true;
 }

@@ -6,10 +6,12 @@
 #include <dirent.h>
 #include <errno.h>
 #include <expat.h>
+#include <pwd.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 #ifdef HAVE_SELINUX
 #include <selinux/selinux.h>
 #endif
@@ -21,7 +23,7 @@ typedef struct {
         PolicyContext context;
         uint32_t uid;
         uint32_t gid;
-        const char *text_element;
+        bool capture_text;
         StrBuf *text;
         bool include_ignore_missing;
         bool include_if_selinux;
@@ -38,6 +40,8 @@ static void optimize_rule_table(U32Map *table);
 static bool optimize_strings(PtrVec *strings, Error **error);
 static void parser_warning(ParserState *state, const char *format, ...);
 static void parser_fail(ParserState *state, Error *error);
+static bool valid_boolean(const char *value);
+static bool is_known_limit_name(const char *value);
 
 /* expat 2.10 deprecates the XML_Size getter in favour of a fixed-width one. */
 static unsigned long long parser_line(XML_Parser parser)
@@ -360,30 +364,33 @@ static void parse_rule(ParserState *state, const char *element, const char **att
         const char *send_destination = attribute(attributes, "send_destination");
         const char *send_destination_prefix = attribute(attributes, "send_destination_prefix");
         const char *recv_sender = attribute(attributes, "receive_sender");
+        const char *send_error = attribute(attributes, "send_error");
+        const char *recv_error = attribute(attributes, "receive_error");
         const char *send_type = attribute(attributes, "send_type");
         const char *recv_type = attribute(attributes, "receive_type");
         const char *send_requested_reply = attribute(attributes, "send_requested_reply");
         const char *recv_requested_reply = attribute(attributes, "receive_requested_reply");
+        const char *eavesdrop = attribute(attributes, "eavesdrop");
         /* dbus-broker tracks expected replies itself, so requested_reply is not
          * expressible in its policy. A rule that says nothing else would
          * otherwise widen into a match-everything rule. */
         bool only_send_requested_reply =
                 send_requested_reply && !send_destination && !attribute(attributes, "send_path") &&
-                !attribute(attributes, "send_interface") && !attribute(attributes, "send_member") &&
-                !attribute(attributes, "send_error") && !send_type && !attribute(attributes, "send_broadcast");
-        bool only_recv_requested_reply =
-                recv_requested_reply && !recv_sender && !attribute(attributes, "receive_path") &&
-                !attribute(attributes, "receive_interface") && !attribute(attributes, "receive_member") &&
-                !attribute(attributes, "receive_error") && !recv_type;
+                !attribute(attributes, "send_interface") && !attribute(attributes, "send_member") && !send_error &&
+                !send_type && !attribute(attributes, "send_broadcast");
+        bool only_recv_requested_reply = recv_requested_reply && !recv_sender &&
+                                         !attribute(attributes, "receive_path") &&
+                                         !attribute(attributes, "receive_interface") &&
+                                         !attribute(attributes, "receive_member") && !recv_error && !recv_type;
         /* The send conditions dbus-broker can express. */
         bool has_send_match = send_destination || attribute(attributes, "send_path") ||
                               attribute(attributes, "send_interface") || attribute(attributes, "send_member") ||
-                              attribute(attributes, "send_error") || send_type ||
-                              attribute(attributes, "send_broadcast") || send_requested_reply;
+                              send_error || send_type || attribute(attributes, "send_broadcast") ||
+                              send_requested_reply;
         bool has_send = has_send_match || send_destination_prefix;
         bool has_recv = recv_sender || attribute(attributes, "receive_path") ||
                         attribute(attributes, "receive_interface") || attribute(attributes, "receive_member") ||
-                        attribute(attributes, "receive_error") || recv_type || recv_requested_reply;
+                        recv_error || recv_type || recv_requested_reply;
         PolicyRule *rule = calloc(1, sizeof(*rule));
         if (!rule) {
                 Error *error = NULL;
@@ -400,32 +407,16 @@ static void parse_rule(ParserState *state, const char *element, const char **att
 
         if (state->context == POLICY_CONTEXT_NONE)
                 goto invalid;
-        if (categories == 0 && attribute(attributes, "eavesdrop"))
+        if (eavesdrop && !valid_boolean(eavesdrop))
+                goto invalid;
+        if (categories == 0 && eavesdrop)
                 categories = 1;
         if (categories != 1 || (user && group) || (own && own_prefix) ||
+            (send_destination && send_destination_prefix) ||
             ((user || group) && (state->context == POLICY_CONTEXT_USER || state->context == POLICY_CONTEXT_GROUP)))
                 goto invalid;
 
         rule->allow = str_equal(element, "allow");
-        /* dbus-broker matches send destinations exactly. Dropping only the
-         * attribute would widen an <allow> to every destination, so the whole
-         * rule goes. A <deny> keeps its other conditions, because denying too
-         * much fails closed; with no other usable condition it would deny
-         * every send, so it is dropped as well. */
-        if (send_destination_prefix) {
-                if (rule->allow || !has_send_match || only_send_requested_reply) {
-                        parser_warning(state,
-                                       "ignoring <%s> with send_destination_prefix=\"%s\"; dbus-broker cannot match "
-                                       "destination prefixes",
-                                       element, send_destination_prefix);
-                        policy_rule_free(rule);
-                        return;
-                }
-                parser_warning(state,
-                               "ignoring send_destination_prefix=\"%s\"; dbus-broker cannot match destination "
-                               "prefixes, so this <deny> applies to every destination",
-                               send_destination_prefix);
-        }
         rule->priority = ((uint64_t)state->context << 56) | ++state->config->priority;
         rule->min_fds = 0;
         rule->max_fds = UINT64_MAX;
@@ -499,6 +490,13 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 policy_rule_free(rule);
                 return;
         }
+        if ((rule->type == POLICY_RULE_SEND && send_error) || (rule->type == POLICY_RULE_RECV && recv_error)) {
+                parser_warning(
+                        state,
+                        "ignoring explicit policy on error messages; dbus-broker tracks expected replies itself");
+                policy_rule_free(rule);
+                return;
+        }
         if ((rule->type == POLICY_RULE_SEND && only_send_requested_reply) ||
             (rule->type == POLICY_RULE_RECV && only_recv_requested_reply)) {
                 parser_warning(state, "ignoring D-Bus policy rule that only constrains requested_reply; dbus-broker "
@@ -506,7 +504,26 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 policy_rule_free(rule);
                 return;
         }
-        if (str_equal(attribute(attributes, "eavesdrop"), "true") && !rule->allow) {
+        /* dbus-broker matches send destinations exactly. Dropping only the
+         * attribute would widen an <allow> to every destination, so the whole
+         * rule goes. A <deny> keeps its other conditions, because denying too
+         * much fails closed; with no other usable condition it would deny
+         * every send, so it is dropped as well. */
+        if (send_destination_prefix) {
+                if (rule->allow || !has_send_match || only_send_requested_reply) {
+                        parser_warning(state,
+                                       "ignoring <%s> with send_destination_prefix=\"%s\"; dbus-broker cannot match "
+                                       "destination prefixes",
+                                       element, send_destination_prefix);
+                        policy_rule_free(rule);
+                        return;
+                }
+                parser_warning(state,
+                               "ignoring send_destination_prefix=\"%s\"; dbus-broker cannot match destination "
+                               "prefixes, so this <deny> applies to every destination",
+                               send_destination_prefix);
+        }
+        if (str_equal(eavesdrop, "true") && !rule->allow) {
                 policy_rule_free(rule);
                 return;
         }
@@ -590,9 +607,69 @@ static bool validate_element(ParserState *state, const char *element)
         return false;
 }
 
+static bool is_known_limit_name(const char *value)
+{
+        static const char *const limit_names[] = {
+                "max_incoming_bytes",
+                "max_incoming_unix_fds",
+                "max_outgoing_bytes",
+                "max_outgoing_unix_fds",
+                "max_message_size",
+                "max_message_unix_fds",
+                "service_start_timeout",
+                "auth_timeout",
+                "pending_fd_timeout",
+                "max_completed_connections",
+                "max_incomplete_connections",
+                "max_connections_per_user",
+                "max_pending_service_starts",
+                "max_names_per_connection",
+                "max_match_rules_per_connection",
+                "max_replies_per_connection",
+                "max_containers_per_user",
+                "max_containers",
+                "max_connections_per_container",
+                "max_container_metadata_bytes",
+                "reply_timeout",
+                NULL,
+        };
+        return string_in(value, limit_names);
+}
+
 static bool valid_boolean(const char *value)
 {
         return str_equal(value, "true") || str_equal(value, "false");
+}
+
+static char *current_user_home(void)
+{
+        long suggested = sysconf(_SC_GETPW_R_SIZE_MAX);
+        size_t size = suggested > 0 && suggested < 1024 * 1024 ? (size_t)suggested : 16384;
+        char *buffer = NULL;
+        struct passwd entry, *result = NULL;
+        uid_t uid = getuid();
+
+        for (;;) {
+                char *resized = realloc(buffer, size);
+                int r;
+                if (!resized) {
+                        free(buffer);
+                        return NULL;
+                }
+                buffer = resized;
+                r = getpwuid_r(uid, &entry, buffer, size, &result);
+                if (r == ERANGE && size < 16 * 1024 * 1024) {
+                        size *= 2;
+                        continue;
+                }
+                if (r == 0 && result && entry.pw_dir && path_is_absolute(entry.pw_dir)) {
+                        char *home = str_dup(entry.pw_dir);
+                        free(buffer);
+                        return home;
+                }
+                free(buffer);
+                return NULL;
+        }
 }
 
 static void validate_attributes(ParserState *state, const char *element, const char **attributes)
@@ -635,30 +712,6 @@ static void validate_attributes(ParserState *state, const char *element, const c
         static const char *const associate_attributes[] = {"own", "context", NULL};
         static const char *const apparmor_attributes[] = {"mode", NULL};
         static const char *const limit_attributes[] = {"name", NULL};
-        static const char *const limit_names[] = {
-                "max_incoming_bytes",
-                "max_incoming_unix_fds",
-                "max_outgoing_bytes",
-                "max_outgoing_unix_fds",
-                "max_message_size",
-                "max_message_unix_fds",
-                "service_start_timeout",
-                "auth_timeout",
-                "pending_fd_timeout",
-                "max_completed_connections",
-                "max_incomplete_connections",
-                "max_connections_per_user",
-                "max_pending_service_starts",
-                "max_names_per_connection",
-                "max_match_rules_per_connection",
-                "max_replies_per_connection",
-                "max_containers_per_user",
-                "max_containers",
-                "max_connections_per_container",
-                "max_container_metadata_bytes",
-                "reply_timeout",
-                NULL,
-        };
         const char *const *allowed = no_attributes;
 
         if (str_equal(element, "include"))
@@ -701,7 +754,7 @@ static void validate_attributes(ParserState *state, const char *element, const c
                 else if (str_equal(element, "apparmor") && str_equal(name, "mode") && !str_equal(value, "enabled") &&
                          !str_equal(value, "disabled") && !str_equal(value, "required"))
                         parser_warning(state, "invalid AppArmor mode=\"%s\"", value);
-                else if (str_equal(element, "limit") && str_equal(name, "name") && !string_in(value, limit_names))
+                else if (str_equal(element, "limit") && str_equal(name, "name") && !is_known_limit_name(value))
                         parser_warning(state, "invalid limit name=\"%s\"", value);
         }
 
@@ -749,12 +802,11 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
 
         if (str_equal(element, "policy")) {
                 context = attribute(attributes, "context");
-                state->context = POLICY_CONTEXT_DEFAULT;
+                state->context = POLICY_CONTEXT_NONE;
                 state->uid = state->gid = 0;
                 const char *at_console = attribute(attributes, "at_console");
                 if (!!attribute(attributes, "user") + !!attribute(attributes, "group") + !!context + !!at_console > 1) {
                         parser_warning(state, "ignoring D-Bus policy with conflicting identity contexts");
-                        state->context = POLICY_CONTEXT_NONE;
                 } else if (attribute(attributes, "user")) {
                         state->context = POLICY_CONTEXT_USER;
                         if (!lookup_uid(state, attribute(attributes, "user"), &state->uid)) {
@@ -765,6 +817,8 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         if (!lookup_gid(state, attribute(attributes, "group"), &state->gid)) {
                                 state->context = POLICY_CONTEXT_NONE;
                         }
+                } else if (context && str_equal(context, "default")) {
+                        state->context = POLICY_CONTEXT_DEFAULT;
                 } else if (context && str_equal(context, "mandatory")) {
                         state->context = POLICY_CONTEXT_MANDATORY;
                 } else if (at_console && str_equal(at_console, "true")) {
@@ -775,10 +829,8 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                         state->config->uses_console_policy = true;
                 } else if (at_console) {
                         parser_warning(state, "ignoring D-Bus policy with invalid at_console value '%s'", at_console);
-                        state->context = POLICY_CONTEXT_NONE;
-                } else if (context && !str_equal(context, "default")) {
+                } else if (context) {
                         parser_warning(state, "ignoring D-Bus policy with unknown context '%s'", context);
-                        state->context = POLICY_CONTEXT_NONE;
                 }
         } else if (str_equal(element, "keep_umask")) {
                 state->config->keep_umask = true;
@@ -815,7 +867,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                    str_equal(element, "servicedir") || str_equal(element, "listen") || str_equal(element, "user") ||
                    str_equal(element, "type") || str_equal(element, "pidfile") || str_equal(element, "auth") ||
                    str_equal(element, "servicehelper")) {
-                state->text_element = element;
+                state->capture_text = true;
                 state->include_ignore_missing = str_equal(attribute(attributes, "ignore_missing"), "yes");
                 state->include_if_selinux = str_equal(attribute(attributes, "if_selinux_enabled"), "yes");
                 state->include_selinux_root_relative = str_equal(attribute(attributes, "selinux_root_relative"), "yes");
@@ -823,7 +875,7 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                 if (state->text->data)
                         state->text->data[0] = 0;
         } else if (str_equal(element, "limit")) {
-                state->text_element = element;
+                state->capture_text = true;
                 free(state->limit_name);
                 state->limit_name = str_dup(attribute(attributes, "name"));
                 if (attribute(attributes, "name") && !state->limit_name) {
@@ -866,10 +918,17 @@ static void parser_start(void *data, const XML_Char *element, const XML_Char **a
                                 return;
                         }
                 }
-                if (data_home && path_is_absolute(data_home))
+                if (data_home && path_is_absolute(data_home)) {
                         base = str_dup(data_home);
-                else if (home && path_is_absolute(home))
+                } else if (home && path_is_absolute(home)) {
                         base = path_join(home, ".local/share");
+                } else {
+                        char *pw_home = current_user_home();
+                        if (pw_home) {
+                                base = path_join(pw_home, ".local/share");
+                                free(pw_home);
+                        }
+                }
                 if (base) {
                         dbus = path_join(base, "dbus-1/services");
                         free(base);
@@ -923,7 +982,7 @@ static bool load_directory(LauncherConfig *config, const char *path, Error **err
         }
         directory = opendir(path);
         if (!directory) {
-                if (errno == ENOENT)
+                if (errno == ENOENT || errno == ENOTDIR)
                         return true;
                 return error_set_errno(error, errno, "%s", path);
         }
@@ -940,7 +999,7 @@ static bool load_directory(LauncherConfig *config, const char *path, Error **err
                         read_error = errno;
                         break;
                 }
-                if (str_has_suffix(entry->d_name, ".conf")) {
+                if (str_has_suffix(entry->d_name, ".conf") && strlen(entry->d_name) > strlen(".conf")) {
                         char *name = str_dup(entry->d_name);
                         if (!name || !ptr_vec_push(names, name)) {
                                 free(name);
@@ -963,7 +1022,7 @@ static bool load_directory(LauncherConfig *config, const char *path, Error **err
                         ptr_vec_free(names);
                         return error_set(error, ENOMEM, "%s: out of memory", path);
                 }
-                if (!load_file(config, file, false, error)) {
+                if (!load_file(config, file, true, error)) {
                         free(file);
                         ptr_vec_free(names);
                         return false;
@@ -1015,10 +1074,10 @@ static void parser_end(void *data, const XML_Char *element)
         }
         ptr_vec_delete(state->elements, state->elements->len - 1);
         if (str_equal(element, "policy")) {
-                state->context = POLICY_CONTEXT_DEFAULT;
+                state->context = POLICY_CONTEXT_NONE;
                 return;
         }
-        if (!state->text_element || !str_equal(element, state->text_element))
+        if (!state->capture_text)
                 return;
         value = str_dup(state->text->data ? state->text->data : "");
         if (!value) {
@@ -1160,13 +1219,13 @@ static void parser_end(void *data, const XML_Char *element)
                                 state->config->max_matches_per_connection = parsed;
                         } else if (str_equal(state->limit_name, "service_start_timeout")) {
                                 state->config->service_start_timeout = parsed;
-                        } else {
+                        } else if (!is_known_limit_name(state->limit_name)) {
                                 parser_warning(state, "ignoring unsupported D-Bus limit '%s'", state->limit_name);
                         }
                 }
         }
         free(value);
-        state->text_element = NULL;
+        state->capture_text = false;
         free(state->limit_name);
         state->limit_name = NULL;
 }
@@ -1174,7 +1233,7 @@ static void parser_end(void *data, const XML_Char *element)
 static void parser_text(void *data, const XML_Char *text, int length)
 {
         ParserState *state = data;
-        if (!state->ignored_depth && state->text_element) {
+        if (!state->ignored_depth && state->capture_text) {
                 if (!str_buf_append_n(state->text, text, (size_t)length)) {
                         Error *nomem = NULL;
                         error_set(&nomem, ENOMEM, "Out of memory appending text");
@@ -1189,8 +1248,9 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
         char *contents;
         size_t length;
         XML_Parser parser;
-        ParserState state = {.config = config, .context = POLICY_CONTEXT_DEFAULT};
+        ParserState state = {.config = config, .context = POLICY_CONTEXT_NONE};
         bool success = false;
+        Error *read_error = NULL;
 
         canonical = path_canonicalize(path, NULL);
         char *watched = canonical ? str_dup(canonical) : NULL;
@@ -1215,13 +1275,17 @@ static bool load_file(LauncherConfig *config, const char *path, bool ignore_miss
                 free(canonical);
                 return true;
         }
-        if (!read_file_limited(canonical, (size_t)16 * 1024 * 1024, &contents, &length, error)) {
+        if (!read_file_limited(canonical, (size_t)16 * 1024 * 1024, &contents, &length, &read_error)) {
                 free(resolved);
-                if (ignore_missing && error && *error && (*error)->code == ENOENT) {
-                        error_clear(error);
+                if (ignore_missing && read_error && read_error->code == ENOENT) {
+                        error_free(read_error);
                         free(canonical);
                         return true;
                 }
+                if (error)
+                        *error = read_error;
+                else
+                        error_free(read_error);
                 free(canonical);
                 return false;
         }

@@ -60,6 +60,7 @@ bool event_loop_dispatch(EventLoop *loop, int timeout_ms, Error **error)
 {
         struct epoll_event events[32];
         int count;
+        bool was_running = loop->running;
         do
                 count = epoll_wait(loop->epoll_fd, events, 32, timeout_ms);
         while (count < 0 && errno == EINTR);
@@ -69,6 +70,8 @@ bool event_loop_dispatch(EventLoop *loop, int timeout_ms, Error **error)
                 EventSource *source = events[i].data.ptr;
                 if (source->registered && !source->callback(source, events[i].events, source->data, error))
                         return false;
+                if (was_running && !loop->running)
+                        break;
         }
         return true;
 }

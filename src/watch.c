@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "watch.h"
 #include "event.h"
+#include "log.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -40,8 +41,9 @@ static void entry_free(void *data)
 }
 
 /* Returns the closest path that can carry an inotify watch. When the target is
- * a file, that is its parent directory; substituted is set so the caller can
- * filter the directory's events down to that one name. */
+ * a file or lies below a missing/non-directory ancestor, that is the nearest
+ * existing directory; substituted is set so the caller can filter the
+ * directory's events down to the first component below it. */
 static char *nearest_existing(const char *path, bool *substituted)
 {
         char *candidate = path_canonicalize(path, NULL);
@@ -49,13 +51,7 @@ static char *nearest_existing(const char *path, bool *substituted)
         *substituted = false;
         if (!candidate)
                 return NULL;
-        if (lstat(candidate, &st) == 0 && !S_ISDIR(st.st_mode)) {
-                char *parent = path_dirname(candidate);
-                free(candidate);
-                *substituted = true;
-                return parent;
-        }
-        while (lstat(candidate, &st) < 0 && errno == ENOENT) {
+        while (lstat(candidate, &st) < 0 && (errno == ENOENT || errno == ENOTDIR)) {
                 *substituted = true;
                 char *parent = path_dirname(candidate);
                 if (!parent) {
@@ -69,11 +65,28 @@ static char *nearest_existing(const char *path, bool *substituted)
                 free(candidate);
                 candidate = parent;
         }
+        if (lstat(candidate, &st) == 0 && !S_ISDIR(st.st_mode)) {
+                char *parent = path_dirname(candidate);
+                free(candidate);
+                *substituted = true;
+                return parent;
+        }
         return candidate;
 }
 
-/* Several targets can share one inotify descriptor, so each is removed once. */
-static void discard_entries(Watch *watch, PtrVec *entries)
+static bool entries_have_descriptor(const PtrVec *entries, int descriptor)
+{
+        if (!entries || descriptor < 0)
+                return false;
+        for (size_t i = 0; i < entries->len; ++i)
+                if (((const WatchEntry *)entries->items[i])->descriptor == descriptor)
+                        return true;
+        return false;
+}
+
+/* Several targets can share one inotify descriptor, so each is removed once.
+ * Descriptors present in @keep are left armed in inotify. */
+static void discard_entries(Watch *watch, PtrVec *entries, const PtrVec *keep)
 {
         for (size_t i = 0; i < entries->len; ++i) {
                 WatchEntry *entry = entries->items[i];
@@ -83,7 +96,7 @@ static void discard_entries(Watch *watch, PtrVec *entries)
                                 first = false;
                                 break;
                         }
-                if (first && entry->descriptor >= 0)
+                if (first && entry->descriptor >= 0 && !entries_have_descriptor(keep, entry->descriptor))
                         inotify_rm_watch(watch->inotify_fd, entry->descriptor);
         }
         ptr_vec_clear(entries);
@@ -91,56 +104,80 @@ static void discard_entries(Watch *watch, PtrVec *entries)
 
 static void remove_watches(Watch *watch)
 {
-        discard_entries(watch, &watch->entries);
+        discard_entries(watch, &watch->entries, NULL);
 }
 
 static bool rebuild(Watch *watch, Error **error)
 {
         PtrVec entries;
-        remove_watches(watch);
         ptr_vec_init(&entries, entry_free);
         for (size_t i = 0; i < watch->targets.len; ++i) {
-                WatchEntry *entry = calloc(1, sizeof(*entry));
-                bool substituted = false;
-                if (!entry)
-                        goto memory;
-                entry->descriptor = -1;
-                entry->target = strdup(watch->targets.items[i]);
-                entry->monitored = entry->target ? nearest_existing(entry->target, &substituted) : NULL;
-                if (!entry->target || !entry->monitored) {
-                        entry_free(entry);
-                        goto memory;
-                }
-                /* inotify names only direct children, so filter on the first
-                 * component below the watched ancestor. Creating it triggers
-                 * a rebuild that moves the watch one level deeper. */
-                if (substituted) {
-                        size_t n = strlen(entry->monitored);
-                        if (strncmp(entry->target, entry->monitored, n) == 0 && (n == 1 || entry->target[n] == '/')) {
-                                const char *rest = entry->target + (n == 1 ? 1 : n + 1);
-                                if (*rest)
-                                        entry->filter = strndup(rest, strcspn(rest, "/"));
+                const char *target = watch->targets.items[i];
+                WatchEntry *entry = NULL;
+                int saved = 0;
+                for (unsigned int attempt = 0; attempt < 3; ++attempt) {
+                        bool substituted = false;
+                        entry = calloc(1, sizeof(*entry));
+                        if (!entry)
+                                goto memory;
+                        entry->descriptor = -1;
+                        entry->target = strdup(target);
+                        entry->monitored = entry->target ? nearest_existing(entry->target, &substituted) : NULL;
+                        if (!entry->target || !entry->monitored) {
+                                entry_free(entry);
+                                goto memory;
                         }
-                }
-                if (!ptr_vec_push(&entries, entry)) {
+                        /* inotify names only direct children, so filter on the first
+                         * component below the watched ancestor. Creating it triggers
+                         * a rebuild that moves the watch one level deeper. */
+                        if (substituted) {
+                                size_t n = strlen(entry->monitored);
+                                if (strncmp(entry->target, entry->monitored, n) == 0 &&
+                                    (n == 1 || entry->target[n] == '/')) {
+                                        const char *rest = entry->target + (n == 1 ? 1 : n + 1);
+                                        if (*rest) {
+                                                entry->filter = strndup(rest, strcspn(rest, "/"));
+                                                if (!entry->filter) {
+                                                        entry_free(entry);
+                                                        goto memory;
+                                                }
+                                        }
+                                }
+                        }
+                        entry->descriptor =
+                                inotify_add_watch(watch->inotify_fd, entry->monitored,
+                                                  IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
+                                                          IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
+                        if (entry->descriptor >= 0)
+                                break;
+                        saved = errno;
                         entry_free(entry);
-                        goto memory;
+                        entry = NULL;
+                        if (saved != ENOENT && saved != ENOTDIR)
+                                break;
                 }
-                entry->descriptor =
-                        inotify_add_watch(watch->inotify_fd, entry->monitored,
-                                          IN_ATTRIB | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE | IN_DELETE_SELF |
-                                                  IN_MODIFY | IN_MOVE_SELF | IN_MOVED_FROM | IN_MOVED_TO);
-                if (entry->descriptor < 0) {
-                        int saved = errno;
-                        error_set_errno(error, saved, "Cannot monitor %s", entry->target);
-                        discard_entries(watch, &entries);
+                if (!entry) {
+                        if (saved == EACCES || saved == EPERM || saved == ENOENT || saved == ENOTDIR) {
+                                log_warning("Cannot monitor %s: %s", target, strerror(saved));
+                                continue;
+                        }
+                        error_set_errno(error, saved, "Cannot monitor %s", target);
+                        discard_entries(watch, &entries, &watch->entries);
                         return false;
                 }
+                if (!ptr_vec_push(&entries, entry)) {
+                        if (!entries_have_descriptor(&entries, entry->descriptor) &&
+                            !entries_have_descriptor(&watch->entries, entry->descriptor))
+                                inotify_rm_watch(watch->inotify_fd, entry->descriptor);
+                        entry_free(entry);
+                        goto memory;
+                }
         }
+        discard_entries(watch, &watch->entries, &entries);
         watch->entries = entries;
         return true;
 memory:
-        discard_entries(watch, &entries);
+        discard_entries(watch, &entries, &watch->entries);
         return error_set(error, ENOMEM, "Cannot allocate file watches");
 }
 

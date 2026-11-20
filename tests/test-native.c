@@ -24,6 +24,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -118,6 +119,13 @@ static void test_config_nss_and_services(void)
         write_contents(service_path, "[D-BUS Service]\nName=org.example.Native\nExec=/bin/true\n");
         ptr_vec_init(&dirs, free);
         assert(ptr_vec_push(&dirs, strdup(directory)));
+        /* System scope must reject services without User=. */
+        services = service_table_new();
+        assert(services && service_table_scan(&dirs, nss, false, services, &error));
+        assert(services->len == 0);
+        service_table_free(services);
+        /* User scope accepts services without User= and ignores User= if present. */
+        write_contents(service_path, "[D-BUS Service]\nName=org.example.Native\nExec=/bin/true\nUser=root\n");
         services = service_table_new();
         assert(services && service_table_scan(&dirs, nss, true, services, &error));
         assert(services->len == 1);
@@ -162,7 +170,8 @@ static void test_collections(void)
 static void test_service_parser(void)
 {
         char path[] = "/tmp/dbd-service-XXXXXX";
-        const char data[] = "[D-BUS Service]\nName=org.example.Test\nExec=/bin/echo 'hello world' \"x\"\nUser=root\n";
+        const char data[] =
+                "[D-BUS Service]\nName=org.example.Test\nExec=/bin/echo 'hello world' \"a\\\"b\" 'c\\d'\nUser=root\n";
         ServiceFile file = {0};
         Error *error = NULL;
         int fd = mkstemp(path);
@@ -173,9 +182,10 @@ static void test_service_parser(void)
         assert(service_file_load(path, &file, &error));
         assert(!error);
         assert(strcmp(file.name, "org.example.Test") == 0);
-        assert(file.arguments.len == 3);
+        assert(file.arguments.len == 4);
         assert(strcmp(file.arguments.items[1], "hello world") == 0);
-        assert(strcmp(file.arguments.items[2], "x") == 0);
+        assert(strcmp(file.arguments.items[2], "a\"b") == 0);
+        assert(strcmp(file.arguments.items[3], "c\\d") == 0);
         assert(dbus_name_is_valid(file.name));
         assert(!dbus_name_is_valid("1org.example"));
         service_file_clear(&file);
@@ -296,6 +306,37 @@ static void test_controller_peer(void)
         assert(controller_authenticate(&controller, getuid(), &error));
         assert(controller_add_name(&controller, "/org/bus1/DBus/Name/_test", "org.example.NativeTest", getuid(),
                                    &error));
+        /* Verify SELinux a(ss) 8-byte struct alignment against live dbus-broker. */
+        char dir[] = "/tmp/dbd-native-peer-XXXXXX";
+        assert(mkdtemp(dir));
+        char *conf_path = path_join(dir, "bus.conf");
+        char *sock_path = path_join(dir, "bus");
+        assert(conf_path && sock_path);
+        write_contents(conf_path, "<busconfig>"
+                                  "<policy context='default'><allow own='*'/></policy>"
+                                  "<selinux>"
+                                  "<associate own='org.example.A' context='system_u:object_r:a_t:s0'/>"
+                                  "<associate own='org.example.B' context='system_u:object_r:b_t:s0'/>"
+                                  "</selinux>"
+                                  "</busconfig>");
+        LauncherConfig *config = launcher_config_new();
+        DBusWriter policy = {0};
+        assert(config && launcher_config_load(config, conf_path, &error));
+        assert(launcher_config_export_policy_wire(config, true, 999, NULL, 0, &policy, &error));
+        struct sockaddr_un addr = {.sun_family = AF_UNIX};
+        assert(strlen(sock_path) < sizeof(addr.sun_path));
+        strcpy(addr.sun_path, sock_path);
+        int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0);
+        assert(listener >= 0 && bind(listener, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+               listen(listener, 1) == 0);
+        assert(controller_add_listener(&controller, "/org/bus1/DBus/Listener/0", listener,
+                                       launcher_config_policy_signature(), &policy, &error));
+        close(listener);
+        dbus_writer_clear(&policy);
+        launcher_config_free(config);
+        assert(unlink(sock_path) == 0 && unlink(conf_path) == 0 && rmdir(dir) == 0);
+        free(sock_path);
+        free(conf_path);
         controller_clear(&controller);
         while (waitpid(broker, &status, 0) < 0 && errno == EINTR)
                 ;
@@ -562,6 +603,26 @@ static void test_policy_invalid_xml(void)
         assert(error);
         error_clear(&error);
         launcher_config_free(config);
+
+        /* Missing <policy> context and invalid/error rules must not widen policy */
+        write_contents(path, "<busconfig>"
+                             "<policy><allow own='org.example.MissingContext'/></policy>"
+                             "<policy context='default'>"
+                             "<allow send_error='org.example.Err'/>"
+                             "<allow receive_error='org.example.Err'/>"
+                             "<allow send_destination='org.a' send_destination_prefix='org.b'/>"
+                             "<allow eavesdrop='bogus'/>"
+                             "</policy></busconfig>");
+        config = launcher_config_new();
+        assert(config && launcher_config_load(config, path, &error));
+        assert(config->default_rules->len == 0);
+        launcher_config_free(config);
+
+        uint64_t parsed = 0;
+        assert(!parse_u64(" -1", UINT64_MAX, &parsed));
+        assert(!parse_u64(" -0", UINT64_MAX, &parsed));
+        assert(!parse_u64(" 42", UINT64_MAX, &parsed));
+        assert(parse_u64("42", UINT64_MAX, &parsed) && parsed == 42);
 
         unlink(path);
 }

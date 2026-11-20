@@ -2,21 +2,29 @@
 #include "dbus-transport.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/uio.h>
+#include <time.h>
 #include <unistd.h>
 
 enum { CONTROLLER_TIMEOUT_MS = 30000, MAX_AUTH_LINE = 4096 };
 
-static void close_nointr(int fd)
+static uint64_t now_monotonic_ms(void)
+{
+        struct timespec ts;
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+        return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+static void close_fd(int fd)
 {
         if (fd >= 0)
-                while (close(fd) < 0 && errno == EINTR)
-                        ;
+                close(fd);
 }
 
 void dbus_transport_init(DBusTransport *transport, int fd)
@@ -27,30 +35,37 @@ void dbus_transport_init(DBusTransport *transport, int fd)
 void dbus_transport_clear(DBusTransport *transport)
 {
         for (size_t i = 0; i < transport->n_received_fds; ++i)
-                close_nointr(transport->received_fds[i]);
+                close_fd(transport->received_fds[i]);
         str_buf_clear(&transport->incoming);
         if (transport->fd >= 0)
-                close_nointr(transport->fd);
+                close_fd(transport->fd);
         *transport = (DBusTransport){.fd = -1};
 }
 
-static bool wait_fd(int fd, short events, Error **error)
+static bool wait_fd(int fd, short events, uint64_t deadline_ms, Error **error)
 {
         struct pollfd pollfd = {.fd = fd, .events = events};
-        int result;
-        do
-                result = poll(&pollfd, 1, CONTROLLER_TIMEOUT_MS);
-        while (result < 0 && errno == EINTR);
-        if (result < 0)
-                return error_set_errno(error, errno, "Cannot poll D-Bus controller");
-        if (!result)
-                return error_set(error, ETIMEDOUT, "D-Bus controller timed out");
-        if (pollfd.revents & (POLLERR | POLLNVAL))
-                return error_set(error, EIO, "D-Bus controller socket failed");
-        return true;
+        for (;;) {
+                uint64_t now = now_monotonic_ms();
+                int timeout_ms = 0;
+                if (now < deadline_ms) {
+                        uint64_t remaining = deadline_ms - now;
+                        timeout_ms = remaining > (uint64_t)INT_MAX ? INT_MAX : (int)remaining;
+                }
+                int result = poll(&pollfd, 1, timeout_ms);
+                if (result < 0 && errno == EINTR)
+                        continue;
+                if (result < 0)
+                        return error_set_errno(error, errno, "Cannot poll D-Bus controller");
+                if (!result)
+                        return error_set(error, ETIMEDOUT, "D-Bus controller timed out");
+                if (pollfd.revents & (POLLERR | POLLNVAL))
+                        return error_set(error, EIO, "D-Bus controller socket failed");
+                return true;
+        }
 }
 
-static bool write_all(int fd, const void *data, size_t length, Error **error)
+static bool write_all_until(int fd, const void *data, size_t length, uint64_t deadline_ms, Error **error)
 {
         const uint8_t *bytes = data;
         while (length) {
@@ -61,7 +76,7 @@ static bool write_all(int fd, const void *data, size_t length, Error **error)
                 } else if (n < 0 && errno == EINTR) {
                         continue;
                 } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        if (!wait_fd(fd, POLLOUT, error))
+                        if (!wait_fd(fd, POLLOUT, deadline_ms, error))
                                 return false;
                 } else {
                         return error_set_errno(error, n < 0 ? errno : EPIPE, "Cannot write D-Bus controller");
@@ -70,7 +85,7 @@ static bool write_all(int fd, const void *data, size_t length, Error **error)
         return true;
 }
 
-static bool read_auth_line(int fd, char line[MAX_AUTH_LINE], Error **error)
+static bool read_auth_line(int fd, char line[MAX_AUTH_LINE], uint64_t deadline_ms, Error **error)
 {
         size_t length = 0;
         while (length + 1 < MAX_AUTH_LINE) {
@@ -85,7 +100,7 @@ static bool read_auth_line(int fd, char line[MAX_AUTH_LINE], Error **error)
                 } else if (n < 0 && errno == EINTR) {
                         continue;
                 } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        if (!wait_fd(fd, POLLIN, error))
+                        if (!wait_fd(fd, POLLIN, deadline_ms, error))
                                 return false;
                 } else {
                         return error_set_errno(error, n < 0 ? errno : ECONNRESET,
@@ -100,6 +115,7 @@ bool dbus_transport_authenticate(DBusTransport *transport, uid_t uid, Error **er
         char identity[32], encoded[64], request[128], line[MAX_AUTH_LINE];
         int identity_length = snprintf(identity, sizeof(identity), "%lu", (unsigned long)uid);
         static const char hex[] = "0123456789abcdef";
+        uint64_t deadline_ms = now_monotonic_ms() + CONTROLLER_TIMEOUT_MS;
 
         if (identity_length < 0 || (size_t)identity_length >= sizeof(identity))
                 return error_set(error, EOVERFLOW, "Cannot encode D-Bus authentication identity");
@@ -113,16 +129,17 @@ bool dbus_transport_authenticate(DBusTransport *transport, uid_t uid, Error **er
         size_t request_length = formatted > 0 ? (size_t)formatted + 1 : 0;
         request[0] = 0;
         if (!request_length || request_length >= sizeof(request) ||
-            !write_all(transport->fd, request, request_length, error) || !read_auth_line(transport->fd, line, error))
+            !write_all_until(transport->fd, request, request_length, deadline_ms, error) ||
+            !read_auth_line(transport->fd, line, deadline_ms, error))
                 return false;
         if (strncmp(line, "OK ", 3) != 0)
                 return error_set(error, EACCES, "D-Bus authentication rejected: %s", line);
-        if (!write_all(transport->fd, "NEGOTIATE_UNIX_FD\r\n", 19, error) ||
-            !read_auth_line(transport->fd, line, error))
+        if (!write_all_until(transport->fd, "NEGOTIATE_UNIX_FD\r\n", 19, deadline_ms, error) ||
+            !read_auth_line(transport->fd, line, deadline_ms, error))
                 return false;
         if (strcmp(line, "AGREE_UNIX_FD") != 0)
                 return error_set(error, EPROTONOSUPPORT, "D-Bus peer refused Unix FD passing: %s", line);
-        return write_all(transport->fd, "BEGIN\r\n", 7, error);
+        return write_all_until(transport->fd, "BEGIN\r\n", 7, deadline_ms, error);
 }
 
 uint32_t dbus_transport_next_serial(DBusTransport *transport)
@@ -137,6 +154,7 @@ bool dbus_transport_send(DBusTransport *transport, const DBusWriter *message, co
                          Error **error)
 {
         size_t offset = 0;
+        uint64_t deadline_ms = now_monotonic_ms() + CONTROLLER_TIMEOUT_MS;
 
         if (!message || !message->bytes.len || n_fds > 64)
                 return error_set(error, EINVAL, "Invalid D-Bus message or file descriptor list");
@@ -163,17 +181,18 @@ bool dbus_transport_send(DBusTransport *transport, const DBusWriter *message, co
                         if (n < 0 && errno == EINTR)
                                 continue;
                         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                                if (!wait_fd(transport->fd, POLLOUT, error))
+                                if (!wait_fd(transport->fd, POLLOUT, deadline_ms, error))
                                         return false;
                                 continue;
                         }
                         return error_set_errno(error, n < 0 ? errno : EPIPE, "Cannot send D-Bus message");
                 }
         }
-        return write_all(transport->fd, message->bytes.data + offset, message->bytes.len - offset, error);
+        return write_all_until(transport->fd, message->bytes.data + offset, message->bytes.len - offset, deadline_ms,
+                               error);
 }
 
-static bool receive_more(DBusTransport *transport, bool wait, bool *received, Error **error)
+static bool receive_more(DBusTransport *transport, bool wait, uint64_t deadline_ms, bool *received, Error **error)
 {
         uint8_t bytes[65536];
         /* Aligned for the control messages parsed out of it below. */
@@ -200,20 +219,25 @@ static bool receive_more(DBusTransport *transport, bool wait, bool *received, Er
                 };
                 n = recvmsg(transport->fd, &msg, MSG_CMSG_CLOEXEC | MSG_DONTWAIT);
                 if (n > 0) {
+                        bool fd_overflow = false;
                         for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg; cmsg = CMSG_NXTHDR(&msg, cmsg)) {
-                                if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS)
+                                if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_RIGHTS ||
+                                    cmsg->cmsg_len < CMSG_LEN(0))
                                         continue;
                                 size_t count = (cmsg->cmsg_len - CMSG_LEN(0)) / sizeof(int);
-                                if (count > 64 - transport->n_received_fds) {
-                                        int *received = (int *)CMSG_DATA(cmsg);
+                                if (fd_overflow || count > 64 - transport->n_received_fds) {
+                                        int *extra = (int *)CMSG_DATA(cmsg);
                                         for (size_t i = 0; i < count; ++i)
-                                                close_nointr(received[i]);
-                                        return error_set(error, EOVERFLOW, "Too many queued D-Bus file descriptors");
+                                                close_fd(extra[i]);
+                                        fd_overflow = true;
+                                        continue;
                                 }
                                 memcpy(transport->received_fds + transport->n_received_fds, CMSG_DATA(cmsg),
                                        count * sizeof(int));
                                 transport->n_received_fds += count;
                         }
+                        if (fd_overflow)
+                                return error_set(error, EOVERFLOW, "Too many queued D-Bus file descriptors");
                         /* Checked after collecting, so the descriptors that did
                          * fit are owned by the transport and get closed with it
                          * rather than leaked. */
@@ -231,7 +255,7 @@ static bool receive_more(DBusTransport *transport, bool wait, bool *received, Er
                                 *received = false;
                                 return true;
                         }
-                        if (!wait_fd(transport->fd, POLLIN, error))
+                        if (!wait_fd(transport->fd, POLLIN, deadline_ms, error))
                                 return false;
                         continue;
                 }
@@ -243,7 +267,7 @@ void dbus_packet_clear(DBusPacket *packet)
 {
         dbus_header_clear(&packet->header);
         for (size_t i = 0; i < packet->n_fds; ++i)
-                close_nointr(packet->fds[i]);
+                close_fd(packet->fds[i]);
         free(packet->bytes);
         *packet = (DBusPacket){0};
 }
@@ -253,6 +277,7 @@ static bool receive_packet(DBusTransport *transport, DBusPacket *packet, bool wa
         DBusHeader temporary = {0};
         DBusReader body;
         size_t consumed;
+        uint64_t deadline_ms = wait ? now_monotonic_ms() + CONTROLLER_TIMEOUT_MS : 0;
 
         dbus_packet_clear(packet);
         *received = false;
@@ -304,7 +329,7 @@ static bool receive_packet(DBusTransport *transport, DBusPacket *packet, bool wa
                 error_free(parse_error);
                 dbus_header_clear(&temporary);
                 bool read = false;
-                if (!receive_more(transport, wait, &read, error))
+                if (!receive_more(transport, wait, deadline_ms, &read, error))
                         return false;
                 if (!read)
                         return true;

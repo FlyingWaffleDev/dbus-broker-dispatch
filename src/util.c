@@ -7,6 +7,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static bool grow(void **memory, size_t *capacity, size_t element_size, size_t needed)
@@ -701,14 +702,28 @@ bool read_file(const char *path, char **contents, size_t *length, Error **error)
 bool read_file_limited(const char *path, size_t maximum, char **contents, size_t *length, Error **error)
 {
         int fd;
+        struct stat st;
         StrBuf buffer = {0};
         char chunk[8192];
         ssize_t n;
 
         *contents = NULL;
-        fd = open(path, O_RDONLY | O_CLOEXEC);
+        fd = open(path, O_RDONLY | O_CLOEXEC | O_NONBLOCK);
         if (fd < 0)
                 return error_set_errno(error, errno, "%s", path);
+        if (fstat(fd, &st) < 0) {
+                int saved = errno;
+                close(fd);
+                return error_set_errno(error, saved, "%s", path);
+        }
+        if (S_ISDIR(st.st_mode)) {
+                close(fd);
+                return error_set_errno(error, EISDIR, "%s", path);
+        }
+        if (!S_ISREG(st.st_mode)) {
+                close(fd);
+                return error_set(error, EINVAL, "%s: not a regular file", path);
+        }
         for (;;) {
                 n = read(fd, chunk, sizeof(chunk));
                 if (n < 0 && errno == EINTR)
@@ -745,7 +760,7 @@ bool parse_u64(const char *text, uint64_t maximum, uint64_t *value)
 {
         char *end;
         unsigned long long parsed;
-        if (!text || !*text || *text == '-' || *text == '+')
+        if (!text || *text < '0' || *text > '9')
                 return false;
         errno = 0;
         parsed = strtoull(text, &end, 10);

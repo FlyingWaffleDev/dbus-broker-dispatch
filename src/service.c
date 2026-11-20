@@ -7,7 +7,6 @@
 #include <dirent.h>
 #include <errno.h>
 #include <limits.h>
-#include <linux/capability.h>
 #include <signal.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -17,6 +16,22 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+
+#ifdef SYS_setgroups32
+#define SYSCALL_SETGROUPS SYS_setgroups32
+#else
+#define SYSCALL_SETGROUPS SYS_setgroups
+#endif
+#ifdef SYS_setresgid32
+#define SYSCALL_SETRESGID SYS_setresgid32
+#else
+#define SYSCALL_SETRESGID SYS_setresgid
+#endif
+#ifdef SYS_setresuid32
+#define SYSCALL_SETRESUID SYS_setresuid32
+#else
+#define SYSCALL_SETRESUID SYS_setresuid
+#endif
 
 extern char **environ;
 
@@ -226,10 +241,18 @@ static bool activation_child_setup(void *data, int *error_number)
 {
         Activation *activation = data;
         sigset_t empty;
-        /* Activated services must not inherit the dispatcher's blocked
-         * SIGHUP/SIGINT/SIGTERM/SIGCHLD; the mask survives execve. */
+        struct sigaction action = {.sa_handler = SIG_DFL};
+        /* Activated services must not inherit the dispatcher's blocked or
+         * altered signals, nor share its session/process group. */
+        sigemptyset(&action.sa_mask);
+        sigaction(SIGHUP, &action, NULL);
+        sigaction(SIGINT, &action, NULL);
+        sigaction(SIGTERM, &action, NULL);
+        sigaction(SIGQUIT, &action, NULL);
+        sigaction(SIGPIPE, &action, NULL);
+        sigaction(SIGCHLD, &action, NULL);
         sigemptyset(&empty);
-        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0) {
+        if (sigprocmask(SIG_SETMASK, &empty, NULL) < 0 || (setsid() < 0 && errno != EPERM)) {
                 *error_number = errno ? errno : EPERM;
                 return false;
         }
@@ -238,9 +261,9 @@ static bool activation_child_setup(void *data, int *error_number)
         /* Root must install the configured groups even when UID/GID match. */
         if (geteuid() != 0 && geteuid() == activation->uid && getegid() == activation->gid)
                 return true;
-        if (geteuid() != 0 || syscall(SYS_setgroups, activation->n_groups, activation->groups) < 0 ||
-            syscall(SYS_setresgid, activation->gid, activation->gid, activation->gid) < 0 ||
-            syscall(SYS_setresuid, activation->uid, activation->uid, activation->uid) < 0) {
+        if (geteuid() != 0 || syscall(SYSCALL_SETGROUPS, activation->n_groups, activation->groups) < 0 ||
+            syscall(SYSCALL_SETRESGID, activation->gid, activation->gid, activation->gid) < 0 ||
+            syscall(SYSCALL_SETRESUID, activation->uid, activation->uid, activation->uid) < 0) {
                 *error_number = errno ? errno : EPERM;
                 return false;
         }
@@ -375,9 +398,16 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
         environment_vector = environment_export(&environment);
         if (!environment_vector)
                 goto memory_environment;
+        const char *working_directory = "/";
+        if (manager->user_scope) {
+                const char *home = str_map_get(&environment, "HOME");
+                if (home && path_is_absolute(home) && access(home, X_OK) == 0)
+                        working_directory = home;
+        }
         spec = (ProcessSpec){
                 .argv = arguments,
                 .environment = environment_vector,
+                .working_directory = working_directory,
                 .search_path = true,
                 .child_setup = activation_child_setup,
                 .child_setup_data = activation,
@@ -385,7 +415,7 @@ static void activate(ServiceManager *manager, Service *service, uint64_t serial)
         if (!process_spawn(&spec, &pid, &error))
                 goto failure;
         if (!u32_map_set(&manager->activations, (uint32_t)pid, activation)) {
-                kill(pid, SIGTERM);
+                kill(pid, SIGKILL);
                 while (waitpid(pid, NULL, 0) < 0 && errno == EINTR)
                         ;
                 error_set(&error, ENOMEM, "Cannot track activated service");
@@ -535,6 +565,11 @@ bool service_manager_handle_packet(ServiceManager *manager, DBusPacket *packet, 
         return true;
 }
 
+static int compare_service_names(const void *left, const void *right)
+{
+        return strcmp(*(const char *const *)left, *(const char *const *)right);
+}
+
 bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, ServiceTable *services, Error **error)
 {
         StrMap names;
@@ -543,8 +578,9 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                 const char *directory_path = service_dirs->items[i];
                 DIR *directory = opendir(directory_path);
                 struct dirent *entry;
+                PtrVec file_names;
                 if (!directory) {
-                        if (errno == ENOENT)
+                        if (errno == ENOENT || errno == ENOTDIR)
                                 continue;
                         if (errno == EACCES || errno == EPERM) {
                                 log_warning("Cannot access D-Bus service directory %s: %s", directory_path,
@@ -554,25 +590,44 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                         str_map_clear(&names);
                         return error_set_errno(error, errno, "Cannot scan D-Bus services in %s", directory_path);
                 }
+                ptr_vec_init(&file_names, free);
                 int read_error = 0;
                 for (;;) {
-                        char *path;
-                        ServiceFile parsed = {0};
-                        Error *local_error = NULL;
-                        const NssUser *identity = NULL;
-                        Service *service;
                         errno = 0;
                         entry = readdir(directory);
                         if (!entry) {
                                 read_error = errno;
                                 break;
                         }
-                        if (!str_has_suffix(entry->d_name, ".service"))
+                        if (entry->d_name[0] == '.' || !str_has_suffix(entry->d_name, ".service") ||
+                            strlen(entry->d_name) <= strlen(".service"))
                                 continue;
-                        path = path_join(directory_path, entry->d_name);
+                        char *copy = str_dup(entry->d_name);
+                        if (!copy || !ptr_vec_push(&file_names, copy)) {
+                                free(copy);
+                                ptr_vec_clear(&file_names);
+                                closedir(directory);
+                                str_map_clear(&names);
+                                return error_set(error, ENOMEM, "Cannot scan D-Bus services in %s", directory_path);
+                        }
+                }
+                closedir(directory);
+                if (read_error) {
+                        ptr_vec_clear(&file_names);
+                        str_map_clear(&names);
+                        return error_set_errno(error, read_error, "Cannot scan D-Bus services in %s", directory_path);
+                }
+                ptr_vec_sort(&file_names, compare_service_names);
+                for (size_t file_index = 0; file_index < file_names.len; ++file_index) {
+                        const char *entry_name = file_names.items[file_index];
+                        char *path;
+                        ServiceFile parsed = {0};
+                        Error *local_error = NULL;
+                        const NssUser *identity = NULL;
+                        Service *service;
+                        path = path_join(directory_path, entry_name);
                         if (!path || !service_file_load(path, &parsed, &local_error)) {
-                                log_warning("Ignoring unreadable D-Bus service file %s: %s",
-                                            path ? path : entry->d_name,
+                                log_warning("Ignoring unreadable D-Bus service file %s: %s", path ? path : entry_name,
                                             local_error ? local_error->message : "out of memory");
                                 error_free(local_error);
                                 free(path);
@@ -590,6 +645,15 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                                 log_warning("Ignoring invalid D-Bus service file %s", path);
                                 goto next;
                         }
+                        if (!user_scope && !parsed.user) {
+                                log_warning("Ignoring system D-Bus service file %s: missing User", path);
+                                goto next;
+                        }
+                        if (user_scope && parsed.user) {
+                                log_warning("Ignoring User=%s in user D-Bus service file %s", parsed.user, path);
+                                free(parsed.user);
+                                parsed.user = NULL;
+                        }
                         if (parsed.user) {
                                 identity = nss_cache_lookup_user(nss, parsed.user, &local_error);
                                 if (!identity) {
@@ -606,13 +670,13 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                                                 error_free(local_error);
                                         service_file_clear(&parsed);
                                         free(path);
-                                        closedir(directory);
+                                        ptr_vec_clear(&file_names);
                                         str_map_clear(&names);
                                         return false;
                                 }
                         }
-                        if (strlen(entry->d_name) != strlen(parsed.name) + strlen(".service") ||
-                            !str_has_prefix(entry->d_name, parsed.name)) {
+                        if (strlen(entry_name) != strlen(parsed.name) + strlen(".service") ||
+                            !str_has_prefix(entry_name, parsed.name)) {
                                 if (!user_scope) {
                                         log_warning("Ignoring system D-Bus service file %s: filename does not match "
                                                     "Name=%s",
@@ -629,7 +693,7 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                         if (!service) {
                                 service_file_clear(&parsed);
                                 free(path);
-                                closedir(directory);
+                                ptr_vec_clear(&file_names);
                                 str_map_clear(&names);
                                 return error_set(error, ENOMEM, "Cannot allocate D-Bus service");
                         }
@@ -651,7 +715,7 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                                 service_unref(service);
                                 service_file_clear(&parsed);
                                 free(path);
-                                closedir(directory);
+                                ptr_vec_clear(&file_names);
                                 str_map_clear(&names);
                                 return error_set(error, ENOMEM, "Cannot store D-Bus service");
                         }
@@ -659,12 +723,7 @@ bool service_table_scan(PtrVec *service_dirs, NssCache *nss, bool user_scope, Se
                         service_file_clear(&parsed);
                         free(path);
                 }
-                if (read_error) {
-                        closedir(directory);
-                        str_map_clear(&names);
-                        return error_set_errno(error, read_error, "Cannot scan D-Bus services in %s", directory_path);
-                }
-                closedir(directory);
+                ptr_vec_clear(&file_names);
         }
         str_map_clear(&names);
         return true;

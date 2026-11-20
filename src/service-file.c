@@ -18,59 +18,11 @@ static char *trim(char *text)
         return text;
 }
 
-static char *unescape_value(const char *value, Error **error)
-{
-        StrBuf result = {0};
-        for (const char *p = value; *p; ++p) {
-                char escaped;
-                if (*p != '\\') {
-                        size_t length = strcspn(p, "\\");
-                        if (!str_buf_append_n(&result, p, length))
-                                goto memory;
-                        p += length - 1;
-                        continue;
-                }
-                if (!*++p) {
-                        str_buf_clear(&result);
-                        error_set(error, EINVAL, "Trailing backslash in service-file value");
-                        return NULL;
-                }
-                switch (*p) {
-                case 's':
-                        escaped = ' ';
-                        break;
-                case 'n':
-                        escaped = '\n';
-                        break;
-                case 't':
-                        escaped = '\t';
-                        break;
-                case 'r':
-                        escaped = '\r';
-                        break;
-                case '\\':
-                        escaped = '\\';
-                        break;
-                default:
-                        str_buf_clear(&result);
-                        error_set(error, EINVAL, "Unsupported service-file escape '\\%c'", *p);
-                        return NULL;
-                }
-                if (!str_buf_append_n(&result, &escaped, 1))
-                        goto memory;
-        }
-        return str_buf_steal(&result);
-memory:
-        str_buf_clear(&result);
-        error_set(error, ENOMEM, "Service-file value: out of memory");
-        return NULL;
-}
-
 static bool set_field(char **field, const char *value, Error **error)
 {
-        char *copy = unescape_value(value, error);
+        char *copy = str_dup(value);
         if (!copy)
-                return false;
+                return error_set(error, ENOMEM, "Service-file value: out of memory");
         free(*field);
         *field = copy;
         return true;
@@ -166,6 +118,16 @@ fail:
         return false;
 }
 
+static bool is_ascii_digit(unsigned char c)
+{
+        return c >= '0' && c <= '9';
+}
+
+static bool is_ascii_alnum(unsigned char c)
+{
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || is_ascii_digit(c);
+}
+
 bool dbus_name_is_valid(const char *name)
 {
         size_t length;
@@ -185,9 +147,9 @@ bool dbus_name_is_valid(const char *name)
                         dot = true;
                         continue;
                 }
-                if (!(isalnum(c) || c == '_' || c == '-'))
+                if (!(is_ascii_alnum(c) || c == '_' || c == '-'))
                         return false;
-                if (component_start && isdigit(c))
+                if (component_start && is_ascii_digit(c))
                         return false;
                 component_start = false;
         }
