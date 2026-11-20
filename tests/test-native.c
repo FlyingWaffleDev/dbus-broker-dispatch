@@ -511,6 +511,32 @@ static void test_policy_dedup_and_mandatory(void)
         unlink(path);
 }
 
+/* dbus-broker cannot match a destination prefix. An <allow> must not survive
+ * as a rule for every destination; a <deny> may, if it has another condition. */
+static void test_policy_destination_prefix(void)
+{
+        char path[] = "/tmp/dbd-native-prefix-XXXXXX";
+        int fd = mkstemp(path);
+        assert(fd >= 0);
+        close(fd);
+
+        write_contents(path, "<busconfig><policy context='default'>"
+                             "<allow send_destination_prefix='org.example' send_interface='org.example.Iface'/>"
+                             "<deny send_destination_prefix='org.example' send_interface='org.example.Iface'/>"
+                             "<deny send_destination_prefix='org.example'/>"
+                             "</policy></busconfig>");
+        LauncherConfig *config = launcher_config_new();
+        Error *error = NULL;
+        assert(config && launcher_config_load(config, path, &error));
+        assert(config->default_rules->len == 1);
+        PolicyRule *rule = config->default_rules->items[0];
+        assert(!rule->allow && rule->type == POLICY_RULE_SEND && !*rule->name);
+        assert(strcmp(rule->interface, "org.example.Iface") == 0);
+        launcher_config_free(config);
+
+        unlink(path);
+}
+
 static void test_policy_invalid_xml(void)
 {
         char path[] = "/tmp/dbd-native-invalid-XXXXXX";
@@ -707,6 +733,7 @@ int main(void)
         test_service_parser();
         test_service_quote_parsing();
         test_policy_dedup_and_mandatory();
+        test_policy_destination_prefix();
         test_policy_invalid_xml();
         test_process();
         test_dbus_wire();

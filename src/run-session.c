@@ -46,6 +46,8 @@ static char *join_path(const char *directory, const char *name)
         return path;
 }
 
+/* Relative and empty PATH entries name the working directory, so they are
+ * never searched; the dispatcher resolves dbus-broker the same way. */
 static char *find_program(const char *name)
 {
         const char *path;
@@ -59,17 +61,15 @@ static char *find_program(const char *name)
         for (part = path;;) {
                 const char *end = strchr(part, ':');
                 size_t length = end ? (size_t)(end - part) : strlen(part);
-                const char *directory = length ? part : ".";
-                size_t directory_length = length ? length : 1;
                 char *candidate;
 
-                if (directory_length <= SIZE_MAX - strlen(name) - 2) {
-                        candidate = malloc(directory_length + strlen(name) + 2);
+                if (length && part[0] == '/' && length <= SIZE_MAX - strlen(name) - 2) {
+                        candidate = malloc(length + strlen(name) + 2);
                         if (!candidate)
                                 return NULL;
-                        memcpy(candidate, directory, directory_length);
-                        candidate[directory_length] = '/';
-                        strcpy(candidate + directory_length + 1, name);
+                        memcpy(candidate, part, length);
+                        candidate[length] = '/';
+                        strcpy(candidate + length + 1, name);
                         if (access(candidate, X_OK) == 0)
                                 return candidate;
                         free(candidate);
@@ -204,11 +204,13 @@ int main(int argc, char **argv)
                 goto out;
         }
 
+        /* No bare-name fallback: without a PATH search, the name would resolve
+         * against the working directory. */
         launcher = find_program("dbus-broker-dispatch");
-        if (!launcher)
-                launcher = strdup("dbus-broker-dispatch");
-        if (!launcher)
+        if (!launcher) {
+                fputs("Cannot find dbus-broker-dispatch in PATH.\n", stderr);
                 goto out;
+        }
         if (!start_bus(launcher, address, &bus, &error)) {
                 fprintf(stderr, "Cannot start user bus: %s\n", error ? error->message : "out of memory");
                 goto out;

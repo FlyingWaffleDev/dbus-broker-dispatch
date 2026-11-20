@@ -32,6 +32,7 @@
 #include <sys/types.h>
 #include <sys/un.h>
 #include <sys/wait.h>
+#include <time.h>
 #include <unistd.h>
 #ifdef HAVE_ELOGIND
 #include <elogind/sd-login.h>
@@ -40,6 +41,10 @@
 typedef struct Launcher Launcher;
 
 #define BROKER_LOG_LINE_MAX 4096
+/* How long the broker gets to exit after SIGTERM, and again after SIGKILL.
+ * Together they stay below the five seconds the PAM module waits for the
+ * dispatcher itself to stop. */
+#define BROKER_STOP_TIMEOUT_MS 2000
 
 typedef struct BrokerChild {
         int fd;
@@ -167,21 +172,29 @@ static bool configure_broker_user(Launcher *launcher, Error **error)
         return true;
 }
 
-static U32Vec effective_console_uids(Launcher *launcher)
+/* A UID missing from these lists silently loses its console rules, so running
+ * out of memory while building them is an error, not a shorter list. */
+static bool effective_console_uids(Launcher *launcher, U32Vec *result)
 {
-        U32Vec result = {0};
         for (size_t i = 0; i < launcher->static_uids.len; ++i)
-                u32_vec_push(&result, launcher->static_uids.items[i]);
+                if (!u32_vec_push(result, launcher->static_uids.items[i]))
+                        goto fail;
         for (size_t i = 0; i < launcher->dynamic_uids.len; ++i)
-                u32_vec_push(&result, launcher->dynamic_uids.items[i]);
-        u32_vec_sort_unique(&result);
-        return result;
+                if (!u32_vec_push(result, launcher->dynamic_uids.items[i]))
+                        goto fail;
+        u32_vec_sort_unique(result);
+        return true;
+fail:
+        u32_vec_clear(result);
+        return false;
 }
 
-static void load_static_console_users(Launcher *launcher)
+static bool load_static_console_users(Launcher *launcher)
 {
         char *copy = str_dup(SYSTEM_CONSOLE_USERS), *cursor = copy, *name;
-        while (copy && (name = strsep(&cursor, ","))) {
+        if (!copy)
+                return false;
+        while ((name = strsep(&cursor, ","))) {
                 struct passwd *entry;
                 /* An empty list still yields one empty name. */
                 if (!*name)
@@ -189,17 +202,22 @@ static void load_static_console_users(Launcher *launcher)
                 entry = getpwnam(name);
                 if (!entry)
                         log_warning("Ignoring unknown system-console user '%s'", name);
-                else
-                        u32_vec_push(&launcher->static_uids, (uint32_t)entry->pw_uid);
+                else if (!u32_vec_push(&launcher->static_uids, (uint32_t)entry->pw_uid)) {
+                        free(copy);
+                        return false;
+                }
         }
         free(copy);
         u32_vec_sort_unique(&launcher->static_uids);
+        return true;
 }
 
 static bool make_policy(Launcher *launcher, LauncherConfig *config, DBusWriter *policy, Error **error)
 {
-        U32Vec uids = effective_console_uids(launcher);
+        U32Vec uids = {0};
         uint32_t uid_max = launcher->console_tracked ? UINT32_MAX : launcher->system_uid_max;
+        if (!effective_console_uids(launcher, &uids))
+                return error_set(error, ENOMEM, "Out of memory collecting console users");
         bool result = launcher_config_export_policy_wire(config, launcher->user, uid_max, uids.items, uids.len, policy,
                                                          error);
         u32_vec_clear(&uids);
@@ -238,12 +256,13 @@ static bool refresh_console_users(Launcher *launcher, bool *changed)
                         u32_vec_clear(&candidate);
                         return false;
                 }
+                bool pushed = true;
                 for (int j = 0; j < n_sessions; ++j) {
                         char *seat = NULL;
                         int remote = sd_session_is_remote(sessions[j]);
                         int seat_result = remote == 0 ? sd_session_get_seat(sessions[j], &seat) : 0;
                         if (remote == 0 && seat_result >= 0 && seat && *seat) {
-                                u32_vec_push(&candidate, (uint32_t)uids[i]);
+                                pushed = u32_vec_push(&candidate, (uint32_t)uids[i]);
                                 free(seat);
                                 break;
                         }
@@ -252,6 +271,12 @@ static bool refresh_console_users(Launcher *launcher, bool *changed)
                 for (int j = 0; j < n_sessions; ++j)
                         free(sessions[j]);
                 free(sessions);
+                if (!pushed) {
+                        log_error("Out of memory collecting local-session users");
+                        free(uids);
+                        u32_vec_clear(&candidate);
+                        return false;
+                }
         }
         free(uids);
         u32_vec_sort_unique(&candidate);
@@ -915,6 +940,46 @@ static void broker_log_finish(Launcher *launcher)
         broker_log_close(launcher);
 }
 
+/* Reaps @pid if it exits within @timeout_ms. SIGCHLD is blocked for the
+ * signalfd by the time a broker exists, so sigtimedwait() returns as soon as
+ * it dies. The short slices only bound the wait should that ever not hold. */
+static bool reap_within(pid_t pid, int timeout_ms)
+{
+        const struct timespec slice = {.tv_nsec = 50 * 1000 * 1000};
+        struct timespec start, now;
+        sigset_t child_signal;
+
+        sigemptyset(&child_signal);
+        sigaddset(&child_signal, SIGCHLD);
+        clock_gettime(CLOCK_MONOTONIC, &start);
+        for (;;) {
+                pid_t reaped = waitpid(pid, NULL, WNOHANG);
+                if (reaped == pid || (reaped < 0 && errno != EINTR))
+                        return true;
+                clock_gettime(CLOCK_MONOTONIC, &now);
+                if ((now.tv_sec - start.tv_sec) * 1000 + (now.tv_nsec - start.tv_nsec) / 1000000 >= timeout_ms)
+                        return false;
+                sigtimedwait(&child_signal, NULL, &slice);
+        }
+}
+
+/* A broker that ignores SIGTERM must not keep the dispatcher, and with it the
+ * socket, lock, and PID file, around forever. */
+static void stop_broker(Launcher *launcher)
+{
+        pid_t pid = launcher->broker_pid;
+        if (!pid)
+                return;
+        launcher->broker_pid = 0;
+        kill(pid, SIGTERM);
+        if (reap_within(pid, BROKER_STOP_TIMEOUT_MS))
+                return;
+        log_warning("dbus-broker did not exit within %d ms of SIGTERM; sending SIGKILL", BROKER_STOP_TIMEOUT_MS);
+        kill(pid, SIGKILL);
+        if (!reap_within(pid, BROKER_STOP_TIMEOUT_MS))
+                log_error("dbus-broker (PID %ld) survived SIGKILL; leaving it behind", (long)pid);
+}
+
 static bool broker_child_setup(void *data, int *error_number)
 {
         BrokerChild *child = data;
@@ -1067,10 +1132,7 @@ static bool start_broker(Launcher *launcher, Error **error)
         }
         controller_init(&launcher->controller, pair[0], controller_packet, launcher);
         if (!controller_authenticate(&launcher->controller, geteuid(), error)) {
-                kill(launcher->broker_pid, SIGTERM);
-                while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
-                        ;
-                launcher->broker_pid = 0;
+                stop_broker(launcher);
                 controller_clear(&launcher->controller);
                 broker_log_close(launcher);
                 goto fail_controller;
@@ -1082,10 +1144,7 @@ static bool start_broker(Launcher *launcher, Error **error)
         free(matches);
         return true;
 fail_spawned:
-        kill(launcher->broker_pid, SIGTERM);
-        while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
-                ;
-        launcher->broker_pid = 0;
+        stop_broker(launcher);
         close(pair[0]);
         goto fail_controller;
 fail:
@@ -1196,11 +1255,15 @@ static bool daemonize_launcher(Launcher *launcher, Error **error)
         return true;
 }
 
-static void notify_startup(Launcher *launcher, bool ready)
+/* Returns false when a readiness report on the socket did not reach anyone.
+ * Whoever asked for it has given up on this start, as the PAM module does
+ * after its timeout, and would never stop a bus that came up regardless. */
+static bool notify_startup(Launcher *launcher, bool ready)
 {
         char status = ready ? 'R' : 'F';
+        bool delivered = true;
         if (launcher->startup_fd < 0)
-                return;
+                return true;
         if (launcher->startup_pipe) {
                 /* Supervisors read a newline as readiness and EOF as failure.
                  * A closed reader must not kill us with SIGPIPE. */
@@ -1213,11 +1276,15 @@ static void notify_startup(Launcher *launcher, bool ready)
                         sigaction(SIGPIPE, &previous, NULL);
                 }
         } else {
-                while (send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL | MSG_DONTWAIT) < 0 && errno == EINTR)
-                        ;
+                ssize_t sent;
+                do
+                        sent = send(launcher->startup_fd, &status, 1, MSG_NOSIGNAL | MSG_DONTWAIT);
+                while (sent < 0 && errno == EINTR);
+                delivered = sent == 1 || !ready;
         }
         close(launcher->startup_fd);
         launcher->startup_fd = -1;
+        return delivered;
 }
 
 static bool controller_event(EventSource *source, uint32_t events, void *data, Error **error)
@@ -1368,11 +1435,7 @@ static void launcher_clear(Launcher *launcher)
                 close(launcher->signal_fd);
         if (launcher->listener_fd >= 0)
                 close(launcher->listener_fd);
-        if (launcher->broker_pid) {
-                kill(launcher->broker_pid, SIGTERM);
-                while (waitpid(launcher->broker_pid, NULL, 0) < 0 && errno == EINTR)
-                        ;
-        }
+        stop_broker(launcher);
         /* Only now, so the broker's own exit diagnostics are not cut off. */
         broker_log_finish(launcher);
         str_buf_clear(&launcher->broker_log);
@@ -1585,8 +1648,10 @@ int main(int argc, char **argv)
                 print_error("Invalid D-Bus address", error);
                 goto fail;
         }
-        if (!launcher.user)
-                load_static_console_users(&launcher);
+        if (!launcher.user && !load_static_console_users(&launcher)) {
+                fputs("Cannot allocate the system-console user list\n", stderr);
+                goto fail;
+        }
         if (!service_table_scan(launcher.service_dirs, launcher_config_nss_cache(launcher.config_state), launcher.user,
                                 service_manager_table(launcher.service_manager), &error) ||
             !daemonize_launcher(&launcher, &error) || !event_loop_init(&launcher.loop, &error)) {
@@ -1628,7 +1693,10 @@ int main(int argc, char **argv)
                 print_error("Cannot initialize dispatcher", error);
                 goto fail;
         }
-        notify_startup(&launcher, true);
+        if (!notify_startup(&launcher, true)) {
+                log_error("Nobody is waiting for the readiness report any more; stopping");
+                goto fail;
+        }
         /* Not event_loop_run(): reloads must happen between dispatches, never
          * inside one. */
         launcher.loop.running = true;

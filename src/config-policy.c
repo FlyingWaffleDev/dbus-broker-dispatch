@@ -358,6 +358,7 @@ static void parse_rule(ParserState *state, const char *element, const char **att
         const char *own = attribute(attributes, "own");
         const char *own_prefix = attribute(attributes, "own_prefix");
         const char *send_destination = attribute(attributes, "send_destination");
+        const char *send_destination_prefix = attribute(attributes, "send_destination_prefix");
         const char *recv_sender = attribute(attributes, "receive_sender");
         const char *send_type = attribute(attributes, "send_type");
         const char *recv_type = attribute(attributes, "receive_type");
@@ -374,10 +375,12 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 recv_requested_reply && !recv_sender && !attribute(attributes, "receive_path") &&
                 !attribute(attributes, "receive_interface") && !attribute(attributes, "receive_member") &&
                 !attribute(attributes, "receive_error") && !recv_type;
-        bool has_send = send_destination || attribute(attributes, "send_path") ||
-                        attribute(attributes, "send_interface") || attribute(attributes, "send_member") ||
-                        attribute(attributes, "send_error") || send_type || attribute(attributes, "send_broadcast") ||
-                        send_requested_reply;
+        /* The send conditions dbus-broker can express. */
+        bool has_send_match = send_destination || attribute(attributes, "send_path") ||
+                              attribute(attributes, "send_interface") || attribute(attributes, "send_member") ||
+                              attribute(attributes, "send_error") || send_type ||
+                              attribute(attributes, "send_broadcast") || send_requested_reply;
+        bool has_send = has_send_match || send_destination_prefix;
         bool has_recv = recv_sender || attribute(attributes, "receive_path") ||
                         attribute(attributes, "receive_interface") || attribute(attributes, "receive_member") ||
                         attribute(attributes, "receive_error") || recv_type || recv_requested_reply;
@@ -404,6 +407,25 @@ static void parse_rule(ParserState *state, const char *element, const char **att
                 goto invalid;
 
         rule->allow = str_equal(element, "allow");
+        /* dbus-broker matches send destinations exactly. Dropping only the
+         * attribute would widen an <allow> to every destination, so the whole
+         * rule goes. A <deny> keeps its other conditions, because denying too
+         * much fails closed; with no other usable condition it would deny
+         * every send, so it is dropped as well. */
+        if (send_destination_prefix) {
+                if (rule->allow || !has_send_match || only_send_requested_reply) {
+                        parser_warning(state,
+                                       "ignoring <%s> with send_destination_prefix=\"%s\"; dbus-broker cannot match "
+                                       "destination prefixes",
+                                       element, send_destination_prefix);
+                        policy_rule_free(rule);
+                        return;
+                }
+                parser_warning(state,
+                               "ignoring send_destination_prefix=\"%s\"; dbus-broker cannot match destination "
+                               "prefixes, so this <deny> applies to every destination",
+                               send_destination_prefix);
+        }
         rule->priority = ((uint64_t)state->context << 56) | ++state->config->priority;
         rule->min_fds = 0;
         rule->max_fds = UINT64_MAX;
@@ -580,6 +602,7 @@ static void validate_attributes(ParserState *state, const char *element, const c
                 "send_member",
                 "send_error",
                 "send_destination",
+                "send_destination_prefix",
                 "send_path",
                 "send_type",
                 "send_requested_reply",
@@ -905,6 +928,10 @@ static bool load_directory(LauncherConfig *config, const char *path, Error **err
                 return error_set_errno(error, errno, "%s", path);
         }
         names = ptr_vec_new(free);
+        if (!names) {
+                closedir(directory);
+                return error_set(error, ENOMEM, "%s: out of memory", path);
+        }
         int read_error = 0;
         for (;;) {
                 errno = 0;
@@ -932,6 +959,10 @@ static bool load_directory(LauncherConfig *config, const char *path, Error **err
         ptr_vec_sort(names, compare_strings);
         for (size_t index = 0; index < names->len; ++index) {
                 char *file = path_join(path, names->items[index]);
+                if (!file) {
+                        ptr_vec_free(names);
+                        return error_set(error, ENOMEM, "%s: out of memory", path);
+                }
                 if (!load_file(config, file, false, error)) {
                         free(file);
                         ptr_vec_free(names);
@@ -1047,13 +1078,33 @@ static void parser_end(void *data, const XML_Char *element)
                                 error_set(&nomem, ENOMEM, "Out of memory adding servicedir");
                                 parser_fail(state, nomem);
                         }
-                } else if (str_equal(element, "listen") && !state->config->address &&
-                           str_has_prefix(value, "unix:path=")) {
-                        state->config->address = str_dup(value);
-                        if (!state->config->address) {
-                                Error *nomem = NULL;
-                                error_set(&nomem, ENOMEM, "Out of memory setting listen address");
-                                parser_fail(state, nomem);
+                } else if (str_equal(element, "listen")) {
+                        /* The dispatcher binds one unix:path= socket and
+                         * otherwise its default. unix:tmpdir=, unix:dir= and
+                         * unix:runtime= only ask for some filesystem socket,
+                         * which the default is, and the stock session.conf
+                         * uses the first of them, so those stay quiet. */
+                        if (str_has_prefix(value, "unix:path=")) {
+                                if (state->config->address) {
+                                        if (!str_equal(value, state->config->address))
+                                                parser_warning(state,
+                                                               "ignoring additional <listen>%s</listen>; the "
+                                                               "dispatcher listens on one address",
+                                                               value);
+                                } else {
+                                        state->config->address = str_dup(value);
+                                        if (!state->config->address) {
+                                                Error *nomem = NULL;
+                                                error_set(&nomem, ENOMEM, "Out of memory setting listen address");
+                                                parser_fail(state, nomem);
+                                        }
+                                }
+                        } else if (!str_has_prefix(value, "unix:tmpdir=") && !str_has_prefix(value, "unix:dir=") &&
+                                   !str_has_prefix(value, "unix:runtime=")) {
+                                parser_warning(state,
+                                               "ignoring unsupported <listen>%s</listen>; only unix:path= addresses "
+                                               "are supported",
+                                               value);
                         }
                 } else if (str_equal(element, "user")) {
                         free(state->config->user);

@@ -130,7 +130,9 @@ numbered 3 or higher, to learn when the broker and listener are configured:
 - On a connected Unix stream socket, the dispatcher sends one byte, `R` on
   success or `F` on startup failure, then closes it. EOF without `R` also means
   startup failed. This private handshake distinguishes the new dispatcher from
-  an existing bus at the same public address.
+  an existing bus at the same public address. If the `R` cannot be delivered
+  because the other end is already closed, the dispatcher stops instead of
+  leaving a bus running that nobody asked for any more.
 - On a pipe, it writes the line `READY=1` on success and closes it without
   writing on failure. This suits s6 `notification-fd`, Dinit
   `ready-notification = pipefd:FD`, and OpenRC `notify=fd:FD`.
@@ -161,7 +163,10 @@ command and leaves `XDG_RUNTIME_DIR` unchanged. Nested invocations each get
 their own bus. The wrapper returns the command's exit status and removes its
 socket and temporary directory when the command exits. The bus runs in its own
 process group, so Ctrl-C reaches the command but does not stop the bus under
-it. Signals sent to the wrapper itself are forwarded to the command.
+it. Signals sent to the wrapper itself are forwarded to the command. The
+wrapper finds `dbus-broker-dispatch` through the absolute directories in
+`PATH`; empty and relative entries are skipped, so it never runs a dispatcher
+from the working directory.
 
 ## Start user buses from PAM
 
@@ -205,8 +210,12 @@ already-configured user supervisor.
 
 ## Known limits
 
-- The dispatcher accepts only filesystem-backed `unix:path=` listeners. It
-  rejects abstract sockets and non-Unix transports.
+- The dispatcher listens on one filesystem-backed `unix:path=` socket.
+  `--address` rejects anything else. In the configuration, the first
+  `<listen>unix:path=...</listen>` is used and further ones are ignored with a
+  warning, as are abstract sockets and non-Unix transports. `unix:tmpdir=`,
+  `unix:dir=`, and `unix:runtime=` are ignored silently, because the stock
+  `session.conf` uses the first; the default socket is used instead.
 - Container policy and several limits used only by `dbus-daemon` are not
   implemented. The dispatcher supports `max_outgoing_bytes`,
   `max_outgoing_unix_fds`, `max_connections_per_user`, and
@@ -222,6 +231,11 @@ already-configured user supervisor.
   `receive_requested_reply` are ignored with a warning. `dbus-broker` tracks
   expected replies itself, so there is nothing left for such a rule to match
   narrowly.
+- `send_destination_prefix` is not supported, because `dbus-broker` matches
+  send destinations exactly. An `<allow>` using it is ignored with a warning
+  rather than applied to every destination. A `<deny>` using it keeps its other
+  conditions and then applies to every destination; with no other condition it
+  is ignored with a warning.
 
 ## License
 

@@ -183,7 +183,29 @@ int main(int argc, char **argv)
         }
         wait_for_exit(child, 1);
         assert(unlink(fake_dispatcher) == 0);
+
+        /* Empty and relative PATH entries name the working directory, and so
+         * would a bare name once the search fails. A dispatcher lying there
+         * must never run. */
+        static const char *const unsafe_paths[] = {"", ".", "/nonexistent"};
+        char *marker = path_join(runtime, "ran");
+        FILE *script = fopen(fake_dispatcher, "w");
+        assert(marker && script && fputs("#!/bin/sh\n: >ran\n", script) >= 0 && fclose(script) == 0);
+        assert(chmod(fake_dispatcher, 0700) == 0);
+        for (size_t i = 0; i < sizeof(unsafe_paths) / sizeof(unsafe_paths[0]); ++i) {
+                child = fork();
+                assert(child >= 0);
+                if (child == 0) {
+                        assert(chdir(runtime) == 0 && setenv("PATH", unsafe_paths[i], 1) == 0);
+                        execl(argv[1], argv[1], "--", "/bin/true", (char *)NULL);
+                        _exit(127);
+                }
+                wait_for_exit(child, 1);
+                assert(access(marker, F_OK) < 0 && errno == ENOENT);
+        }
+        assert(unlink(fake_dispatcher) == 0);
         assert(rmdir(runtime) == 0);
+        free(marker);
         free(fake_dispatcher);
         free(address);
         free(escaped);

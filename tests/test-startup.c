@@ -15,33 +15,23 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static void expect_startup_failure(const char *dispatcher, const char *runtime, const char *config)
+static pid_t spawn_dispatcher(const char *dispatcher, const char *runtime, const char *config, int ready_fd)
 {
-        int pair[2], status;
-        char notification;
-        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
         pid_t child = fork();
         assert(child >= 0);
         if (!child) {
-                close(pair[0]);
-                assert(dup2(pair[1], 3) == 3 && fcntl(3, F_SETFD, 0) == 0);
-                if (pair[1] != 3)
-                        close(pair[1]);
+                assert(dup2(ready_fd, 3) == 3 && fcntl(3, F_SETFD, 0) == 0);
                 assert(setenv("XDG_RUNTIME_DIR", runtime, 1) == 0);
                 execl(dispatcher, dispatcher, "--scope=user", "--foreground", "--ready-fd=3", "--config-file", config,
                       (char *)NULL);
                 _exit(127);
         }
-        close(pair[1]);
-        struct pollfd pfd = {.fd = pair[0], .events = POLLIN};
-        int result = poll(&pfd, 1, 2000);
-        if (result <= 0) {
-                kill(child, SIGKILL);
-                waitpid(child, NULL, 0);
-        }
-        assert(result > 0);
-        assert(read(pair[0], &notification, 1) == 1 && notification == 'F');
-        close(pair[0]);
+        return child;
+}
+
+static void expect_failed_exit(pid_t child)
+{
+        int status;
         for (unsigned int i = 0; i < 200; ++i) {
                 pid_t reaped = waitpid(child, &status, WNOHANG);
                 if (reaped == child) {
@@ -54,6 +44,37 @@ static void expect_startup_failure(const char *dispatcher, const char *runtime, 
         kill(child, SIGKILL);
         waitpid(child, NULL, 0);
         assert(!"Failed dispatcher did not exit promptly");
+}
+
+static void expect_startup_failure(const char *dispatcher, const char *runtime, const char *config)
+{
+        int pair[2];
+        char notification;
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+        pid_t child = spawn_dispatcher(dispatcher, runtime, config, pair[1]);
+        close(pair[1]);
+        struct pollfd pfd = {.fd = pair[0], .events = POLLIN};
+        int result = poll(&pfd, 1, 2000);
+        if (result <= 0) {
+                kill(child, SIGKILL);
+                waitpid(child, NULL, 0);
+        }
+        assert(result > 0);
+        assert(read(pair[0], &notification, 1) == 1 && notification == 'F');
+        close(pair[0]);
+        expect_failed_exit(child);
+}
+
+/* A start whose readiness report reaches nobody must not leave a bus behind:
+ * whoever asked for it has stopped waiting and will never stop it. */
+static void expect_abandoned_startup(const char *dispatcher, const char *runtime, const char *config)
+{
+        int pair[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair) == 0);
+        close(pair[0]);
+        pid_t child = spawn_dispatcher(dispatcher, runtime, config, pair[1]);
+        close(pair[1]);
+        expect_failed_exit(child);
 }
 
 int main(int argc, char **argv)
@@ -98,6 +119,10 @@ int main(int argc, char **argv)
         for (unsigned int i = 0; i < 2; ++i)
                 close(clients[i]);
         close(listener);
-        assert(unlink(address.sun_path) == 0 && unlink(config) == 0 && rmdir(runtime) == 0);
+
+        /* The socket is stale now, so this start gets as far as reporting. */
+        expect_abandoned_startup(argv[1], runtime, config);
+        assert(lstat(address.sun_path, &after) < 0 && errno == ENOENT);
+        assert(unlink(config) == 0 && rmdir(runtime) == 0);
         return 0;
 }
